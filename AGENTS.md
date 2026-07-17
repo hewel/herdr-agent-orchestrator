@@ -5,16 +5,17 @@
 - Build a Rust Herdr plugin that runs, supervises, and coordinates coding agents in normal Herdr-managed terminal panes.
 - The parent agent retains ownership of intent, architecture, decomposition, acceptance criteria, verification design, final diff review, and the user-facing response.
 - Child agents receive bounded tasks with resolved requirements, declared write scopes, and objectively verifiable completion criteria.
-- Treat the architecture supplied during repository initialization as the product source of truth. Keep this guide concise; do not duplicate the full design here.
+- Treat `docs/ARCHITECTURE.md` as the product source of truth and `CONTEXT.md` as the canonical domain vocabulary. Keep this guide concise; do not duplicate the full design here.
 
 ## Architectural boundaries
 
-- Keep provider, role, task, and policy independent. OMP and Codex are providers, not hard-coded responsibilities.
+- Herdr Agent Orchestrator is the single top-level workflow authority. Provider-native orchestration may only appear later as a controlled child capability.
+- Keep provider, role, task, and policy independent. OMP and Codex are MVP providers; Pi and OpenCode are later providers, not hard-coded responsibilities.
 - Hide provider-specific protocols behind a shared Rust adapter interface. Shared runtime code consumes normalized events and structured artifacts, not native protocol messages.
 - Prompts describe role behavior; execution policies enforce permissions. Read-only and write-scope rules must be runtime constraints, not prompt-only requests.
 - Exchange structured run specifications, reports, and handoff artifacts instead of relying on cross-provider conversation history.
 - The child-agent pane owns the real process. Popups display and control runs but must not own agent lifecycles.
-- Official Herdr integrations remain authoritative for native agent identity and lifecycle; this plugin adds task, role, policy, and verification metadata.
+- Official Herdr integrations may remain authoritative for native provider identity and protocol lifecycle, but this plugin owns top-level workflow, task, role, policy, repository safety, and verification state.
 
 ## Repository safety
 
@@ -27,25 +28,25 @@
 ## MVP boundaries
 
 - Require explicit provider and role selection. Initial providers are OMP and Codex; built-in roles are implementer, reviewer, and verifier.
-- Include structured run specs and artifacts, repository guards, verification commands, normalized lifecycle events, persistent JSON state, Herdr metadata, a Ratatui popup, and cancel/focus/inspect controls.
+- Use Managed delegation mode for the MVP. Include structured run specs and artifacts, repository guards, verification commands, normalized lifecycle events, persistent SQLite state, Herdr metadata, a Ratatui popup, and cancel/focus/inspect controls.
 - Keep role and policy concepts in the domain model from the start, even when initial role definitions are built in.
-- Defer automatic routing, user-defined roles, inheritance, workflow DAGs, provider switching, multiple editing agents, automatic worktrees/merge/rollback, additional providers, graphical or web UIs, distributed workers, and deep recursive delegation.
+- Defer automatic routing, provider-native subagents, user-defined roles, inheritance, general workflow DAG execution, multiple editing agents, automatic merge/rollback, OpenCode, graphical or web UIs, distributed workers, and deep recursive delegation. Pi is the first provider after the MVP.
 
 ## Implementation order
 
-1. Define `AgentRunSpec`, task packets, assignments, policies, events, and structured artifacts.
-2. Implement role/policy resolution, persistent state, Git baselines, write-scope validation, repository locking, and verification.
-3. Add the Herdr command/socket boundary and complete one end-to-end OMP run.
-4. Add Codex App Server support only after the shared runtime and OMP path are stable.
-5. Add normalized presentation, popup controls, inspection, cancellation, and the reviewer/verifier flows.
+1. Build the Managed runtime with OMP, Codex, built-in roles, repository guards, SQLite state, artifacts, Herdr metadata, and popup controls.
+2. Add provider capability negotiation, persistent sessions, resume, steering, transcripts, handoffs, and isolated worktrees.
+3. Add Pi as a managed provider.
+4. Add policy-bounded OMP Hybrid mode with read-only native helpers first.
+5. Add OpenCode, then custom roles and general DAG workflows.
 
-The first milestone must prove the full OMP path from parent submission through a bounded edit, verification, scope validation, structured artifact, popup result, and parent review.
+The first milestone must prove the full Managed OMP path from parent submission through a bounded edit, verification, scope validation, structured artifact, popup result, and parent review while keeping provider-native subagents disabled.
 
 ## Rust and persistence conventions
 
 - Use async Rust with Tokio and provider traits with `async-trait`; use Serde-backed versioned JSON/TOML types at process and disk boundaries.
 - Use the Git CLI initially rather than `git2`.
-- Store run data beneath `HERDR_PLUGIN_STATE_DIR`; use atomic replacement for frequently updated JSON and append-only JSONL for events.
+- Store indexed runtime state in SQLite beneath `HERDR_PLUGIN_STATE_DIR`; store large artifacts, transcripts, logs, diffs, and patches as files.
 - Keep provider protocol types inside provider modules and keep Herdr transport details behind the Herdr integration boundary.
 - Prefer focused tests around domain validation, state transitions, repository guards, protocol translation, cancellation, and artifact construction.
 
