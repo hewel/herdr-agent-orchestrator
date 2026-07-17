@@ -14,6 +14,7 @@
 - Hide provider-specific protocols behind a shared Rust adapter interface. Shared runtime code consumes normalized events and structured artifacts, not native protocol messages.
 - Prompts describe role behavior; execution policies enforce permissions. Read-only and write-scope rules must be runtime constraints, not prompt-only requests.
 - Exchange structured run specifications, reports, and handoff artifacts instead of relying on cross-provider conversation history.
+- Treat `docs/research/mvp/public-run-contract.md` as the normative boundary between caller intent and immutable resolved runtime authority.
 - The child-agent pane owns the real process. Popups display and control runs but must not own agent lifecycles.
 - Official Herdr integrations may remain authoritative for native provider identity and protocol lifecycle, but this plugin owns top-level workflow, task, role, policy, repository safety, and verification state.
 

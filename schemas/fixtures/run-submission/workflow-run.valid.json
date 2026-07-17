@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "kind": "workflow_run",
+  "request_key": "download-race-workflow-v1",
+  "worktree_path": "/workspace/herdr-agent-orchestrator",
+  "timeout_seconds": 3600,
+  "assignments": {
+    "implementer": {
+      "provider": "omp",
+      "profile_id": "omp-managed-default"
+    },
+    "reviewer": {
+      "provider": "codex",
+      "profile_id": "codex-review"
+    },
+    "verifier": {
+      "provider": "codex",
+      "profile_id": "codex-verify"
+    }
+  },
+  "task": {
+    "title": "Fix and independently verify the download queue race",
+    "objective": "Prevent duplicate queue insertion",
+    "context_paths": ["src/download/queue.rs"],
+    "requirements": ["Preserve the existing public API"],
+    "acceptance_criteria": ["Concurrent insertions produce one queue entry"],
+    "repository": {
+      "write_scopes": [
+        { "kind": "exact_file", "path": "src/download/queue.rs" },
+        { "kind": "subtree", "path": "tests/download" }
+      ],
+      "scratch_scopes": [
+        { "kind": "subtree", "path": "target" }
+      ],
+      "ignored_publish_paths": [],
+      "destructive_authorizations": []
+    },
+    "verification": [
+      {
+        "id": "download-queue-tests",
+        "command": "cargo test download_queue",
+        "expected": "Focused tests exit successfully"
+      }
+    ]
+  }
+}

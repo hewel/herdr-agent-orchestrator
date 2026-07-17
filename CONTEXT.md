@@ -26,6 +26,14 @@ _Avoid_: Prompt instructions, role description
 
 ## Work
 
+**Run Submission**:
+The versioned caller intent for either one Agent Run or the fixed Managed workflow, containing explicit assignments, bounded task intent, repository authority, and a root timeout.
+_Avoid_: Agent Run Spec, request packet
+
+**Resolved Run Spec**:
+The immutable, orchestrator-owned authority compiled from an accepted Run Submission and frozen configuration for one top-level run or child Agent Run.
+_Avoid_: Run Submission, mutable run state
+
 **Task Packet**:
 A bounded, resolved objective with its context, requirements, acceptance criteria, write scope, and verification expectations.
 _Avoid_: Prompt, ticket

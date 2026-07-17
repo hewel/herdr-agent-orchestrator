@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://herdr.dev/schemas/orchestrator/resolved-agent-run-spec-v1.schema.json",
+  "title": "SnapshotEnvelopeResolvedAgentRunSpecV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "digest", "value"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "digest": { "$ref": "#/$defs/digest" },
+    "value": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["agent_run_id", "top_level_run_id", "workflow_node", "top_level_spec", "assignment", "task_snapshot", "input_artifacts", "node_budget_seconds", "deadline_at", "repository_snapshot", "repository_authority_snapshot", "safety_backend_snapshot"],
+      "allOf": [
+        {
+          "if": { "properties": { "workflow_node": { "const": "implementer" } }, "required": ["workflow_node"] },
+          "then": { "type": "object", "properties": { "assignment": { "type": "object", "properties": { "role": { "const": "implementer" } } }, "input_artifacts": { "type": "array", "maxItems": 0 } } }
+        },
+        {
+          "if": { "properties": { "workflow_node": { "const": "reviewer" } }, "required": ["workflow_node"] },
+          "then": { "type": "object", "properties": { "assignment": { "type": "object", "properties": { "role": { "const": "reviewer" } } }, "input_artifacts": { "type": "array", "minItems": 1 } } }
+        },
+        {
+          "if": { "properties": { "workflow_node": { "const": "verifier" } }, "required": ["workflow_node"] },
+          "then": { "type": "object", "properties": { "assignment": { "type": "object", "properties": { "role": { "const": "verifier" } } }, "input_artifacts": { "type": "array", "minItems": 2 } } }
+        }
+      ],
+      "properties": {
+        "agent_run_id": { "$ref": "#/$defs/uuid" },
+        "top_level_run_id": { "$ref": "#/$defs/uuid" },
+        "workflow_node": {
+          "oneOf": [
+            { "enum": ["implementer", "reviewer", "verifier"] },
+            { "type": "null" }
+          ]
+        },
+        "top_level_spec": { "$ref": "#/$defs/snapshot_ref" },
+        "assignment": { "$ref": "#/$defs/resolved_assignment" },
+        "task_snapshot": { "$ref": "#/$defs/snapshot_ref" },
+        "input_artifacts": {
+          "type": "array",
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/artifact_ref" }
+        },
+        "node_budget_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86400
+        },
+        "deadline_at": { "$ref": "#/$defs/timestamp" },
+        "repository_snapshot": { "$ref": "#/$defs/snapshot_ref" },
+        "repository_authority_snapshot": { "$ref": "#/$defs/snapshot_ref" },
+        "safety_backend_snapshot": { "$ref": "#/$defs/snapshot_ref" }
+      }
+    }
+  },
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$"
+    },
+    "snapshot_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "digest"],
+      "properties": {
+        "schema_version": { "type": "integer", "minimum": 1 },
+        "digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "artifact_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["uri", "digest"],
+      "properties": {
+        "uri": {
+          "type": "string",
+          "pattern": "^artifact://[A-Za-z0-9._:/-]{1,512}$"
+        },
+        "digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "resolved_assignment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "provider_snapshot", "profile_id", "profile_snapshot", "role", "role_snapshot", "policy_snapshot"],
+      "properties": {
+        "provider": { "enum": ["omp", "codex"] },
+        "provider_snapshot": { "$ref": "#/$defs/snapshot_ref" },
+        "profile_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "profile_snapshot": { "$ref": "#/$defs/snapshot_ref" },
+        "role": { "enum": ["implementer", "reviewer", "verifier"] },
+        "role_snapshot": { "$ref": "#/$defs/snapshot_ref" },
+        "policy_snapshot": { "$ref": "#/$defs/snapshot_ref" }
+      }
+    }
+  }
+}

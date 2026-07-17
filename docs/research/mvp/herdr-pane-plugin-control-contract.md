@@ -7,6 +7,10 @@ provider launch, pane identity, focus, cancellation, status, popups, and restart
 reconciliation. It targets the locally verified `herdr 0.7.4` socket protocol
 `16` and deliberately separates Herdr guarantees from project decisions.
 
+Durable run identity is allocated at acceptance according to the
+[public run contract](public-run-contract.md); caller-supplied IDs never become
+Herdr or orchestrator authority.
+
 ## Confirmed Herdr facts
 
 ### Plugins and panes

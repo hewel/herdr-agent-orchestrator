@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "digest": "25c95d3df4af9caa526ad156a2fbb4159b655cddb0a75b643b26883f35839a0b",
+  "value": {
+    "agent_run_id": "019f76c0-7c59-7000-8000-000000000013",
+    "top_level_run_id": "019f76c0-7c59-7000-8000-000000000010",
+    "workflow_node": "verifier",
+    "top_level_spec": { "schema_version": 1, "digest": "cdbc79aa7a48783b4586a74708d427bbe3901b4e7d6ad884f5d842b142df1ded" },
+    "assignment": {
+      "provider": "codex",
+      "provider_snapshot": { "schema_version": 1, "digest": "3030303030303030303030303030303030303030303030303030303030303030" },
+      "profile_id": "codex-verify",
+      "profile_snapshot": { "schema_version": 1, "digest": "3131313131313131313131313131313131313131313131313131313131313131" },
+      "role": "verifier",
+      "role_snapshot": { "schema_version": 1, "digest": "3232323232323232323232323232323232323232323232323232323232323232" },
+      "policy_snapshot": { "schema_version": 1, "digest": "3333333333333333333333333333333333333333333333333333333333333333" }
+    },
+    "task_snapshot": { "schema_version": 1, "digest": "6262626262626262626262626262626262626262626262626262626262626262" },
+    "input_artifacts": [
+      {
+        "uri": "artifact://implementation/run-0194",
+        "digest": "5353535353535353535353535353535353535353535353535353535353535353"
+      },
+      {
+        "uri": "artifact://review/run-0195",
+        "digest": "6363636363636363636363636363636363636363636363636363636363636363"
+      }
+    ],
+    "node_budget_seconds": 600,
+    "deadline_at": "2026-07-18T09:00:00Z",
+    "repository_snapshot": { "schema_version": 1, "digest": "0303030303030303030303030303030303030303030303030303030303030303" },
+    "repository_authority_snapshot": { "schema_version": 1, "digest": "5454545454545454545454545454545454545454545454545454545454545454" },
+    "safety_backend_snapshot": { "schema_version": 1, "digest": "6969696969696969696969696969696969696969696969696969696969696969" }
+  }
+}

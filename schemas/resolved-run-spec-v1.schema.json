@@ -1,0 +1,263 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://herdr.dev/schemas/orchestrator/resolved-run-spec-v1.schema.json",
+  "title": "SnapshotEnvelopeResolvedTopLevelRunSpecV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "digest", "value"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "digest": { "$ref": "#/$defs/digest" },
+    "value": {
+      "oneOf": [
+        { "$ref": "#/$defs/resolved_agent_run" },
+        { "$ref": "#/$defs/resolved_workflow_run" }
+      ]
+    }
+  },
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$"
+    },
+    "snapshot_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "digest"],
+      "properties": {
+        "schema_version": { "type": "integer", "minimum": 1 },
+        "digest": { "$ref": "#/$defs/digest" }
+      }
+    },
+    "provider": {
+      "enum": ["omp", "codex"]
+    },
+    "role": {
+      "enum": ["implementer", "reviewer", "verifier"]
+    },
+    "repo_path": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "write_scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "path"],
+      "properties": {
+        "kind": { "enum": ["exact_file", "subtree"] },
+        "path": { "$ref": "#/$defs/repo_path" }
+      }
+    },
+    "destructive_authorization": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "target"],
+          "properties": {
+            "kind": { "const": "delete" },
+            "target": { "$ref": "#/$defs/repo_path" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "from", "to"],
+          "properties": {
+            "kind": { "const": "rename" },
+            "from": { "$ref": "#/$defs/repo_path" },
+            "to": { "$ref": "#/$defs/repo_path" }
+          }
+        }
+      ]
+    },
+    "resolved_assignment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "provider_snapshot", "profile_id", "profile_snapshot", "role", "role_snapshot", "policy_snapshot"],
+      "properties": {
+        "provider": { "$ref": "#/$defs/provider" },
+        "provider_snapshot": { "$ref": "#/$defs/snapshot_ref" },
+        "profile_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "profile_snapshot": { "$ref": "#/$defs/snapshot_ref" },
+        "role": { "$ref": "#/$defs/role" },
+        "role_snapshot": { "$ref": "#/$defs/snapshot_ref" },
+        "policy_snapshot": { "$ref": "#/$defs/snapshot_ref" }
+      }
+    },
+    "filesystem_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["canonical_path", "mount_id", "device_major", "device_minor", "inode"],
+      "properties": {
+        "canonical_path": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "mount_id": { "type": "integer", "minimum": 0 },
+        "device_major": { "type": "integer", "minimum": 0 },
+        "device_minor": { "type": "integer", "minimum": 0 },
+        "inode": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "repository_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["submitted_worktree_path", "worktree", "git_directory", "git_common_directory", "worktree_kind", "head_kind", "head_oid", "worktree_git_manifest", "common_git_manifest"],
+      "properties": {
+        "submitted_worktree_path": { "type": "string", "minLength": 1, "maxLength": 4096 },
+        "worktree": { "$ref": "#/$defs/filesystem_identity" },
+        "git_directory": { "$ref": "#/$defs/filesystem_identity" },
+        "git_common_directory": { "$ref": "#/$defs/filesystem_identity" },
+        "worktree_kind": { "enum": ["main", "linked"] },
+        "head_kind": { "enum": ["symbolic", "detached"] },
+        "head_oid": { "type": "string", "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$" },
+        "worktree_git_manifest": { "$ref": "#/$defs/snapshot_ref" },
+        "common_git_manifest": { "$ref": "#/$defs/snapshot_ref" }
+      }
+    },
+    "repository_authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["write_scopes", "scratch_scopes", "ignored_publish_paths", "destructive_authorizations"],
+      "properties": {
+        "write_scopes": { "type": "array", "maxItems": 256, "uniqueItems": true, "items": { "$ref": "#/$defs/write_scope" } },
+        "scratch_scopes": { "type": "array", "maxItems": 64, "uniqueItems": true, "items": { "$ref": "#/$defs/write_scope" } },
+        "ignored_publish_paths": { "type": "array", "maxItems": 256, "uniqueItems": true, "items": { "$ref": "#/$defs/repo_path" } },
+        "destructive_authorizations": { "type": "array", "maxItems": 256, "uniqueItems": true, "items": { "$ref": "#/$defs/destructive_authorization" } }
+      }
+    },
+    "common": {
+      "type": "object",
+      "required": ["kind", "run_id", "submission_digest", "accepted_at", "deadline_at", "delegation_mode", "repository", "repository_authority", "repository_snapshot_digest", "synthetic_git_digest", "dirty_confirmation_digest", "safety_backend_snapshot", "orchestrator_snapshot"],
+      "properties": {
+        "kind": { "enum": ["agent_run", "workflow_run"] },
+        "run_id": { "$ref": "#/$defs/uuid" },
+        "submission_digest": { "$ref": "#/$defs/digest" },
+        "accepted_at": { "$ref": "#/$defs/timestamp" },
+        "deadline_at": { "$ref": "#/$defs/timestamp" },
+        "delegation_mode": { "const": "managed" },
+        "repository": { "$ref": "#/$defs/repository_identity" },
+        "repository_authority": { "$ref": "#/$defs/repository_authority" },
+        "repository_snapshot_digest": { "$ref": "#/$defs/digest" },
+        "synthetic_git_digest": { "$ref": "#/$defs/digest" },
+        "dirty_confirmation_digest": {
+          "oneOf": [
+            { "$ref": "#/$defs/digest" },
+            { "type": "null" }
+          ]
+        },
+        "safety_backend_snapshot": { "$ref": "#/$defs/snapshot_ref" },
+        "orchestrator_snapshot": { "$ref": "#/$defs/snapshot_ref" }
+      }
+    },
+    "resolved_agent_run": {
+      "allOf": [
+        { "$ref": "#/$defs/common" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "run_id", "submission_digest", "accepted_at", "deadline_at", "delegation_mode", "repository", "repository_authority", "repository_snapshot_digest", "synthetic_git_digest", "dirty_confirmation_digest", "safety_backend_snapshot", "orchestrator_snapshot", "assignment", "task_snapshot"],
+          "properties": {
+            "kind": { "const": "agent_run" },
+            "run_id": { "$ref": "#/$defs/uuid" },
+            "submission_digest": { "$ref": "#/$defs/digest" },
+            "accepted_at": { "$ref": "#/$defs/timestamp" },
+            "deadline_at": { "$ref": "#/$defs/timestamp" },
+            "delegation_mode": { "const": "managed" },
+            "repository": { "$ref": "#/$defs/repository_identity" },
+            "repository_authority": { "$ref": "#/$defs/repository_authority" },
+            "repository_snapshot_digest": { "$ref": "#/$defs/digest" },
+            "synthetic_git_digest": { "$ref": "#/$defs/digest" },
+            "dirty_confirmation_digest": {
+              "oneOf": [{ "$ref": "#/$defs/digest" }, { "type": "null" }]
+            },
+            "safety_backend_snapshot": { "$ref": "#/$defs/snapshot_ref" },
+            "orchestrator_snapshot": { "$ref": "#/$defs/snapshot_ref" },
+            "assignment": { "$ref": "#/$defs/resolved_assignment" },
+            "task_snapshot": { "$ref": "#/$defs/snapshot_ref" }
+          }
+        }
+      ]
+    },
+    "implementer_node": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["agent_run_id", "assignment", "depends_on", "task_source"],
+      "properties": {
+        "agent_run_id": { "$ref": "#/$defs/uuid" },
+        "assignment": { "allOf": [{ "$ref": "#/$defs/resolved_assignment" }, { "type": "object", "properties": { "role": { "const": "implementer" } } }] },
+        "depends_on": { "const": [] },
+        "task_source": { "const": "root_task" }
+      }
+    },
+    "reviewer_node": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["agent_run_id", "assignment", "depends_on", "task_source"],
+      "properties": {
+        "agent_run_id": { "$ref": "#/$defs/uuid" },
+        "assignment": { "allOf": [{ "$ref": "#/$defs/resolved_assignment" }, { "type": "object", "properties": { "role": { "const": "reviewer" } } }] },
+        "depends_on": { "const": ["implementer"] },
+        "task_source": { "const": "implementation_artifact" }
+      }
+    },
+    "verifier_node": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["agent_run_id", "assignment", "depends_on", "task_source"],
+      "properties": {
+        "agent_run_id": { "$ref": "#/$defs/uuid" },
+        "assignment": { "allOf": [{ "$ref": "#/$defs/resolved_assignment" }, { "type": "object", "properties": { "role": { "const": "verifier" } } }] },
+        "depends_on": { "const": ["implementer", "reviewer"] },
+        "task_source": { "const": "review_artifact" }
+      }
+    },
+    "workflow_nodes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["implementer", "reviewer", "verifier"],
+      "properties": {
+        "implementer": { "$ref": "#/$defs/implementer_node" },
+        "reviewer": { "$ref": "#/$defs/reviewer_node" },
+        "verifier": { "$ref": "#/$defs/verifier_node" }
+      }
+    },
+    "resolved_workflow_run": {
+      "allOf": [
+        { "$ref": "#/$defs/common" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "run_id", "submission_digest", "accepted_at", "deadline_at", "delegation_mode", "repository", "repository_authority", "repository_snapshot_digest", "synthetic_git_digest", "dirty_confirmation_digest", "safety_backend_snapshot", "orchestrator_snapshot", "workflow_template", "nodes", "root_task_snapshot"],
+          "properties": {
+            "kind": { "const": "workflow_run" },
+            "run_id": { "$ref": "#/$defs/uuid" },
+            "submission_digest": { "$ref": "#/$defs/digest" },
+            "accepted_at": { "$ref": "#/$defs/timestamp" },
+            "deadline_at": { "$ref": "#/$defs/timestamp" },
+            "delegation_mode": { "const": "managed" },
+            "repository": { "$ref": "#/$defs/repository_identity" },
+            "repository_authority": { "$ref": "#/$defs/repository_authority" },
+            "repository_snapshot_digest": { "$ref": "#/$defs/digest" },
+            "synthetic_git_digest": { "$ref": "#/$defs/digest" },
+            "dirty_confirmation_digest": {
+              "oneOf": [{ "$ref": "#/$defs/digest" }, { "type": "null" }]
+            },
+            "safety_backend_snapshot": { "$ref": "#/$defs/snapshot_ref" },
+            "orchestrator_snapshot": { "$ref": "#/$defs/snapshot_ref" },
+            "workflow_template": { "const": "implement_review_verify_v1" },
+            "nodes": { "$ref": "#/$defs/workflow_nodes" },
+            "root_task_snapshot": { "$ref": "#/$defs/snapshot_ref" }
+          }
+        }
+      ]
+    }
+  }
+}

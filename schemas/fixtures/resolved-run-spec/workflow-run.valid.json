@@ -1,0 +1,117 @@
+{
+  "schema_version": 1,
+  "digest": "cdbc79aa7a48783b4586a74708d427bbe3901b4e7d6ad884f5d842b142df1ded",
+  "value": {
+    "kind": "workflow_run",
+    "run_id": "019f76c0-7c59-7000-8000-000000000010",
+    "submission_digest": "1246a26f799dc650e9ca553fee119db966f29dd2426b5a5417b4e4e9bd834d7d",
+    "accepted_at": "2026-07-18T08:00:00Z",
+    "deadline_at": "2026-07-18T09:00:00Z",
+    "delegation_mode": "managed",
+    "repository": {
+      "submitted_worktree_path": "/workspace/herdr-agent-orchestrator",
+      "worktree": {
+        "canonical_path": "/workspace/herdr-agent-orchestrator",
+        "mount_id": 41,
+        "device_major": 8,
+        "device_minor": 1,
+        "inode": 1001
+      },
+      "git_directory": {
+        "canonical_path": "/workspace/herdr-agent-orchestrator/.git",
+        "mount_id": 41,
+        "device_major": 8,
+        "device_minor": 1,
+        "inode": 1002
+      },
+      "git_common_directory": {
+        "canonical_path": "/workspace/herdr-agent-orchestrator/.git",
+        "mount_id": 41,
+        "device_major": 8,
+        "device_minor": 1,
+        "inode": 1002
+      },
+      "worktree_kind": "main",
+      "head_kind": "symbolic",
+      "head_oid": "0e37200000000000000000000000000000000000",
+      "worktree_git_manifest": {
+        "schema_version": 1,
+        "digest": "6767676767676767676767676767676767676767676767676767676767676767"
+      },
+      "common_git_manifest": {
+        "schema_version": 1,
+        "digest": "6868686868686868686868686868686868686868686868686868686868686868"
+      }
+    },
+    "repository_authority": {
+      "write_scopes": [
+        { "kind": "subtree", "path": "src/download" }
+      ],
+      "scratch_scopes": [
+        { "kind": "subtree", "path": "target" }
+      ],
+      "ignored_publish_paths": [],
+      "destructive_authorizations": []
+    },
+    "repository_snapshot_digest": "0303030303030303030303030303030303030303030303030303030303030303",
+    "synthetic_git_digest": "0404040404040404040404040404040404040404040404040404040404040404",
+    "dirty_confirmation_digest": null,
+    "safety_backend_snapshot": {
+      "schema_version": 1,
+      "digest": "6969696969696969696969696969696969696969696969696969696969696969"
+    },
+    "orchestrator_snapshot": {
+      "schema_version": 1,
+      "digest": "0505050505050505050505050505050505050505050505050505050505050505"
+    },
+    "workflow_template": "implement_review_verify_v1",
+    "nodes": {
+      "implementer": {
+        "agent_run_id": "019f76c0-7c59-7000-8000-000000000011",
+        "assignment": {
+          "provider": "omp",
+          "provider_snapshot": { "schema_version": 1, "digest": "1010101010101010101010101010101010101010101010101010101010101010" },
+          "profile_id": "omp-managed-default",
+          "profile_snapshot": { "schema_version": 1, "digest": "1111111111111111111111111111111111111111111111111111111111111111" },
+          "role": "implementer",
+          "role_snapshot": { "schema_version": 1, "digest": "1212121212121212121212121212121212121212121212121212121212121212" },
+          "policy_snapshot": { "schema_version": 1, "digest": "1313131313131313131313131313131313131313131313131313131313131313" }
+        },
+        "depends_on": [],
+        "task_source": "root_task"
+      },
+      "reviewer": {
+        "agent_run_id": "019f76c0-7c59-7000-8000-000000000012",
+        "assignment": {
+          "provider": "codex",
+          "provider_snapshot": { "schema_version": 1, "digest": "2020202020202020202020202020202020202020202020202020202020202020" },
+          "profile_id": "codex-review",
+          "profile_snapshot": { "schema_version": 1, "digest": "2121212121212121212121212121212121212121212121212121212121212121" },
+          "role": "reviewer",
+          "role_snapshot": { "schema_version": 1, "digest": "2222222222222222222222222222222222222222222222222222222222222222" },
+          "policy_snapshot": { "schema_version": 1, "digest": "2323232323232323232323232323232323232323232323232323232323232323" }
+        },
+        "depends_on": ["implementer"],
+        "task_source": "implementation_artifact"
+      },
+      "verifier": {
+        "agent_run_id": "019f76c0-7c59-7000-8000-000000000013",
+        "assignment": {
+          "provider": "codex",
+          "provider_snapshot": { "schema_version": 1, "digest": "3030303030303030303030303030303030303030303030303030303030303030" },
+          "profile_id": "codex-verify",
+          "profile_snapshot": { "schema_version": 1, "digest": "3131313131313131313131313131313131313131313131313131313131313131" },
+          "role": "verifier",
+          "role_snapshot": { "schema_version": 1, "digest": "3232323232323232323232323232323232323232323232323232323232323232" },
+          "policy_snapshot": { "schema_version": 1, "digest": "3333333333333333333333333333333333333333333333333333333333333333" }
+        },
+        "depends_on": ["implementer", "reviewer"],
+        "task_source": "review_artifact"
+      }
+    },
+    "root_task_snapshot": {
+      "schema_version": 1,
+      "digest": "4141414141414141414141414141414141414141414141414141414141414141"
+    }
+  }
+}

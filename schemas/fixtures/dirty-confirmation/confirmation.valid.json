@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "run_id": "019f76c0-7c59-7000-8000-000000000001",
+  "snapshot_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+  "paths": [
+    {
+      "path": "src/download/queue.rs",
+      "staged": false,
+      "unstaged": true,
+      "untracked": false,
+      "ignored": false
+    }
+  ]
+}

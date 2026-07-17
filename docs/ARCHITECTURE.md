@@ -242,61 +242,107 @@ Recommended Hybrid restrictions:
 
 ## Core Domain Model
 
-### Agent Assignment
+### Caller assignment
 
 ```rust
-pub struct AgentAssignment {
+pub struct AssignmentInputV1 {
     pub provider: ProviderKind,
-    pub role_id: String,
-    pub profile_id: Option<String>,
-    pub delegation_mode: DelegationMode,
+    pub profile_id: String,
+    pub role: BuiltInRole,
 }
 ```
 
-### Agent Run Specification
+The caller selects every provider, profile, and role explicitly. It does not
+select delegation mode, model, tools, prompts, environment, output schema, or
+effective policy. Managed mode and runtime authority are resolved internally.
+
+### Run Submission
 
 ```rust
-pub struct AgentRunSpec {
-    pub schema_version: u32,
-    pub run_id: RunId,
-    pub workflow_id: Option<WorkflowRunId>,
-    pub parent_run_id: Option<AgentRunId>,
-
-    pub assignment: AgentAssignment,
-    pub task: TaskPacket,
-    pub resolved_role: ResolvedRole,
-    pub effective_policy: ExecutionPolicy,
+pub enum RunSubmissionV1 {
+    AgentRun {
+        request_key: Option<String>,
+        worktree_path: AbsoluteWorktreePath,
+        timeout_seconds: u32,
+        assignment: AssignmentInputV1,
+        task: TaskInputV1,
+    },
+    WorkflowRun {
+        request_key: Option<String>,
+        worktree_path: AbsoluteWorktreePath,
+        timeout_seconds: u32,
+        assignments: FixedWorkflowAssignmentsV1,
+        task: TaskInputV1,
+    },
 }
 ```
 
-Example:
+The public contract is a strict, versioned tagged union. An individual
+submission creates one `AgentRun`; a workflow submission creates the fixed
+implementer → reviewer → verifier workflow and preallocates all three child
+run IDs. Callers never provide run IDs. Every repository scope has an explicit
+`exact_file` or `subtree` kind; path spelling never implies scope semantics.
+
+Example individual submission:
 
 ```json
 {
   "schema_version": 1,
-  "run_id": "run-0194",
-  "title": "Fix download queue race",
+  "kind": "agent_run",
+  "request_key": "download-race-v1",
+  "worktree_path": "/workspace/herdr-agent-orchestrator",
+  "timeout_seconds": 1800,
   "assignment": {
     "provider": "omp",
-    "role": "implementer",
-    "delegation_mode": "managed"
+    "profile_id": "omp-managed-default",
+    "role": "implementer"
   },
   "task": {
+    "title": "Fix download queue race",
     "objective": "Prevent duplicate queue insertion",
     "context_paths": ["src/download/queue.rs"],
-    "write_scope": ["src/download/queue.rs", "tests/download/"],
     "requirements": ["Preserve the existing public API"],
     "acceptance_criteria": ["Concurrent insertions produce one queue entry"],
+    "repository": {
+      "write_scopes": [
+        { "kind": "exact_file", "path": "src/download/queue.rs" },
+        { "kind": "subtree", "path": "tests/download" }
+      ],
+      "scratch_scopes": [],
+      "ignored_publish_paths": [],
+      "destructive_authorizations": []
+    },
     "verification": [
       {
+        "id": "download-queue-tests",
         "command": "cargo test download_queue",
         "expected": "Exit 0 with focused tests passing"
       }
     ]
-  },
-  "timeout_seconds": 1800
+  }
 }
 ```
+
+### Resolved Run Spec
+
+After durable acceptance the orchestrator generates IDs and freezes the
+selected configuration into digest-addressed snapshots. A sealed
+`ResolvedTopLevelRunSpecV1` records the canonical submission digest, root
+deadline, resolved repository identity and authority, Repository Snapshot,
+Managed mode, and immutable profile, role, policy, task, and orchestrator
+snapshot references. Mutable sessions, panes, progress, and publication state
+remain outside it.
+
+Each provider invocation receives a separately sealed
+`ResolvedAgentRunSpecV1`. For a workflow child it links the immutable root,
+preallocated child ID, fixed node assignment, late-bound input Artifact
+references, node budget, and repository/safety snapshots without mutating the
+workflow root.
+
+The complete public input, idempotency, dirty-confirmation, deadline, snapshot,
+and compatibility rules are normative in the
+[public run contract](research/mvp/public-run-contract.md). Checked-in Draft
+2020-12 schemas and golden fixtures live under [`schemas/`](../schemas/).
 
 ## Provider Adapter Layer
 
@@ -311,7 +357,7 @@ pub trait AgentProvider: Send + Sync {
 
     async fn start(
         &self,
-        spec: &AgentRunSpec,
+        spec: &ResolvedAgentRunSpecV1,
         context: &RunContext,
     ) -> Result<ProviderSession>;
 
@@ -715,7 +761,11 @@ allowed_tools = ["read", "search", "shell"]
 output_schema = "review-report-v1"
 ```
 
-## Workflow Engine
+## Future Workflow Engine
+
+The MVP exposes only the fixed implementer → reviewer → verifier workflow.
+The general DAG model below is a future extension and is not accepted by the
+v1 public run contract.
 
 Use a DAG with topological scheduling.
 
@@ -1149,9 +1199,11 @@ herdr-agent-orchestrator/
 ├── Cargo.toml
 ├── herdr-plugin.toml
 ├── schemas/
-│   ├── agent-run-spec.schema.json
+│   ├── run-submission-v1.schema.json
+│   ├── dirty-worktree-confirmation-v1.schema.json
+│   ├── resolved-run-spec-v1.schema.json
+│   ├── resolved-agent-run-spec-v1.schema.json
 │   ├── role-definition.schema.json
-│   ├── workflow-definition.schema.json
 │   ├── execution-policy.schema.json
 │   └── artifact-envelope.schema.json
 └── src/
@@ -1273,7 +1325,7 @@ Implement:
 - Codex Provider
 - `implementer`, `reviewer`, and `verifier`
 - Explicit provider selection
-- Structured `AgentRunSpec`
+- Versioned `RunSubmissionV1` and immutable resolved run snapshots
 - Repository baseline
 - Write-scope enforcement
 - Repository edit lock

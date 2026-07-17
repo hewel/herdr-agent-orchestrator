@@ -8,6 +8,10 @@ artifact, cancels work, and retains native evidence. It targets the locally
 verified Codex CLI `0.144.5` protocol and treats Codex as a single managed
 provider. Codex-native multi-agent behavior is outside the MVP.
 
+The adapter receives only a sealed Resolved Run Spec from the
+[public run contract](public-run-contract.md). Raw caller submissions and
+mutable configuration never cross the provider boundary.
+
 ## Confirmed Codex facts
 
 ### Process and wire protocol

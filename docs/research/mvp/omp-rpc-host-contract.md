@@ -7,6 +7,10 @@ OMP RPC frames into an `AgentRun`, obtains a structured artifact, cancels work,
 and retains native evidence. It targets the locally verified OMP `17.0.2`
 protocol and deliberately keeps OMP's native orchestration outside the MVP.
 
+The adapter receives only a sealed Resolved Run Spec from the
+[public run contract](public-run-contract.md). Raw caller submissions and
+mutable configuration never cross the provider boundary.
+
 ## Confirmed OMP facts
 
 ### Process and wire protocol

@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://herdr.dev/schemas/orchestrator/dirty-worktree-confirmation-v1.schema.json",
+  "title": "DirtyWorktreeConfirmationV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "run_id", "snapshot_digest", "paths"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "run_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "snapshot_digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "paths": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 4096,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "staged", "unstaged", "untracked", "ignored"],
+        "anyOf": [
+          { "properties": { "staged": { "const": true } } },
+          { "properties": { "unstaged": { "const": true } } },
+          { "properties": { "untracked": { "const": true } } },
+          { "properties": { "ignored": { "const": true } } }
+        ],
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          },
+          "staged": { "type": "boolean" },
+          "unstaged": { "type": "boolean" },
+          "untracked": { "type": "boolean" },
+          "ignored": { "type": "boolean" }
+        }
+      }
+    }
+  }
+}

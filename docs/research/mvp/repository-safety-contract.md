@@ -152,9 +152,12 @@ The effective repository policy distinguishes these concepts independently:
 - dirty-path acknowledgements bound to the Repository Snapshot digest; and
 - explicit destructive-change authorization for deletions and renames.
 
-Serialized field names belong to the public run contract, but it MUST preserve
-these distinctions. In particular, a trailing slash or string-prefix test is
-not a scope kind.
+The [public run contract](public-run-contract.md) serializes these distinctions
+as typed `exact_file` and `subtree` scopes, `scratch_scopes`,
+`ignored_publish_paths`, and exact `delete` or `rename` authorizations. A
+trailing slash or string-prefix test is not a scope kind. The resolver binds
+the normalized authority and resolved worktree identity into the immutable
+Resolved Run Spec before a provider may start.
 
 Scope paths are relative UTF-8 paths beneath the canonical worktree root. They
 are compared as exact Linux path bytes without Unicode normalization. Empty,
@@ -354,21 +357,22 @@ lease metadata. A stale database row or absent process is not sufficient.
 
 ## Required downstream semantics
 
-The public run, lifecycle, state, and artifact contracts MUST be able to carry,
-without relying on provider-native fields:
+The public and persisted shapes in the
+[public run contract](public-run-contract.md) carry caller repository intent,
+the resolved repository and worktree identity, typed scopes and
+authorizations, and Repository Snapshot confirmation. Lifecycle, state, and
+artifact contracts MUST additionally carry, without relying on provider-native
+fields:
 
-- resolved repository and worktree identity;
 - safety-backend capability evidence;
 - Repository Snapshot and sealed candidate digests;
-- exact-file and subtree scopes, Scratch Scopes, dirty acknowledgements,
-  ignored-path authorization, and destructive-change authorization;
 - Publish Delta and verification evidence;
 - publication phase and cancellation-gate result;
 - a durable Publish Journal reference; and
 - Repository Quarantine state and reconciliation acknowledgement.
 
-Exact serialized names, error envelopes, and general terminal-state precedence
-remain downstream decisions. Semantically, an unavailable prerequisite rejects
+General lifecycle error envelopes and terminal-state precedence remain
+downstream decisions. Semantically, an unavailable prerequisite rejects
 startup, a candidate or pre-publication baseline violation is invalid and
 publishes nothing, a pre-publication provider loss fails with the overlay
 preserved, and any uncertain or partial publication is invalid and quarantined.

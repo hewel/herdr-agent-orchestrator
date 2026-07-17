@@ -1,0 +1,240 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://herdr.dev/schemas/orchestrator/run-submission-v1.schema.json",
+  "title": "RunSubmissionV1",
+  "oneOf": [
+    { "$ref": "#/$defs/agent_run" },
+    { "$ref": "#/$defs/workflow_run" }
+  ],
+  "$defs": {
+    "request_key": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._:-]{1,128}$"
+    },
+    "profile_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "provider": {
+      "enum": ["omp", "codex"]
+    },
+    "role": {
+      "enum": ["implementer", "reviewer", "verifier"]
+    },
+    "repo_path": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "nonempty_text_4096": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "assignment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "profile_id", "role"],
+      "properties": {
+        "provider": { "$ref": "#/$defs/provider" },
+        "profile_id": { "$ref": "#/$defs/profile_id" },
+        "role": { "$ref": "#/$defs/role" }
+      }
+    },
+    "workflow_assignment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "profile_id"],
+      "properties": {
+        "provider": { "$ref": "#/$defs/provider" },
+        "profile_id": { "$ref": "#/$defs/profile_id" }
+      }
+    },
+    "workflow_assignments": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["implementer", "reviewer", "verifier"],
+      "properties": {
+        "implementer": { "$ref": "#/$defs/workflow_assignment" },
+        "reviewer": { "$ref": "#/$defs/workflow_assignment" },
+        "verifier": { "$ref": "#/$defs/workflow_assignment" }
+      }
+    },
+    "write_scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "path"],
+      "properties": {
+        "kind": { "enum": ["exact_file", "subtree"] },
+        "path": { "$ref": "#/$defs/repo_path" }
+      }
+    },
+    "delete_authorization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "target"],
+      "properties": {
+        "kind": { "const": "delete" },
+        "target": { "$ref": "#/$defs/repo_path" }
+      }
+    },
+    "rename_authorization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "from", "to"],
+      "properties": {
+        "kind": { "const": "rename" },
+        "from": { "$ref": "#/$defs/repo_path" },
+        "to": { "$ref": "#/$defs/repo_path" }
+      }
+    },
+    "destructive_authorization": {
+      "oneOf": [
+        { "$ref": "#/$defs/delete_authorization" },
+        { "$ref": "#/$defs/rename_authorization" }
+      ]
+    },
+    "repository_intent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "write_scopes": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/write_scope" },
+          "default": []
+        },
+        "scratch_scopes": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/write_scope" },
+          "default": []
+        },
+        "ignored_publish_paths": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/repo_path" },
+          "default": []
+        },
+        "destructive_authorizations": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/destructive_authorization" },
+          "default": []
+        }
+      },
+      "default": {}
+    },
+    "verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "command", "expected"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._:-]{1,128}$"
+        },
+        "command": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16384
+        },
+        "expected": { "$ref": "#/$defs/nonempty_text_4096" }
+      }
+    },
+    "task": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["title", "objective", "acceptance_criteria", "repository"],
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "objective": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16384
+        },
+        "context_paths": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/repo_path" },
+          "default": []
+        },
+        "requirements": {
+          "type": "array",
+          "maxItems": 128,
+          "items": { "$ref": "#/$defs/nonempty_text_4096" },
+          "default": []
+        },
+        "acceptance_criteria": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 128,
+          "items": { "$ref": "#/$defs/nonempty_text_4096" }
+        },
+        "repository": { "$ref": "#/$defs/repository_intent" },
+        "verification": {
+          "type": "array",
+          "maxItems": 32,
+          "items": { "$ref": "#/$defs/verification" },
+          "default": []
+        }
+      }
+    },
+    "agent_run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "kind", "worktree_path", "timeout_seconds", "assignment", "task"],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "kind": { "const": "agent_run" },
+        "request_key": { "$ref": "#/$defs/request_key" },
+        "worktree_path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096,
+          "pattern": "^/"
+        },
+        "timeout_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86400
+        },
+        "assignment": { "$ref": "#/$defs/assignment" },
+        "task": { "$ref": "#/$defs/task" }
+      }
+    },
+    "workflow_run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "kind", "worktree_path", "timeout_seconds", "assignments", "task"],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "kind": { "const": "workflow_run" },
+        "request_key": { "$ref": "#/$defs/request_key" },
+        "worktree_path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096,
+          "pattern": "^/"
+        },
+        "timeout_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86400
+        },
+        "assignments": { "$ref": "#/$defs/workflow_assignments" },
+        "task": { "$ref": "#/$defs/task" }
+      }
+    }
+  }
+}

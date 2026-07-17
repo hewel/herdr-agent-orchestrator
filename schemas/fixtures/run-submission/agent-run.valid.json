@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "kind": "agent_run",
+  "request_key": "download-race-v1",
+  "worktree_path": "/workspace/herdr-agent-orchestrator",
+  "timeout_seconds": 1800,
+  "assignment": {
+    "provider": "omp",
+    "profile_id": "omp-managed-default",
+    "role": "implementer"
+  },
+  "task": {
+    "title": "Fix download queue race",
+    "objective": "Prevent duplicate queue insertion",
+    "context_paths": ["src/download/queue.rs"],
+    "requirements": ["Preserve the existing public API"],
+    "acceptance_criteria": ["Concurrent insertions produce one queue entry"],
+    "repository": {
+      "write_scopes": [
+        { "kind": "exact_file", "path": "src/download/queue.rs" },
+        { "kind": "subtree", "path": "tests/download" }
+      ],
+      "scratch_scopes": [
+        { "kind": "subtree", "path": "target" }
+      ],
+      "ignored_publish_paths": [],
+      "destructive_authorizations": []
+    },
+    "verification": [
+      {
+        "id": "download-queue-tests",
+        "command": "cargo test download_queue",
+        "expected": "Focused tests exit successfully"
+      }
+    ]
+  }
+}
