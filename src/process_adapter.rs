@@ -24,8 +24,8 @@ use crate::{
         AdapterCapabilities, AdapterError, AdapterEvent, AdapterEventStream, AdapterLifecycle,
         AdapterResult, AdapterSnapshot, CodexFrame, HarnessAdapter, HarnessStartSpec,
         NativeAcceptance, NativeDeliveryKind, NativeSession, NativeTurnStatus, OmpFrame,
-        ResolvedDelivery, classify_codex_frame, classify_omp_frame, validate_codex_version_output,
-        validate_omp_version_output,
+        ResolvedDelivery, WorkerCompletionTools, classify_codex_frame, classify_omp_frame,
+        validate_codex_version_output, validate_omp_version_output,
     },
     contract::{HarnessKind, NativeSessionHealth},
     mcp::{self, McpServer},
@@ -265,6 +265,13 @@ impl HarnessAdapter for OmpProcessAdapter {
         }
     }
 
+    fn completion_tools(&self) -> WorkerCompletionTools {
+        WorkerCompletionTools {
+            attachment_create: "harness_attachment_create",
+            complete: "harness_complete",
+        }
+    }
+
     async fn start(&mut self, spec: &HarnessStartSpec) -> AdapterResult<NativeSession> {
         ensure_fresh(HarnessKind::Omp, self.0.runtime.as_ref())?;
         let observed_version = version(HarnessKind::Omp, &spec.executable).await?;
@@ -482,6 +489,13 @@ impl HarnessAdapter for CodexProcessAdapter {
             active_turn_follow_up: false,
             cooperative_cancellation: true,
             safe_compaction: false,
+        }
+    }
+
+    fn completion_tools(&self) -> WorkerCompletionTools {
+        WorkerCompletionTools {
+            attachment_create: "tools.mcp__herdr__harness_attachment_create",
+            complete: "tools.mcp__herdr__harness_complete",
         }
     }
 
@@ -952,7 +966,11 @@ fn codex_reader(
                     }
                 }
                 Ok(CodexFrame::Notification { method, params }) => {
-                    provider_event(HarnessKind::Codex, &method, &params, &state, &events).await;
+                    let notification_thread = field(&params, "threadId");
+                    let bound_thread = state.lock().await.thread_id.clone();
+                    if notification_thread.is_none() || notification_thread == bound_thread {
+                        provider_event(HarnessKind::Codex, &method, &params, &state, &events).await;
+                    }
                 }
                 Ok(CodexFrame::ServerRequest { id, method, .. }) => {
                     send(

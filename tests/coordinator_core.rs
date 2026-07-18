@@ -1692,6 +1692,201 @@ async fn incompatible_fresh_session_does_not_request_unbounded_rotation() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the regression exercises one complete ended-related-Session replacement lifecycle"
+)]
+async fn fresh_related_task_uses_the_new_live_session_when_the_related_session_ended() {
+    let (state, coordinator, supervisor, worker, initial_task_id) = seeded_task().await;
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorCommand::CancelTask {
+                task_id: initial_task_id,
+            },
+        )
+        .await
+        .expect("fixture Task must cancel");
+    let worker_id: HarnessId = "omp-worker".parse().expect("worker ID must be valid");
+    let CommandOutcome::TaskCreated {
+        task_id: related_task_id,
+        ..
+    } = coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorCommand::CreateTask {
+                submission: TaskSubmissionV1 {
+                    schema_version: SCHEMA_VERSION,
+                    request_key: None,
+                    worker_id: worker_id.clone(),
+                    related_task_id: None,
+                    depends_on: Vec::new(),
+                    task_role: TaskRole::Other,
+                    session_reuse: SessionReusePolicy::Auto,
+                    preferred_session_id: None,
+                    title: "Bound work on the old Session".to_owned(),
+                    instructions: "Create an old durable Session binding.".to_owned(),
+                    attachments: Vec::new(),
+                    repository: TaskRepositoryAuthorityV1 {
+                        root: state.path().join("project"),
+                        access: RepositoryAccess::ReadOnly,
+                        write_scopes: Vec::new(),
+                    },
+                },
+            },
+        )
+        .await
+        .expect("related Task must be created")
+    else {
+        panic!("Task creation must return an ID")
+    };
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: worker.clone(),
+            },
+            CoordinatorCommand::ClaimNextTask,
+        )
+        .await
+        .expect("old Worker must bind the related Task");
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorCommand::CancelTask {
+                task_id: related_task_id,
+            },
+        )
+        .await
+        .expect("dispatched related Task must begin cancellation");
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: worker.clone(),
+            },
+            CoordinatorCommand::RecordCancellationCompleted {
+                task_id: related_task_id,
+                succeeded: true,
+            },
+        )
+        .await
+        .expect("read-only cancellation must settle without a Hold");
+    coordinator
+        .execute(
+            ActorContext::Session { capability: worker },
+            CoordinatorCommand::RecordHostStopped { clean: true },
+        )
+        .await
+        .expect("old Worker Session must end cleanly");
+
+    let (profile_snapshot, profile_digest) = worker_profile(None);
+    let CommandOutcome::WorkerStarted {
+        capability: new_worker,
+        ..
+    } = coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorCommand::StartWorker {
+                definition: HarnessDefinitionV1 {
+                    schema_version: SCHEMA_VERSION,
+                    id: worker_id.clone(),
+                    kind: HarnessKind::Omp,
+                    tier: HarnessTier::Worker,
+                    cwd: state.path().join("project"),
+                    launch_profile: Some("omp-worker".to_owned()),
+                    model: None,
+                },
+                profile_snapshot,
+                profile_digest,
+            },
+        )
+        .await
+        .expect("replacement Worker Session must start")
+    else {
+        panic!("Worker start must return a capability")
+    };
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: new_worker.clone(),
+            },
+            CoordinatorCommand::RecordHostReady,
+        )
+        .await
+        .expect("replacement Worker Host must become ready");
+
+    let CommandOutcome::TaskCreated { task_id, .. } = coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorCommand::CreateTask {
+                submission: TaskSubmissionV1 {
+                    schema_version: SCHEMA_VERSION,
+                    request_key: None,
+                    worker_id,
+                    related_task_id: Some(related_task_id),
+                    depends_on: Vec::new(),
+                    task_role: TaskRole::Implementation,
+                    session_reuse: SessionReusePolicy::Fresh,
+                    preferred_session_id: None,
+                    title: "Recover on a fresh Session".to_owned(),
+                    instructions: "Continue after the prior Session ended.".to_owned(),
+                    attachments: Vec::new(),
+                    repository: TaskRepositoryAuthorityV1 {
+                        root: state.path().join("project"),
+                        access: RepositoryAccess::Mutating,
+                        write_scopes: vec![WriteScopeV1::Subtree {
+                            path: PathBuf::from("src"),
+                        }],
+                    },
+                },
+            },
+        )
+        .await
+        .expect("fresh recovery Task must be created")
+    else {
+        panic!("Task creation must return an ID")
+    };
+
+    assert!(matches!(
+        coordinator
+            .execute(
+                ActorContext::Session {
+                    capability: new_worker,
+                },
+                CoordinatorCommand::ClaimNextTask,
+            )
+            .await
+            .expect("fresh recovery Task must select the new live Session"),
+        CommandOutcome::TaskDispatching {
+            task_id: dispatched,
+            ..
+        } if dispatched == task_id
+    ));
+    let QueryResult::Task(task) = coordinator
+        .query(
+            ActorContext::Session {
+                capability: supervisor,
+            },
+            CoordinatorQuery::GetTask { task_id },
+        )
+        .await
+        .expect("recovery Task must remain queryable")
+    else {
+        panic!("query must return the recovery Task")
+    };
+    assert_eq!(task.session_reused, Some(false));
+}
+
+#[tokio::test]
 async fn host_events_replay_idempotently_and_supervisor_can_stop_an_idle_worker() {
     let (_state, coordinator, supervisor, worker, _task_id) = seeded_task().await;
     let event = serde_json::json!({"kind":"activity","summary":"started"});

@@ -2064,6 +2064,7 @@ impl Coordinator {
         }
         let submission: TaskSubmissionV1 =
             serde_json::from_str(task.get("submission_json")).map_err(CoordinatorError::storage)?;
+        let policy = effective_policy(&submission);
         let worker_id: &str = task.get("worker_id");
         let related_session: Option<String> = if let Some(related_task_id) =
             submission.related_task_id
@@ -2080,7 +2081,7 @@ impl Coordinator {
             existing_binding.clone()
         } else if let Some(preferred) = submission.preferred_session_id {
             Some(preferred.to_string())
-        } else if related_session.is_some() {
+        } else if policy != SessionReusePolicy::Fresh && related_session.is_some() {
             related_session
         } else {
             sqlx::query_scalar("SELECT id FROM harness_sessions WHERE harness_id = ? AND ended_at IS NULL ORDER BY started_at DESC LIMIT 1")
@@ -2195,7 +2196,6 @@ impl Coordinator {
             previously_bound: prior_bindings != 0,
             adapter,
         };
-        let policy = effective_policy(&submission);
         let decision = if existing_binding.is_some()
             || (policy == SessionReusePolicy::Fresh && prior_bindings == 0)
         {

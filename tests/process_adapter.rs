@@ -116,6 +116,19 @@ done
     adapter.stop().await.expect("clean OMP shutdown");
 }
 
+#[test]
+fn omp_process_adapter_reports_direct_completion_tools() {
+    let adapter = OmpProcessAdapter::new();
+
+    assert_eq!(
+        adapter.completion_tools(),
+        herdr_harness_coordinator::adapter::WorkerCompletionTools {
+            attachment_create: "harness_attachment_create",
+            complete: "harness_complete",
+        }
+    );
+}
+
 #[tokio::test]
 async fn codex_process_adapter_initializes_thread_and_observes_completion() {
     let temp = TempDir::new().expect("temp directory");
@@ -132,8 +145,10 @@ while IFS= read -r line; do
     *'"method":"thread/start"'*) printf '{"id":"%s","result":{"thread":{"id":"thread-1","cwd":"%s","model":"fixture-model"}}}\n' "$id" "$PWD" ;;
     *'"method":"turn/start"'*)
       printf '{"id":"%s","result":{"turn":{"id":"turn-1"}}}\n' "$id"
-      echo '{"method":"turn/started","params":{"turn":{"id":"turn-1"}}}'
-      echo '{"method":"turn/completed","params":{"turn":{"id":"turn-1","status":"completed"}}}'
+      echo '{"method":"turn/started","params":{"threadId":"child-thread","turn":{"id":"child-turn"}}}'
+      echo '{"method":"turn/completed","params":{"threadId":"child-thread","turn":{"id":"child-turn","status":"completed"}}}'
+      echo '{"method":"turn/started","params":{"threadId":"thread-1","turn":{"id":"turn-1"}}}'
+      echo '{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"completed"}}}'
       ;;
   esac
 done
@@ -158,17 +173,41 @@ done
     assert_eq!(native.thread_id.as_deref(), Some("thread-1"));
     assert_eq!(acceptance.turn_id.as_deref(), Some("turn-1"));
     let mut completed = false;
-    for _ in 0..4 {
-        if matches!(
-            tokio::time::timeout(Duration::from_secs(1), events.next()).await,
-            Ok(Some(Ok(AdapterEvent::TurnCompleted { .. })))
-        ) {
-            completed = true;
-            break;
+    for _ in 0..6 {
+        if let Ok(Some(Ok(event))) =
+            tokio::time::timeout(Duration::from_secs(1), events.next()).await
+        {
+            match event {
+                AdapterEvent::TurnStarted { turn_id } => {
+                    assert_eq!(turn_id.as_deref(), Some("turn-1"));
+                }
+                AdapterEvent::TurnCompleted { turn_id, .. } => {
+                    assert_eq!(turn_id.as_deref(), Some("turn-1"));
+                    completed = true;
+                    break;
+                }
+                _ => {}
+            }
         }
     }
-    assert!(completed, "turn/completed must be terminal evidence");
+    assert!(
+        completed,
+        "the root turn/completed must be terminal evidence"
+    );
     adapter.stop().await.expect("clean Codex shutdown");
+}
+
+#[test]
+fn codex_process_adapter_reports_orchestrated_completion_tools() {
+    let adapter = CodexProcessAdapter::new();
+
+    assert_eq!(
+        adapter.completion_tools(),
+        herdr_harness_coordinator::adapter::WorkerCompletionTools {
+            attachment_create: "tools.mcp__herdr__harness_attachment_create",
+            complete: "tools.mcp__herdr__harness_complete",
+        }
+    );
 }
 
 #[tokio::test]

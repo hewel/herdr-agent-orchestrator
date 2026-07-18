@@ -101,6 +101,15 @@ pub struct AdapterCapabilities {
     pub safe_compaction: bool,
 }
 
+/// Provider-neutral native tool names a Worker uses to submit one structured Result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerCompletionTools {
+    /// Creates immutable verification evidence before completion.
+    pub attachment_create: &'static str,
+    /// Records the Worker's structured Result.
+    pub complete: &'static str,
+}
+
 /// Provider-neutral configuration needed to start one Worker Harness process.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HarnessStartSpec {
@@ -306,6 +315,9 @@ pub trait HarnessAdapter: Send {
 
     /// Returns only capabilities verified by pinned compatibility fixtures.
     fn capabilities(&self) -> AdapterCapabilities;
+
+    /// Returns the native tool names used to submit a structured Worker Result.
+    fn completion_tools(&self) -> WorkerCompletionTools;
 
     /// Starts and initializes one persistent native Worker Session.
     ///
