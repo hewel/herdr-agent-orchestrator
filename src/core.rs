@@ -77,7 +77,7 @@ impl CoordinatorError {
         }
     }
 
-    fn storage(error: impl std::fmt::Display) -> Self {
+    pub(crate) fn storage(error: impl std::fmt::Display) -> Self {
         Self::new(ErrorCategory::StorageFailure, error.to_string())
     }
 }
@@ -100,7 +100,8 @@ impl SessionCapability {
 }
 
 /// Authenticated command/query actor.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum ActorContext {
     /// Initial sole-Supervisor registration only.
     Bootstrap,
@@ -109,7 +110,8 @@ pub enum ActorContext {
 }
 
 /// State-changing operations accepted by [`Coordinator::execute`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum CoordinatorCommand {
     /// Register the sole Supervisor and create its live Session.
     RegisterSupervisor { definition: HarnessDefinitionV1 },
@@ -186,7 +188,8 @@ pub enum DeliveryUnknownResolution {
 }
 
 /// Read-only operations accepted by [`Coordinator::query`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum CoordinatorQuery {
     /// Return durable Harness identities in creation order.
     ListHarnesses,
