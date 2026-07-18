@@ -8,13 +8,15 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::{
+    activation::{ActivationRegistry, DesiredActivation},
     broker::{BrokerOperation, BrokerRequest, BrokerResponse, call},
     contract::{
-        HarnessDefinitionV1, HarnessId, MessageSubmissionV1, ObservationCheckpoint,
+        HarnessDefinitionV1, HarnessId, HarnessTier, MessageSubmissionV1, ObservationCheckpoint,
         ResultManifestV1, SCHEMA_VERSION, TaskId,
     },
     core::{ActorContext, CoordinatorCommand, CoordinatorQuery, SessionCapability},
     herdr::{HerdrSocketClient, PluginPaneOpenParams},
+    profile::ProfileRegistry,
 };
 
 /// MCP revision implemented by the stdio bridge.
@@ -33,13 +35,52 @@ const REQUIRED_WORKER_TOOLS: [&str; 6] = [
 pub struct McpServer {
     socket: PathBuf,
     capability: SessionCapability,
+    workspace_state_dir: Option<PathBuf>,
+    herdr_socket: Option<PathBuf>,
+    native_turn_id: Option<String>,
 }
 
 impl McpServer {
     /// Creates a bridge whose every call is attributed to one Harness Session.
     #[must_use]
     pub fn new(socket: PathBuf, capability: SessionCapability) -> Self {
-        Self { socket, capability }
+        Self {
+            socket,
+            capability,
+            workspace_state_dir: None,
+            herdr_socket: None,
+            native_turn_id: None,
+        }
+    }
+
+    /// Creates a bridge with an explicit durable workspace state directory.
+    #[must_use]
+    pub fn for_workspace(
+        socket: PathBuf,
+        capability: SessionCapability,
+        workspace_state_dir: PathBuf,
+    ) -> Self {
+        Self {
+            socket,
+            capability,
+            workspace_state_dir: Some(workspace_state_dir),
+            herdr_socket: None,
+            native_turn_id: None,
+        }
+    }
+
+    /// Binds Herdr pane operations to the socket that identifies this workspace session.
+    #[must_use]
+    pub fn with_herdr_socket(mut self, herdr_socket: PathBuf) -> Self {
+        self.herdr_socket = Some(herdr_socket);
+        self
+    }
+
+    /// Correlates provider host-tool completion when its protocol omits turn IDs.
+    #[must_use]
+    pub fn with_native_turn_id(mut self, native_turn_id: impl Into<String>) -> Self {
+        self.native_turn_id = Some(native_turn_id.into());
+        self
     }
 
     /// Serves newline-delimited JSON-RPC messages on stdin/stdout.
@@ -113,7 +154,7 @@ impl McpServer {
             Err(error) => json!({
                 "jsonrpc":"2.0",
                 "id":id,
-                "result": {"content":[{"type":"text","text":error.to_string()}],"isError":true}
+                "result": {"content":[{"type":"text","text":format!("{error:#}")}],"isError":true}
             }),
         })
     }
@@ -142,14 +183,7 @@ impl McpServer {
                 submission: serde_json::from_value::<MessageSubmissionV1>(arguments)
                     .context("invalid MessageSubmissionV1")?,
             }),
-            "harness_complete" => {
-                let args: CompleteArgs =
-                    serde_json::from_value(arguments).context("invalid completion arguments")?;
-                execute(CoordinatorCommand::CompleteTask {
-                    manifest: args.manifest,
-                    native_turn_id: args.native_turn_id,
-                })
-            }
+            "harness_complete" => self.complete_operation(arguments)?,
             "harness_task_approve" => {
                 let args: ApproveArgs =
                     serde_json::from_value(arguments).context("invalid Approval arguments")?;
@@ -217,10 +251,25 @@ impl McpServer {
         tool_result(response)
     }
 
+    fn complete_operation(&self, arguments: Value) -> Result<ToolOperation> {
+        let args: CompleteArgs =
+            serde_json::from_value(arguments).context("invalid completion arguments")?;
+        let native_turn_id = self
+            .native_turn_id
+            .clone()
+            .or(args.native_turn_id)
+            .context("native turn ID is required for this provider")?;
+        Ok(execute(CoordinatorCommand::CompleteTask {
+            manifest: args.manifest,
+            native_turn_id,
+        }))
+    }
+
     async fn start_worker(&self, arguments: Value) -> Result<Value> {
         let args: StartArgs =
             serde_json::from_value(arguments).context("invalid Worker start arguments")?;
-        let definition = args.definition.clone();
+        let (definition, profile_snapshot, profile_digest, workspace_id) =
+            self.resolve_worker_start(&args.worker_id).await?;
         let worker_id = definition.id.clone();
         let request = BrokerRequest {
             schema_version: SCHEMA_VERSION,
@@ -230,9 +279,9 @@ impl McpServer {
                     capability: self.capability.clone(),
                 },
                 command: CoordinatorCommand::StartWorker {
-                    definition: args.definition,
-                    profile_snapshot: args.profile_snapshot,
-                    profile_digest: args.profile_digest,
+                    definition: definition.clone(),
+                    profile_snapshot,
+                    profile_digest,
                 },
             },
         };
@@ -268,13 +317,8 @@ impl McpServer {
                 .as_str()
                 .context("Session capability did not serialize as a bearer")?
                 .to_owned();
-            let socket_path = std::env::var_os("HERDR_SOCKET_PATH")
-                .map(PathBuf::from)
-                .context("HERDR_SOCKET_PATH is required to open a Worker pane")?;
-            HerdrSocketClient::new(socket_path)
-                .open_worker(PluginPaneOpenParams::worker(&bearer, &definition.cwd, None))
-                .await
-                .context("opening Herdr Worker pane")?;
+            self.open_worker_pane(&bearer, &definition, workspace_id)
+                .await?;
             let public = json!({"worker_id": worker_id, "presence": "starting"});
             Ok(json!({
                 "content": [{"type":"text","text":serde_json::to_string_pretty(&public)?}],
@@ -304,6 +348,109 @@ impl McpServer {
         }
         launch
     }
+
+    async fn open_worker_pane(
+        &self,
+        bearer: &str,
+        definition: &HarnessDefinitionV1,
+        workspace_id: String,
+    ) -> Result<()> {
+        let socket_path = self
+            .herdr_socket
+            .clone()
+            .or_else(|| std::env::var_os("HERDR_SOCKET_PATH").map(PathBuf::from))
+            .context("Herdr socket is required to open a Worker pane")?;
+        let mut pane = PluginPaneOpenParams::worker(bearer, &definition.cwd, Some(workspace_id));
+        let state_dir = self
+            .workspace_state_dir
+            .as_deref()
+            .or_else(|| self.socket.parent())
+            .context("Coordinator socket has no state directory")?;
+        pane.env.insert(
+            "HERDR_PLUGIN_STATE_DIR".to_owned(),
+            state_dir.to_string_lossy().into_owned(),
+        );
+        pane.env.insert(
+            "HERDR_COORDINATOR_SOCKET".to_owned(),
+            self.socket.to_string_lossy().into_owned(),
+        );
+        pane.env.insert(
+            "HERDR_COORDINATOR_BIN".to_owned(),
+            std::env::current_exe()?.to_string_lossy().into_owned(),
+        );
+        HerdrSocketClient::new(socket_path)
+            .open_worker(pane)
+            .await
+            .context("opening Herdr Worker pane")?;
+        Ok(())
+    }
+
+    async fn resolve_worker_start(
+        &self,
+        worker_id: &HarnessId,
+    ) -> Result<(HarnessDefinitionV1, String, String, String)> {
+        let workspace_state = self.workspace_state_dir.as_deref().unwrap_or_else(|| {
+            self.socket
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+        });
+        let workspaces = workspace_state
+            .parent()
+            .context("workspace state has no workspaces directory")?;
+        let plugin_state = workspaces
+            .parent()
+            .context("workspaces directory has no plugin state root")?;
+        let activation = ActivationRegistry::open(plugin_state).await?;
+        let view = activation
+            .find_by_state_dir(workspace_state)
+            .await?
+            .filter(|view| view.desired == DesiredActivation::On)
+            .context("this Coordinator state directory is not enabled for a workspace")?;
+        let selection = view
+            .selection
+            .context("enabled workspace has no Harness selection")?;
+        let worker = selection
+            .workers
+            .iter()
+            .find(|worker| &worker.worker_id == worker_id)
+            .with_context(|| format!("Worker `{worker_id}` is not selected for this workspace"))?;
+        let config_dir = plugin_config_dir(plugin_state);
+        let profiles = ProfileRegistry::load(&config_dir.join("profiles"))?;
+        let resolved = profiles.resolve_selected(&worker.profile_id, std::env::vars())?;
+        let definition = HarnessDefinitionV1 {
+            schema_version: SCHEMA_VERSION,
+            id: worker.worker_id.clone(),
+            kind: resolved.profile.kind,
+            tier: HarnessTier::Worker,
+            cwd: view.repository_root,
+            launch_profile: Some(resolved.profile.id.to_string()),
+            model: resolved.profile.model.clone(),
+        };
+        Ok((
+            definition,
+            resolved.snapshot,
+            resolved.digest,
+            view.workspace_id,
+        ))
+    }
+}
+
+fn plugin_config_dir(plugin_state: &Path) -> PathBuf {
+    std::env::var_os("HERDR_PLUGIN_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config"))
+                })
+                .map(|config| {
+                    config
+                        .join("herdr/plugins/config")
+                        .join("herdr-harness-coordinator")
+                })
+        })
+        .unwrap_or_else(|| plugin_state.join("config"))
 }
 
 /// Verifies the identity-bound Worker tool surface before a native Harness becomes online.
@@ -351,14 +498,12 @@ fn query(query: CoordinatorQuery) -> ToolOperation {
 #[derive(Deserialize)]
 struct CompleteArgs {
     manifest: ResultManifestV1,
-    native_turn_id: String,
+    native_turn_id: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct StartArgs {
-    definition: HarnessDefinitionV1,
-    profile_snapshot: String,
-    profile_digest: String,
+    worker_id: HarnessId,
 }
 
 #[derive(Deserialize)]
@@ -426,8 +571,8 @@ fn tools() -> Vec<Value> {
         ),
         tool(
             "harness_start",
-            "Register an explicit Worker and open its unfocused Herdr pane.",
-            passthrough.clone(),
+            "Start one explicitly selected Worker by its durable ID.",
+            json!({"type":"object","required":["worker_id"],"properties":{"worker_id":{"type":"string"}},"additionalProperties":false}),
         ),
         tool(
             "harness_task_create",
@@ -477,6 +622,26 @@ fn tools() -> Vec<Value> {
     ]
 }
 
+/// OMP RPC declarations for the Worker-safe Coordinator MCP tools.
+pub(crate) fn omp_host_tools() -> Vec<Value> {
+    tools()
+        .into_iter()
+        .filter(|tool| {
+            tool.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| REQUIRED_WORKER_TOOLS.contains(&name))
+        })
+        .map(|tool| {
+            json!({
+                "name": tool["name"],
+                "label": tool["name"],
+                "description": tool["description"],
+                "parameters": tool["inputSchema"],
+            })
+        })
+        .collect()
+}
+
 #[expect(
     clippy::needless_pass_by_value,
     reason = "the schema Value is moved directly into the JSON result"
@@ -512,5 +677,22 @@ pub fn from_bearer(socket: &Path, bearer: String) -> Result<McpServer> {
     Ok(McpServer::new(
         socket.to_path_buf(),
         SessionCapability::from_bearer(bearer)?,
+    ))
+}
+
+/// Convenience constructor for short runtime sockets outside the durable state directory.
+///
+/// # Errors
+///
+/// Returns an error when the bearer is not a valid Session capability.
+pub fn from_bearer_for_workspace(
+    socket: &Path,
+    bearer: String,
+    workspace_state_dir: PathBuf,
+) -> Result<McpServer> {
+    Ok(McpServer::for_workspace(
+        socket.to_path_buf(),
+        SessionCapability::from_bearer(bearer)?,
+        workspace_state_dir,
     ))
 }

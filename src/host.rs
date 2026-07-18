@@ -16,14 +16,15 @@ use crate::{
     attachment::AttachmentStore,
     broker::{BrokerOperation, BrokerRequest, call},
     contract::{
-        DeliveryIntent, HarnessKind, HarnessLaunchProfileV1, MessageSubmissionV1, SCHEMA_VERSION,
-        TaskSubmissionV1, Validate,
+        DeliveryIntent, HarnessKind, MessageSubmissionV1, SCHEMA_VERSION, TaskSubmissionV1,
     },
     core::{
-        ActorContext, CommandOutcome, CoordinatorCommand, CoordinatorQuery, InboxMessageView,
-        QueryResult, SessionCapability, TaskState,
+        ActorContext, CommandOutcome, CoordinatorCommand, CoordinatorQuery,
+        HarnessCompatibilityEvidenceV1, InboxMessageView, QueryResult, SessionCapability,
+        TaskState,
     },
     process_adapter::{CodexProcessAdapter, OmpProcessAdapter},
+    profile::{parse_launch_profile_snapshot, resolve_executable},
 };
 
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
@@ -74,18 +75,23 @@ async fn run_worker_host_inner(
     if actual_digest != expected_digest {
         bail!("Worker launch profile snapshot digest does not match durable Session state");
     }
-    let profile: HarnessLaunchProfileV1 =
-        toml::from_str(&snapshot).context("decoding durable Worker launch profile snapshot")?;
-    profile
-        .validate()
-        .context("validating durable Worker launch profile")?;
+    let profile = parse_launch_profile_snapshot(&snapshot)
+        .map_err(anyhow::Error::msg)
+        .context("decoding durable Worker launch profile snapshot")?;
     if profile.kind != session.definition.kind {
         bail!("Worker Harness Kind differs from its durable launch profile");
     }
+    let process_environment = std::env::vars().collect::<BTreeMap<_, _>>();
+    let executable = resolve_executable(&profile, &process_environment)
+        .context("resolving durable Worker executable")?;
     let mut environment = profile
         .inherit_env
         .iter()
-        .filter_map(|name| std::env::var(name).ok().map(|value| (name.clone(), value)))
+        .filter_map(|name| {
+            process_environment
+                .get(name)
+                .map(|value| (name.clone(), value.clone()))
+        })
         .collect::<BTreeMap<_, _>>();
     environment.insert(
         "HERDR_HARNESS_CAPABILITY".to_owned(),
@@ -104,7 +110,7 @@ async fn run_worker_host_inner(
     );
     let spec = HarnessStartSpec {
         session_id: session.session_id,
-        executable: profile.executable,
+        executable,
         cwd: session.definition.cwd,
         provider_state_dir: state_dir
             .join("sessions")
@@ -124,10 +130,42 @@ async fn run_worker_host_inner(
         HarnessKind::Omp => Box::new(OmpProcessAdapter::new()),
         HarnessKind::Codex => Box::new(CodexProcessAdapter::new()),
     };
-    adapter
+    let capabilities = adapter.capabilities();
+    let native = adapter
         .start(&spec)
         .await
         .context("starting native Harness")?;
+    broker_execute(
+        socket,
+        capability.clone(),
+        CoordinatorCommand::RecordHostCompatibility {
+            resolved_executable: spec.executable.clone(),
+            observed_version: native.observed_version,
+            native_session_id: native.session_id,
+            native_thread_id: native.thread_id,
+            effective_model: native.model,
+            evidence: HarnessCompatibilityEvidenceV1 {
+                schema_version: SCHEMA_VERSION,
+                kind: profile.kind,
+                capabilities,
+                successful_checks: match profile.kind {
+                    HarnessKind::Omp => vec![
+                        "version".to_owned(),
+                        "ready".to_owned(),
+                        "set_host_tools".to_owned(),
+                        "get_state".to_owned(),
+                    ],
+                    HarnessKind::Codex => vec![
+                        "version".to_owned(),
+                        "initialize".to_owned(),
+                        "initialized".to_owned(),
+                        "thread_start".to_owned(),
+                    ],
+                },
+            },
+        },
+    )
+    .await?;
     broker_execute(
         socket,
         capability.clone(),

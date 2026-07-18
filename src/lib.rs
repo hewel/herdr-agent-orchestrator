@@ -1,5 +1,6 @@
 //! Durable coordination primitives for autonomous Herdr Harnesses.
 
+pub mod activation;
 pub mod adapter;
 pub mod attachment;
 pub mod broker;

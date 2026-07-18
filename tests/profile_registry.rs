@@ -58,3 +58,28 @@ fn registry_rejects_kind_mismatch_instead_of_routing_automatically() {
         .expect_err("registry must not choose another profile or Kind");
     assert!(error.to_string().contains("not compatible"));
 }
+
+#[test]
+fn registry_resolves_v2_bare_executable_on_each_new_session() {
+    let directory = tempfile::tempdir().expect("profile directory");
+    let bin = tempfile::tempdir().expect("binary directory");
+    let executable = bin.path().join("omp-current");
+    fs::write(&executable, "fixture").expect("fake executable");
+    fs::write(
+        directory.path().join("omp.toml"),
+        "schema_version = 2\nid = \"omp-kimi\"\nkind = \"omp\"\nexecutable = \"omp-current\"\nmodel = \"kimi-code/k3:high\"\ninherit_env = [\"PATH\"]\n",
+    )
+    .expect("profile fixture");
+    let registry = ProfileRegistry::load(directory.path()).expect("registry must load");
+
+    let resolved = registry
+        .resolve(
+            &"omp-kimi".parse().expect("valid ID"),
+            HarnessKind::Omp,
+            [("PATH", bin.path().to_string_lossy().into_owned())],
+        )
+        .expect("bare executable must resolve");
+
+    assert_eq!(resolved.executable, executable);
+    assert_eq!(resolved.profile.provider_profile, None);
+}

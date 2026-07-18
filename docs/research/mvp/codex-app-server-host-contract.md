@@ -2,7 +2,7 @@
 
 Status: resolved for the Harness Coordinator MVP.
 
-This contract defines how a pane-resident Harness Host starts and controls one autonomous Codex Worker Harness, maintains its thread across top-level Tasks, delivers FollowUps and Steers, captures Result evidence, and leaves Codex-native collaboration private. It targets the locally verified Codex CLI `0.144.5` App Server protocol.
+This contract defines how a pane-resident Harness Host starts and controls one autonomous Codex Worker Harness, maintains its thread across top-level Tasks, delivers FollowUps and Steers, captures Result evidence, and leaves Codex-native collaboration private. Compatibility is established by App Server behavior, not a Codex CLI release pin.
 
 ## Confirmed App Server facts
 
@@ -20,13 +20,15 @@ The current upstream overview is the [Codex App Server manual](https://learn.cha
 
 ## Launch
 
-The Harness Host checks `codex --version` and accepts exactly `0.144.5`. It launches:
+The Harness Host requires bounded nonempty `codex --version` output, records it, and launches:
 
 ```text
 codex app-server --listen stdio:// --strict-config
 ```
 
 The selected Worker launch profile owns model, reasoning, sandbox, approvals, tools, skills, plugins, MCP servers, hooks, and native multi-agent configuration. The Coordinator records effective values reported by App Server but does not rewrite them into a cross-provider policy.
+
+A compatible newer release proceeds when initialization, thread creation, correlation, and required Coordinator MCP-tool visibility succeed. Missing behavior fails closed regardless of the version string.
 
 The process receives normal Herdr context so the official Codex integration may remain the pane's semantic status authority. The Coordinator's same-user cooperative threat model applies.
 
@@ -117,4 +119,4 @@ Repeated cancellation is idempotent. Background terminals and native descendants
 
 ## Compatibility tests
 
-The pinned fixture must generate or compare the installed App Server schemas and prove initialization, persistent thread creation, consecutive turns, FollowUp queuing, `turn/steer`, MCP tool calls, native collaboration tolerance, structured completion, thread snapshot, interruption, EOF, and process cleanup. Another Codex version is unsupported until the fixture and contract are updated.
+Real-process fixtures must generate or compare the installed App Server schemas and prove initialization, persistent thread creation, consecutive turns, FollowUp queuing, `turn/steer`, MCP tool calls, native collaboration tolerance, structured completion, thread snapshot, interruption, EOF, and process cleanup. Version text alone never grants or denies compatibility.

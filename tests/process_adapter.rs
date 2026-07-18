@@ -27,7 +27,7 @@ fn spec(temp: &TempDir, executable: std::path::PathBuf) -> HarnessStartSpec {
         executable,
         cwd: temp.path().to_path_buf(),
         provider_state_dir: temp.path().join("state"),
-        provider_profile: "fixture-profile".to_owned(),
+        provider_profile: Some("fixture-profile".to_owned()),
         model: Some("fixture-model".to_owned()),
         config_overlays: Vec::new(),
         environment: BTreeMap::new(),
@@ -51,10 +51,14 @@ async fn omp_process_adapter_separates_acceptance_from_agent_end() {
         temp.path(),
         "fake-omp",
         r#"#!/bin/sh
-if [ "$1" = "--version" ]; then echo 'omp/17.0.2'; exit 0; fi
+if [ "$1" = "--version" ]; then echo 'omp/17.0.4'; exit 0; fi
 echo '{"type":"ready"}'
 while IFS= read -r line; do
   case "$line" in
+    *'"type":"set_host_tools"'*)
+      id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+      printf '{"type":"response","id":"%s","command":"set_host_tools","success":true,"data":{"toolNames":["harness_list"]}}\n' "$id"
+      ;;
     *'"type":"get_state"'*)
       id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
       printf '{"type":"response","id":"%s","command":"get_state","success":true,"data":{"sessionId":"omp-session","isStreaming":false,"queuedMessageCount":0,"model":{"id":"fixture-model"}}}\n' "$id"
@@ -86,6 +90,7 @@ done
         .expect("prompt acceptance");
 
     assert_eq!(native.session_id.as_deref(), Some("omp-session"));
+    assert_eq!(native.observed_version, "omp/17.0.4");
     assert_eq!(acceptance.correlation, "delivery-7");
     let mut completed = false;
     for _ in 0..4 {
@@ -160,15 +165,15 @@ done
 }
 
 #[tokio::test]
-async fn process_adapter_rejects_an_unverified_version_before_launch() {
+async fn process_adapter_rejects_malformed_version_evidence_before_launch() {
     let temp = TempDir::new().expect("temp directory");
-    let provider = executable(temp.path(), "wrong-omp", "#!/bin/sh\necho 'omp/17.0.3'\n");
+    let provider = executable(temp.path(), "wrong-omp", "#!/bin/sh\necho '   '\n");
     let mut adapter = OmpProcessAdapter::new();
 
     let error = adapter
         .start(&spec(&temp, provider))
         .await
-        .expect_err("unverified version must fail");
+        .expect_err("malformed version evidence must fail");
 
-    assert!(error.to_string().contains("unsupported Omp version"));
+    assert!(error.to_string().contains("invalid Omp version"));
 }

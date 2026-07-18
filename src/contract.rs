@@ -204,12 +204,74 @@ pub struct HarnessLaunchProfileV1 {
     pub config_overlays: Vec<PathBuf>,
 }
 
+/// Coordinator-owned launch selection that resolves current executables at Session start.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessLaunchProfileV2 {
+    /// Must equal two.
+    pub schema_version: u32,
+    /// Immutable profile identifier.
+    pub id: HarnessId,
+    /// Harness Kind accepted by this profile.
+    pub kind: HarnessKind,
+    /// Absolute executable or one bare command resolved through `PATH`.
+    pub executable: String,
+    /// Optional native profile; absent uses the user's existing default.
+    pub provider_profile: Option<String>,
+    /// Explicit model selected by the user.
+    pub model: String,
+    /// Environment variable names explicitly inherited by the Worker.
+    #[serde(default)]
+    pub inherit_env: Vec<String>,
+    /// OMP configuration overlays, applied in order.
+    #[serde(default)]
+    pub config_overlays: Vec<PathBuf>,
+}
+
 impl Validate for HarnessLaunchProfileV1 {
     fn validate(&self) -> Result<(), ValidationError> {
         validate_version(self.schema_version)?;
         validate_absolute_path("executable", &self.executable)?;
         validate_text("provider_profile", &self.provider_profile, 128, 512)?;
         validate_optional_text("model", self.model.as_deref(), 256)?;
+        validate_unique_limit("inherit_env", &self.inherit_env, 128)?;
+        for name in &self.inherit_env {
+            let valid = !name.is_empty()
+                && name.len() <= 128
+                && name.bytes().enumerate().all(|(index, byte)| {
+                    byte == b'_'
+                        || byte.is_ascii_uppercase()
+                        || (index > 0 && byte.is_ascii_digit())
+                });
+            if !valid {
+                return field_error("inherit_env", "contains an invalid environment name");
+            }
+        }
+        for overlay in &self.config_overlays {
+            validate_absolute_path("config_overlays", overlay)?;
+        }
+        if self.kind == HarnessKind::Codex && !self.config_overlays.is_empty() {
+            return field_error("config_overlays", "is supported only for OMP profiles");
+        }
+        Ok(())
+    }
+}
+
+impl Validate for HarnessLaunchProfileV2 {
+    fn validate(&self) -> Result<(), ValidationError> {
+        if self.schema_version != 2 {
+            return field_error("schema_version", "must equal 2");
+        }
+        let executable = Path::new(&self.executable);
+        let bare = !self.executable.is_empty()
+            && executable.components().count() == 1
+            && self.executable != "."
+            && self.executable != "..";
+        if !executable.is_absolute() && !bare {
+            return field_error("executable", "must be absolute or a bare command name");
+        }
+        validate_optional_text("provider_profile", self.provider_profile.as_deref(), 128)?;
+        validate_text("model", &self.model, 256, 1024)?;
         validate_unique_limit("inherit_env", &self.inherit_env, 128)?;
         for name in &self.inherit_env {
             let valid = !name.is_empty()

@@ -2,7 +2,7 @@
 
 Status: resolved for the Harness Coordinator MVP.
 
-This contract defines how a pane-resident Harness Host starts and controls one autonomous OMP Worker Harness, delivers Coordinator messages, captures top-level lifecycle and Result evidence, and leaves OMP-native multi-agent behavior private. It targets the locally verified OMP `17.0.2` protocol.
+This contract defines how a pane-resident Harness Host starts and controls one autonomous OMP Worker Harness, delivers Coordinator messages, captures top-level lifecycle and Result evidence, and leaves OMP-native multi-agent behavior private. Compatibility is established by runtime protocol behavior, not an OMP release pin.
 
 ## Confirmed OMP facts
 
@@ -20,15 +20,18 @@ The versioned upstream reference is [OMP RPC v17.0.2](https://github.com/can1357
 
 ## Launch
 
-The Harness Host checks `omp --version` and accepts exactly `17.0.2`. It launches one process with:
+The Harness Host requires bounded nonempty `omp --version` output, records it, and launches one process with:
 
 ```text
 omp
+  --model <explicit-selected-model>
   --mode rpc
   --cwd <registered-live-worktree>
   --session-dir <harness-session-state>/provider-session
-  --config <selected-launch-profile>
+  --config <optional-selected-overlay>
 ```
+
+`--profile` is included only when the launch profile explicitly selects a native profile. Omitting it deliberately uses the user's existing OMP default profile. A compatible newer OMP release proceeds; missing `ready`, `set_host_tools`, correlation, or `get_state` behavior fails closed.
 
 The launch profile, not the Coordinator, chooses model, approval behavior, native tools, extensions, skills, rules, MCP configuration, and multi-agent behavior. The selected configuration is recorded with the Harness Session.
 
@@ -116,4 +119,4 @@ Repeated cancellation is idempotent. If cooperative cancellation fails, the Herd
 
 ## Compatibility tests
 
-The real-process fixture must prove ready framing, correlation under interleaved events, prompt acceptance versus completion, FollowUp, Steer, host-tool correlation, native child tolerance, Result completion, transcript collection, abort, and normal shutdown. Another OMP version is unsupported until the fixture and contract are updated.
+Real-process fixtures must prove ready framing, correlation under interleaved events, prompt acceptance versus completion, FollowUp, Steer, host-tool execution and correlation, native child tolerance, Result completion, transcript collection, abort, and normal shutdown. Version text alone never grants or denies compatibility.

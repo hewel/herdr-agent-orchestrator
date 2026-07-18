@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://herdr.dev/schemas/harness-coordinator/harness-launch-profile-v2.schema.json",
+  "title": "HarnessLaunchProfileV2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "id", "kind", "executable", "model"],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "id": { "$ref": "common-v1.schema.json#/$defs/harnessId" },
+    "kind": { "enum": ["omp", "codex"] },
+    "executable": {
+      "type": "string",
+      "minLength": 1,
+      "oneOf": [
+        { "$ref": "common-v1.schema.json#/$defs/absolutePath" },
+        { "pattern": "^[^/\\\\]+$" }
+      ]
+    },
+    "provider_profile": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "model": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "inherit_env": {
+      "type": "array",
+      "maxItems": 128,
+      "uniqueItems": true,
+      "items": { "type": "string", "pattern": "^[A-Z_][A-Z0-9_]{0,127}$" }
+    },
+    "config_overlays": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "common-v1.schema.json#/$defs/absolutePath" }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "kind": { "const": "codex" } } },
+      "then": { "properties": { "config_overlays": { "maxItems": 0 } } }
+    }
+  ]
+}

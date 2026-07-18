@@ -1,4 +1,4 @@
-//! Herdr `0.7.4` socket and plugin boundary.
+//! Herdr socket-protocol and plugin boundary.
 //!
 //! Public pane identifiers are live UI locations. Coordinator sessions bind to
 //! [`PaneInfo::terminal_id`] and resolve a fresh [`PaneLocation`] after every
@@ -40,7 +40,9 @@ pub enum HerdrError {
     OversizedResponse,
     #[error("unexpected Herdr response: {0}")]
     UnexpectedResponse(String),
-    #[error("Herdr 0.7.4 protocol 16 required; received version {version}, protocol {protocol}")]
+    #[error(
+        "Herdr >=0.7.4 with protocol 16 required; received version {version}, protocol {protocol}"
+    )]
     Incompatible { version: String, protocol: u32 },
     #[error("terminal {0} is absent from the current Herdr snapshot")]
     TerminalMissing(String),
@@ -72,13 +74,13 @@ pub struct SessionSnapshot {
 }
 
 impl SessionSnapshot {
-    /// Verifies the pinned MVP Herdr version and socket protocol.
+    /// Verifies the minimum product release and exact socket protocol.
     ///
     /// # Errors
     ///
-    /// Returns [`HerdrError::Incompatible`] for any unverified version.
+    /// Returns [`HerdrError::Incompatible`] when the protocol differs or the release is too old.
     pub fn validate_compatibility(&self) -> Result<(), HerdrError> {
-        if self.version != HERDR_VERSION || self.protocol != HERDR_PROTOCOL {
+        if !version_at_least(&self.version, HERDR_VERSION) || self.protocol != HERDR_PROTOCOL {
             return Err(HerdrError::Incompatible {
                 version: self.version.clone(),
                 protocol: self.protocol,
@@ -145,29 +147,46 @@ impl PluginPaneOpenParams {
             "HERDR_HARNESS_SESSION_ID".to_owned(),
             session_capability.to_owned(),
         );
+        env.insert(
+            "HERDR_HARNESS_CWD".to_owned(),
+            cwd.to_string_lossy().into_owned(),
+        );
         Self {
             plugin_id: PLUGIN_ID.to_owned(),
             entrypoint: WORKER_ENTRYPOINT.to_owned(),
             placement: Some("tab".to_owned()),
             workspace_id,
-            cwd: Some(cwd.to_string_lossy().into_owned()),
+            cwd: None,
             env,
             focus: false,
         }
     }
 
     #[must_use]
-    pub fn popup() -> Self {
+    pub fn popup(workspace_id: String) -> Self {
         Self {
             plugin_id: PLUGIN_ID.to_owned(),
             entrypoint: POPUP_ENTRYPOINT.to_owned(),
             placement: Some("popup".to_owned()),
-            workspace_id: None,
+            workspace_id: Some(workspace_id),
             cwd: None,
             env: BTreeMap::new(),
             focus: true,
         }
     }
+}
+
+fn version_at_least(actual: &str, minimum: &str) -> bool {
+    fn components(value: &str) -> Option<[u64; 3]> {
+        let mut parts = value.split('.');
+        let parsed = [
+            parts.next()?.parse().ok()?,
+            parts.next()?.parse().ok()?,
+            parts.next()?.parse().ok()?,
+        ];
+        parts.next().is_none().then_some(parsed)
+    }
+    matches!((components(actual), components(minimum)), (Some(actual), Some(minimum)) if actual >= minimum)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

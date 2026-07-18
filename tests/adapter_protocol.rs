@@ -142,11 +142,23 @@ fn codex_classifier_rejects_an_id_without_response_or_method() {
 }
 
 #[test]
-fn omp_version_validator_accepts_only_the_pinned_cli_output() {
-    validate_omp_version_output("omp/17.0.2\n").expect("pinned OMP output");
+fn omp_version_validator_records_newer_nonempty_output_without_a_pin() {
+    let observed = validate_omp_version_output("omp/17.0.4\n").expect("bounded version output");
 
-    let error = validate_omp_version_output("omp/17.0.3\n")
-        .expect_err("an unverified OMP version must fail");
+    assert_eq!(observed, "omp/17.0.4");
+}
+
+#[test]
+fn codex_version_validator_records_arbitrary_release_output() {
+    let observed =
+        validate_codex_version_output("codex-cli 0.200.0\r\n").expect("bounded version output");
+
+    assert_eq!(observed, "codex-cli 0.200.0");
+}
+
+#[test]
+fn version_validator_rejects_empty_or_multiline_output() {
+    let error = validate_omp_version_output(" \n").expect_err("empty output must fail");
     assert!(matches!(
         error,
         herdr_harness_coordinator::adapter::AdapterError::UnsupportedVersion {
@@ -154,19 +166,5 @@ fn omp_version_validator_accepts_only_the_pinned_cli_output() {
             ..
         }
     ));
-}
-
-#[test]
-fn codex_version_validator_accepts_only_the_pinned_cli_output() {
-    validate_codex_version_output("codex-cli 0.144.5\r\n").expect("pinned Codex output");
-
-    let error = validate_codex_version_output(" codex-cli 0.144.5\n")
-        .expect_err("non-exact Codex output must fail");
-    assert!(matches!(
-        error,
-        herdr_harness_coordinator::adapter::AdapterError::UnsupportedVersion {
-            kind: HarnessKind::Codex,
-            ..
-        }
-    ));
+    assert!(validate_codex_version_output("codex 1\nextra\n").is_err());
 }

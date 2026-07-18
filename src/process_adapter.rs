@@ -1,7 +1,12 @@
 //! Process-backed OMP RPC and Codex App Server Harness Adapters.
 
 use std::{
-    collections::HashMap, fmt::Write as _, path::Path, process::Stdio, sync::Arc, time::Duration,
+    collections::HashMap,
+    fmt::Write as _,
+    path::Path,
+    process::Stdio,
+    sync::{Arc, Weak},
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -23,11 +28,14 @@ use crate::{
         validate_omp_version_output,
     },
     contract::HarnessKind,
+    mcp::{self, McpServer},
 };
 
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const STOP_TIMEOUT: Duration = Duration::from_secs(15);
+const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_VERSION_BYTES: u64 = 4096;
 type Reply = Result<Value, String>;
 type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<Reply>>>>;
 
@@ -56,7 +64,7 @@ impl Default for State {
 
 struct Runtime {
     child: Child,
-    stdin: Option<ChildStdin>,
+    stdin: Option<Arc<Mutex<ChildStdin>>>,
     pending: Pending,
 }
 
@@ -112,7 +120,7 @@ impl ProcessAdapter {
             .ok_or_else(|| operation(kind, "provider is not running"))?;
         let (tx, rx) = oneshot::channel();
         runtime.pending.lock().await.insert(id.clone(), tx);
-        if let Err(error) = write_line(kind, runtime.stdin.as_mut(), &payload).await {
+        if let Err(error) = write_line(kind, runtime.stdin.as_ref(), &payload).await {
             runtime.pending.lock().await.remove(&id);
             return Err(delivery_ambiguous(kind, error.to_string()));
         }
@@ -180,7 +188,7 @@ impl ProcessAdapter {
     }
 }
 
-/// Process-backed Adapter for OMP RPC 17.0.2.
+/// Process-backed Adapter for runtime-verified OMP RPC releases.
 pub struct OmpProcessAdapter(ProcessAdapter);
 
 impl Default for OmpProcessAdapter {
@@ -203,7 +211,7 @@ impl OmpProcessAdapter {
     }
 }
 
-/// Process-backed Adapter for Codex App Server 0.144.5.
+/// Process-backed Adapter for runtime-verified Codex App Server releases.
 pub struct CodexProcessAdapter(ProcessAdapter);
 
 impl Default for CodexProcessAdapter {
@@ -243,7 +251,7 @@ impl HarnessAdapter for OmpProcessAdapter {
 
     async fn start(&mut self, spec: &HarnessStartSpec) -> AdapterResult<NativeSession> {
         ensure_fresh(HarnessKind::Omp, self.0.runtime.as_ref())?;
-        version(HarnessKind::Omp, &spec.executable).await?;
+        let observed_version = version(HarnessKind::Omp, &spec.executable).await?;
         tokio::fs::create_dir_all(&spec.provider_state_dir)
             .await
             .map_err(|error| operation(HarnessKind::Omp, error.to_string()))?;
@@ -252,9 +260,13 @@ impl HarnessAdapter for OmpProcessAdapter {
             .await
             .map_err(|error| operation(HarnessKind::Omp, error.to_string()))?;
         let mut command = Command::new(&spec.executable);
+        if let Some(profile) = &spec.provider_profile {
+            command.arg("--profile").arg(profile);
+        }
+        if let Some(model) = &spec.model {
+            command.arg("--model").arg(model);
+        }
         command
-            .arg("--profile")
-            .arg(&spec.provider_profile)
             .args(["--mode", "rpc", "--cwd"])
             .arg(&spec.cwd)
             .arg("--session-dir")
@@ -274,11 +286,14 @@ impl HarnessAdapter for OmpProcessAdapter {
             return Err(operation(HarnessKind::Omp, "first frame was not ready"));
         }
         let pending = Arc::new(Mutex::new(HashMap::new()));
+        let stdin = Arc::new(Mutex::new(stdin));
         omp_reader(
             lines,
             Arc::clone(&pending),
             Arc::clone(&self.0.state),
             self.0.event_tx.clone(),
+            Arc::downgrade(&stdin),
+            coordinator_bridge(spec),
         );
         drain_stderr(child.stderr.take());
         self.0.runtime = Some(Runtime {
@@ -287,11 +302,20 @@ impl HarnessAdapter for OmpProcessAdapter {
             pending,
         });
         let id = self.0.id();
+        self.0
+            .request(
+                HarnessKind::Omp,
+                json!({"type":"set_host_tools","tools":mcp::omp_host_tools()}),
+                id,
+            )
+            .await?;
+        let id = self.0.id();
         let value = self
             .0
             .request(HarnessKind::Omp, json!({"type": "get_state"}), id)
             .await?;
         let native = NativeSession {
+            observed_version,
             session_id: field(&value, "sessionId"),
             thread_id: None,
             cwd: spec.cwd.clone(),
@@ -404,19 +428,18 @@ impl HarnessAdapter for CodexProcessAdapter {
 
     async fn start(&mut self, spec: &HarnessStartSpec) -> AdapterResult<NativeSession> {
         ensure_fresh(HarnessKind::Codex, self.0.runtime.as_ref())?;
-        version(HarnessKind::Codex, &spec.executable).await?;
+        let observed_version = version(HarnessKind::Codex, &spec.executable).await?;
         tokio::fs::create_dir_all(&spec.provider_state_dir)
             .await
             .map_err(|error| operation(HarnessKind::Codex, error.to_string()))?;
         let mut command = Command::new(&spec.executable);
-        command.arg("--profile").arg(&spec.provider_profile).args([
-            "app-server",
-            "--listen",
-            "stdio://",
-            "--strict-config",
-        ]);
+        if let Some(profile) = &spec.provider_profile {
+            command.arg("--profile").arg(profile);
+        }
+        command.args(["app-server", "--listen", "stdio://", "--strict-config"]);
         let (mut child, stdin, stdout) = spawn(&mut command, spec, HarnessKind::Codex)?;
         let pending = Arc::new(Mutex::new(HashMap::new()));
+        let stdin = Arc::new(Mutex::new(stdin));
         codex_reader(
             BufReader::new(stdout).lines(),
             Arc::clone(&pending),
@@ -445,7 +468,7 @@ impl HarnessAdapter for CodexProcessAdapter {
             self.0
                 .runtime
                 .as_mut()
-                .and_then(|runtime| runtime.stdin.as_mut()),
+                .and_then(|runtime| runtime.stdin.as_ref()),
             &json!({"method":"initialized"}),
         )
         .await?;
@@ -462,6 +485,7 @@ impl HarnessAdapter for CodexProcessAdapter {
         let thread_id = field(thread, "id")
             .ok_or_else(|| operation(HarnessKind::Codex, "thread/start omitted thread id"))?;
         let native = NativeSession {
+            observed_version,
             session_id: field(thread, "sessionId"),
             thread_id: Some(thread_id),
             cwd: field(thread, "cwd").map_or_else(|| spec.cwd.clone(), Into::into),
@@ -595,20 +619,43 @@ impl HarnessAdapter for CodexProcessAdapter {
     }
 }
 
-async fn version(kind: HarnessKind, executable: &Path) -> AdapterResult<()> {
-    let output = Command::new(executable)
+async fn version(kind: HarnessKind, executable: &Path) -> AdapterResult<String> {
+    let mut child = Command::new(executable)
         .arg("--version")
-        .output()
-        .await
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
         .map_err(|error| operation(kind, error.to_string()))?;
-    if !output.status.success() {
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| operation(kind, "version check has no stdout"))?;
+    let mut bytes = Vec::new();
+    timeout(
+        VERSION_TIMEOUT,
+        stdout.take(MAX_VERSION_BYTES + 1).read_to_end(&mut bytes),
+    )
+    .await
+    .map_err(|_| operation(kind, "version check timed out"))?
+    .map_err(|error| operation(kind, error.to_string()))?;
+    if bytes.len() as u64 > MAX_VERSION_BYTES {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        return Err(operation(kind, "version output exceeds 4096 bytes"));
+    }
+    let status = timeout(VERSION_TIMEOUT, child.wait())
+        .await
+        .map_err(|_| operation(kind, "version check did not exit"))?
+        .map_err(|error| operation(kind, error.to_string()))?;
+    if !status.success() {
         return Err(operation(
             kind,
-            format!("version check exited with {}", output.status),
+            format!("version check exited with {status}"),
         ));
     }
-    let stdout =
-        String::from_utf8(output.stdout).map_err(|error| operation(kind, error.to_string()))?;
+    let stdout = String::from_utf8(bytes).map_err(|error| operation(kind, error.to_string()))?;
     match kind {
         HarnessKind::Omp => validate_omp_version_output(&stdout),
         HarnessKind::Codex => validate_codex_version_output(&stdout),
@@ -644,10 +691,11 @@ fn spawn(
 
 async fn write_line(
     kind: HarnessKind,
-    stdin: Option<&mut ChildStdin>,
+    stdin: Option<&Arc<Mutex<ChildStdin>>>,
     value: &Value,
 ) -> AdapterResult<()> {
     let stdin = stdin.ok_or_else(|| operation(kind, "provider stdin is closed"))?;
+    let mut stdin = stdin.lock().await;
     let mut bytes =
         serde_json::to_vec(value).map_err(|error| operation(kind, error.to_string()))?;
     bytes.push(b'\n');
@@ -666,6 +714,8 @@ fn omp_reader(
     pending: Pending,
     state: Arc<Mutex<State>>,
     events: mpsc::Sender<AdapterResult<AdapterEvent>>,
+    stdin: Weak<Mutex<ChildStdin>>,
+    bridge: Option<McpServer>,
 ) {
     tokio::spawn(async move {
         while let Ok(Some(line)) = lines.next_line().await {
@@ -691,7 +741,12 @@ fn omp_reader(
                     )
                     .await;
                 }
-                Ok(OmpFrame::HostToolCall { id, tool_name, .. }) => {
+                Ok(OmpFrame::HostToolCall {
+                    id,
+                    tool_name,
+                    arguments,
+                    ..
+                }) => {
                     send(
                         &events,
                         AdapterEvent::Activity {
@@ -699,6 +754,24 @@ fn omp_reader(
                         },
                     )
                     .await;
+                    let result = execute_host_tool(bridge.as_ref(), &tool_name, arguments).await;
+                    let Some(stdin) = stdin.upgrade() else {
+                        break;
+                    };
+                    if let Err(error) = write_line(
+                        HarnessKind::Omp,
+                        Some(&stdin),
+                        &json!({
+                            "type": "host_tool_result",
+                            "id": id.to_string(),
+                            "result": result.value,
+                            "isError": result.is_error,
+                        }),
+                    )
+                    .await
+                    {
+                        let _ = events.send(Err(error)).await;
+                    }
                 }
                 Ok(_) => {}
                 Err(error) => {
@@ -708,6 +781,63 @@ fn omp_reader(
         }
         reader_failed(HarnessKind::Omp, pending, state, events).await;
     });
+}
+
+fn coordinator_bridge(spec: &HarnessStartSpec) -> Option<McpServer> {
+    let socket = spec.environment.get("HERDR_COORDINATOR_SOCKET")?;
+    let bearer = spec.environment.get("HERDR_HARNESS_CAPABILITY")?;
+    mcp::from_bearer(Path::new(socket), bearer.clone())
+        .ok()
+        .map(|bridge| bridge.with_native_turn_id("provider-turn"))
+}
+
+struct HostToolResult {
+    value: Value,
+    is_error: bool,
+}
+
+async fn execute_host_tool(
+    bridge: Option<&McpServer>,
+    tool_name: &str,
+    arguments: serde_json::Map<String, Value>,
+) -> HostToolResult {
+    let Some(bridge) = bridge else {
+        return host_tool_error("Coordinator MCP identity is unavailable");
+    };
+    let response = bridge
+        .handle(json!({
+            "jsonrpc": "2.0",
+            "id": "omp-host-tool",
+            "method": "tools/call",
+            "params": {"name": tool_name, "arguments": arguments},
+        }))
+        .await;
+    let Some(response) = response else {
+        return host_tool_error("Coordinator MCP returned no correlated response");
+    };
+    let Some(result) = response.get("result") else {
+        return host_tool_error(
+            response
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("Coordinator MCP returned an invalid response"),
+        );
+    };
+    HostToolResult {
+        is_error: result
+            .get("isError")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        value: result.clone(),
+    }
+}
+
+fn host_tool_error(message: &str) -> HostToolResult {
+    HostToolResult {
+        value: json!({"content":[{"type":"text","text":message}],"details":{}}),
+        is_error: true,
+    }
 }
 
 fn codex_reader(

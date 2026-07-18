@@ -1,4 +1,4 @@
-//! Provider-neutral Harness Adapter seam and pinned protocol frame classifiers.
+//! Provider-neutral Harness Adapter seam and protocol frame classifiers.
 
 use std::{collections::BTreeMap, fmt, path::PathBuf, pin::Pin};
 
@@ -10,11 +10,7 @@ use thiserror::Error;
 
 use crate::contract::{AttachmentId, HarnessKind, HarnessSessionId, TaskId};
 
-/// OMP version verified by the MVP compatibility contract.
-pub const OMP_VERSION_OUTPUT: &str = "omp/17.0.2";
-
-/// Codex CLI version verified by the MVP compatibility contract.
-pub const CODEX_VERSION_OUTPUT: &str = "codex-cli 0.144.5";
+const MAX_VERSION_OUTPUT_BYTES: usize = 4096;
 
 /// Provider Adapter failure with enough structure for stable Coordinator mapping.
 #[derive(Debug, Error)]
@@ -28,7 +24,7 @@ pub enum AdapterError {
         #[source]
         source: serde_json::Error,
     },
-    /// A valid JSON value did not match the pinned provider framing contract.
+    /// A valid JSON value did not match the required provider framing contract.
     #[error("invalid {kind:?} protocol frame: {message}")]
     InvalidFrame {
         /// Provider whose protocol was violated.
@@ -36,8 +32,8 @@ pub enum AdapterError {
         /// Concise framing violation.
         message: String,
     },
-    /// The installed provider version has not been compatibility-tested.
-    #[error("unsupported {kind:?} version output `{actual}`; expected `{expected}`")]
+    /// The executable did not produce bounded single-line version evidence.
+    #[error("invalid {kind:?} version output `{actual}`; expected {expected}")]
     UnsupportedVersion {
         /// Provider executable being checked.
         kind: HarnessKind,
@@ -101,14 +97,14 @@ pub struct AdapterCapabilities {
 pub struct HarnessStartSpec {
     /// Durable Coordinator Session being hosted.
     pub session_id: HarnessSessionId,
-    /// Absolute pinned provider executable.
+    /// Absolute executable resolved for this Harness Session.
     pub executable: PathBuf,
     /// Registered live worktree used by the native Harness.
     pub cwd: PathBuf,
     /// Provider-owned files for this Harness Session.
     pub provider_state_dir: PathBuf,
-    /// Explicit provider-native profile selection.
-    pub provider_profile: String,
+    /// Explicit provider-native profile selection; absent uses the existing default.
+    pub provider_profile: Option<String>,
     /// Explicitly selected model, when the profile pins one.
     pub model: Option<String>,
     /// OMP configuration overlays; empty for Codex.
@@ -120,6 +116,8 @@ pub struct HarnessStartSpec {
 /// Native identity established after successful provider startup.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeSession {
+    /// Raw bounded `--version` evidence observed for this process.
+    pub observed_version: String,
     /// Provider session identity, if the provider exposes one.
     pub session_id: Option<String>,
     /// Persistent conversation identity, such as a Codex thread.
@@ -323,7 +321,7 @@ pub trait HarnessAdapter: Send {
     fn events(&mut self) -> AdapterEventStream;
 }
 
-/// Correlation identifier accepted by the pinned provider JSONL protocols.
+/// Correlation identifier accepted by the provider JSONL protocols.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CorrelationId {
     /// String correlation used by OMP and accepted by Codex.
@@ -341,7 +339,7 @@ impl fmt::Display for CorrelationId {
     }
 }
 
-/// Classified OMP RPC output frame from the pinned `17.0.2` protocol.
+/// Classified OMP RPC output frame from the runtime-verified protocol.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OmpFrame {
     /// Process completed initialization and is ready for commands.
@@ -462,7 +460,7 @@ fn classify_omp_response(object: &Map<String, Value>) -> AdapterResult<OmpFrame>
     })
 }
 
-/// Classified Codex App Server output frame from the pinned `0.144.5` protocol.
+/// Classified Codex App Server output frame from the runtime-verified protocol.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CodexFrame {
     /// Correlated response to a Host request.
@@ -533,45 +531,38 @@ pub fn classify_codex_frame(line: &str) -> AdapterResult<CodexFrame> {
     }
 }
 
-/// Validates exact `omp --version` output for the pinned MVP protocol.
-///
-/// A single platform line ending is ignored; all other whitespace is significant.
+/// Validates and returns bounded `omp --version` evidence.
 ///
 /// # Errors
 ///
-/// Returns [`AdapterError::UnsupportedVersion`] unless output is exactly
-/// [`OMP_VERSION_OUTPUT`].
-pub fn validate_omp_version_output(output: &str) -> AdapterResult<()> {
-    validate_version_output(HarnessKind::Omp, OMP_VERSION_OUTPUT, output)
+/// Returns [`AdapterError::UnsupportedVersion`] for empty, multiline, or oversized output.
+pub fn validate_omp_version_output(output: &str) -> AdapterResult<String> {
+    validate_version_output(HarnessKind::Omp, output)
 }
 
-/// Validates exact `codex --version` output for the pinned MVP protocol.
-///
-/// A single platform line ending is ignored; all other whitespace is significant.
+/// Validates and returns bounded `codex --version` evidence.
 ///
 /// # Errors
 ///
-/// Returns [`AdapterError::UnsupportedVersion`] unless output is exactly
-/// [`CODEX_VERSION_OUTPUT`].
-pub fn validate_codex_version_output(output: &str) -> AdapterResult<()> {
-    validate_version_output(HarnessKind::Codex, CODEX_VERSION_OUTPUT, output)
+/// Returns [`AdapterError::UnsupportedVersion`] for empty, multiline, or oversized output.
+pub fn validate_codex_version_output(output: &str) -> AdapterResult<String> {
+    validate_version_output(HarnessKind::Codex, output)
 }
 
-fn validate_version_output(
-    kind: HarnessKind,
-    expected: &'static str,
-    output: &str,
-) -> AdapterResult<()> {
+fn validate_version_output(kind: HarnessKind, output: &str) -> AdapterResult<String> {
     let actual = output
         .strip_suffix("\r\n")
         .or_else(|| output.strip_suffix('\n'))
         .unwrap_or(output);
-    if actual == expected {
-        Ok(())
+    let valid = !actual.trim().is_empty()
+        && actual.len() <= MAX_VERSION_OUTPUT_BYTES
+        && !actual.contains(['\r', '\n', '\0']);
+    if valid {
+        Ok(actual.to_owned())
     } else {
         Err(AdapterError::UnsupportedVersion {
             kind,
-            expected,
+            expected: "one nonempty UTF-8 line no larger than 4096 bytes",
             actual: actual.to_owned(),
         })
     }

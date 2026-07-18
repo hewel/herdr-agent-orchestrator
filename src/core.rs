@@ -20,14 +20,16 @@ use sqlx::{
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::adapter::AdapterCapabilities;
 use crate::attachment::{AttachmentMetadata, AttachmentStore};
 use crate::contract::{
     CommandEvidenceV1, DeliveryAttemptId, DeliveryIntent, HarnessDefinitionV1, HarnessId,
-    HarnessLaunchProfileV1, HarnessSessionId, HarnessTier, MessageId, MessageKind,
-    MessageSubmissionV1, ObservationCheckpoint, RepositoryAccess, RepositoryObservationId,
-    RepositoryObservationV1, ResultManifestV1, SCHEMA_VERSION, ScopeClassification, TaskId,
-    TaskSubmissionV1, Validate, WorktreeHoldId, WriteScopeV1,
+    HarnessSessionId, HarnessTier, MessageId, MessageKind, MessageSubmissionV1,
+    ObservationCheckpoint, RepositoryAccess, RepositoryObservationId, RepositoryObservationV1,
+    ResultManifestV1, SCHEMA_VERSION, ScopeClassification, TaskId, TaskSubmissionV1, Validate,
+    WorktreeHoldId, WriteScopeV1,
 };
+use crate::profile::parse_launch_profile_snapshot;
 use crate::repository::{GitRepository, RepositorySnapshot};
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
@@ -228,14 +230,39 @@ pub enum CoordinatorCommand {
     },
     /// Request a Worker Host and provider process to stop.
     StopWorker { worker_id: HarnessId },
+    /// End the idle Supervisor after all Workers and repository guards settle.
+    DeactivateWorkspace,
     /// Confirm Worker Host process shutdown.
     RecordHostStopped { clean: bool },
     /// Record Worker Host failure and conservatively settle active work.
     RecordHostFailed { diagnostic: String },
     /// Mark a Worker online only after its pane Host and native Adapter are ready.
     RecordHostReady,
+    /// Retain executable, version, native identity, model, and handshake evidence.
+    RecordHostCompatibility {
+        resolved_executable: PathBuf,
+        observed_version: String,
+        native_session_id: Option<String>,
+        native_thread_id: Option<String>,
+        effective_model: Option<String>,
+        evidence: HarnessCompatibilityEvidenceV1,
+    },
     /// Persist one monotonic pane-resident Host event for reconnect replay.
     RecordHostEvent { sequence: u64, event: Value },
+}
+
+/// Versioned native startup evidence retained with one Harness Session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessCompatibilityEvidenceV1 {
+    /// Must equal one.
+    pub schema_version: u32,
+    /// Native Harness whose handshake was observed.
+    pub kind: crate::contract::HarnessKind,
+    /// Adapter operations supported after startup.
+    pub capabilities: AdapterCapabilities,
+    /// Ordered native checks that succeeded before readiness.
+    pub successful_checks: Vec<String>,
 }
 
 /// Explicit Supervisor resolution after ambiguous native acceptance.
@@ -476,10 +503,14 @@ pub enum CommandOutcome {
     HoldCleared { task_id: TaskId },
     /// Worker Session was asked to stop.
     WorkerStopping { worker_id: HarnessId },
+    /// Idle workspace Sessions ended without discarding durable state.
+    WorkspaceDeactivated,
     /// Worker Host shutdown was durably settled.
     HostStopped { clean: bool },
     /// Worker Host and native Adapter are ready for dispatch.
     HostReady,
+    /// Native compatibility evidence was retained before readiness.
+    HostCompatibilityRecorded,
     /// Monotonic Host event was persisted or replayed idempotently.
     HostEventRecorded { sequence: u64 },
 }
@@ -773,6 +804,11 @@ impl Coordinator {
                 self.require_supervisor(&actor)?;
                 self.stop_worker(worker_id).await
             }
+            (ActorContext::Session { capability }, CoordinatorCommand::DeactivateWorkspace) => {
+                let actor = self.authenticate(&capability).await?;
+                self.require_supervisor(&actor)?;
+                self.deactivate_workspace(&actor).await
+            }
             (
                 ActorContext::Session { capability },
                 CoordinatorCommand::RecordHostStopped { clean },
@@ -790,6 +826,29 @@ impl Coordinator {
             (ActorContext::Session { capability }, CoordinatorCommand::RecordHostReady) => {
                 let actor = self.authenticate(&capability).await?;
                 self.record_host_ready(&actor).await
+            }
+            (
+                ActorContext::Session { capability },
+                CoordinatorCommand::RecordHostCompatibility {
+                    resolved_executable,
+                    observed_version,
+                    native_session_id,
+                    native_thread_id,
+                    effective_model,
+                    evidence,
+                },
+            ) => {
+                let actor = self.authenticate(&capability).await?;
+                self.record_host_compatibility(
+                    &actor,
+                    resolved_executable,
+                    observed_version,
+                    native_session_id,
+                    native_thread_id,
+                    effective_model,
+                    evidence,
+                )
+                .await
             }
             (
                 ActorContext::Session { capability },
@@ -1225,15 +1284,11 @@ impl Coordinator {
                 "launch profile snapshot digest does not match",
             ));
         }
-        let profile: HarnessLaunchProfileV1 =
-            toml::from_str(&profile_snapshot).map_err(|error| {
-                CoordinatorError::new(
-                    ErrorCategory::InvalidInput,
-                    format!("launch profile snapshot is invalid TOML: {error}"),
-                )
-            })?;
-        profile.validate().map_err(|error| {
-            CoordinatorError::new(ErrorCategory::InvalidInput, error.to_string())
+        let profile = parse_launch_profile_snapshot(&profile_snapshot).map_err(|error| {
+            CoordinatorError::new(
+                ErrorCategory::InvalidInput,
+                format!("launch profile snapshot is invalid: {error}"),
+            )
         })?;
         if profile.kind != definition.kind
             || definition.launch_profile.as_deref() != Some(profile.id.as_str())
@@ -2072,7 +2127,13 @@ impl Coordinator {
                 "native turn ID must contain 1 to 512 bytes",
             ));
         }
-        let mut transaction = self.pool.begin().await.map_err(CoordinatorError::storage)?;
+        // Reserve the write lock before attachment and Task reads. A deferred SQLite
+        // transaction can lose its later read-to-write upgrade to concurrent Host events.
+        let mut transaction = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(CoordinatorError::storage)?;
         let mut attachment_ids = manifest.attachments.clone();
         attachment_ids.extend(manifest.verification.iter().map(|entry| entry.evidence));
         require_attachments(&mut transaction, &attachment_ids).await?;
@@ -3226,6 +3287,63 @@ impl Coordinator {
         Ok(CommandOutcome::WorkerStopping { worker_id })
     }
 
+    async fn deactivate_workspace(
+        &self,
+        actor: &AuthenticatedActor,
+    ) -> Result<CommandOutcome, CoordinatorError> {
+        let mut transaction = self.pool.begin().await.map_err(CoordinatorError::storage)?;
+        let active_tasks: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tasks WHERE state IN ('queued','dispatching','working','waiting','reviewing','cancelling','delivery_unknown')",
+        )
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(CoordinatorError::storage)?;
+        let holds: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM worktree_holds WHERE cleared_at IS NULL")
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(CoordinatorError::storage)?;
+        let leases: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM worktree_leases WHERE released_at IS NULL")
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(CoordinatorError::storage)?;
+        let workers: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM harness_sessions WHERE harness_tier = 'worker' AND ended_at IS NULL",
+        )
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(CoordinatorError::storage)?;
+        if active_tasks != 0 || holds != 0 || leases != 0 || workers != 0 {
+            return Err(CoordinatorError::new(
+                ErrorCategory::Conflict,
+                "workspace deactivation requires no active Task, Hold, lease, or Worker Session",
+            ));
+        }
+        let now = timestamp();
+        let changed = sqlx::query(
+            "UPDATE harness_sessions SET presence = 'stopped', activity = 'idle', ended_at = ?, last_seen_at = ? WHERE id = ? AND harness_tier = 'supervisor' AND ended_at IS NULL",
+        )
+        .bind(&now)
+        .bind(&now)
+        .bind(actor.session_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .map_err(CoordinatorError::storage)?
+        .rows_affected();
+        if changed != 1 {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidState,
+                "Supervisor Session is not active",
+            ));
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(CoordinatorError::storage)?;
+        Ok(CommandOutcome::WorkspaceDeactivated)
+    }
+
     async fn record_host_stopped(
         &self,
         actor: &AuthenticatedActor,
@@ -3298,6 +3416,72 @@ impl Coordinator {
             .await
             .remove(&actor.session_id);
         Ok(CommandOutcome::HostReady)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one immutable native compatibility evidence record"
+    )]
+    async fn record_host_compatibility(
+        &self,
+        actor: &AuthenticatedActor,
+        resolved_executable: PathBuf,
+        observed_version: String,
+        native_session_id: Option<String>,
+        native_thread_id: Option<String>,
+        effective_model: Option<String>,
+        evidence: HarnessCompatibilityEvidenceV1,
+    ) -> Result<CommandOutcome, CoordinatorError> {
+        if actor.tier != HarnessTier::Worker {
+            return Err(CoordinatorError::new(
+                ErrorCategory::Forbidden,
+                "only a Worker Host may record compatibility evidence",
+            ));
+        }
+        if !resolved_executable.is_absolute()
+            || observed_version.trim().is_empty()
+            || observed_version.len() > 4096
+        {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidInput,
+                "compatibility evidence requires an absolute executable and bounded version",
+            ));
+        }
+        if evidence.schema_version != SCHEMA_VERSION || evidence.successful_checks.is_empty() {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidInput,
+                "compatibility evidence requires schema version 1 and successful checks",
+            ));
+        }
+        let evidence = serde_json::to_string(&evidence).map_err(CoordinatorError::storage)?;
+        if evidence.len() > 65_536 {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidInput,
+                "compatibility evidence exceeds 64 KiB",
+            ));
+        }
+        let changed = sqlx::query(
+            "UPDATE harness_sessions SET resolved_executable = ?, observed_version = ?, native_session_id = ?, native_thread_id = ?, effective_model = ?, compatibility_evidence_json = ?, last_seen_at = ? WHERE id = ? AND ended_at IS NULL AND presence = 'starting'",
+        )
+        .bind(resolved_executable.to_string_lossy().as_ref())
+        .bind(observed_version)
+        .bind(native_session_id)
+        .bind(native_thread_id)
+        .bind(effective_model)
+        .bind(evidence)
+        .bind(timestamp())
+        .bind(actor.session_id.to_string())
+        .execute(&self.pool)
+        .await
+        .map_err(CoordinatorError::storage)?
+        .rows_affected();
+        if changed != 1 {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidState,
+                "compatibility evidence requires a starting Worker Session",
+            ));
+        }
+        Ok(CommandOutcome::HostCompatibilityRecorded)
     }
 
     #[expect(

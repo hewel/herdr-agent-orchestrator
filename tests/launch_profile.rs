@@ -1,4 +1,6 @@
-use herdr_harness_coordinator::contract::{HarnessKind, HarnessLaunchProfileV1, Validate};
+use herdr_harness_coordinator::contract::{
+    HarnessKind, HarnessLaunchProfileV1, HarnessLaunchProfileV2, Validate,
+};
 
 #[test]
 fn launch_profile_resolves_a_pinned_omp_configuration() {
@@ -18,4 +20,22 @@ fn launch_profile_resolves_a_pinned_omp_configuration() {
 
     profile.validate().expect("profile must validate");
     assert_eq!(profile.kind, HarnessKind::Omp);
+}
+
+#[test]
+fn launch_profile_v2_accepts_a_bare_executable_and_existing_default_profile() {
+    let profile: HarnessLaunchProfileV2 = toml::from_str(
+        r#"
+        schema_version = 2
+        id = "omp-kimi"
+        kind = "omp"
+        executable = "omp"
+        model = "kimi-code/k3:high"
+        inherit_env = ["PATH"]
+        "#,
+    )
+    .expect("profile must deserialize");
+
+    profile.validate().expect("profile must validate");
+    assert_eq!(profile.provider_profile, None);
 }

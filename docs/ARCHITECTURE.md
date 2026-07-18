@@ -77,6 +77,14 @@ Harness IDs are unique within one Coordinator state directory and are never reus
 
 The Coordinator records model and launch profile explicitly but does not infer cost, capability, or routing from them.
 
+### Workspace Activation
+
+The Herdr plugin is installed globally, but coordination is off by default in every workspace. A workspace-context action opens the Harness Network popup for the invoking workspace. Automation uses the idempotent commands `workspace get`, `workspace set on|off`, and `workspace list`; there is no raw toggle command whose duplicate delivery could reverse the user's intent.
+
+The plugin-root activation index keys a record by Herdr session socket plus workspace ID, records the canonical repository root, and routes live state beneath `workspaces/<sha256>`. Each record retains a compare-and-set revision, desired and runtime states, the explicit Supervisor declaration, exact Worker-to-profile mappings, and recovery diagnostics. A partial unique constraint permits only one enabled workspace for a canonical worktree. Reusing a workspace ID with a different root is rejected. Current Herdr does not expose a workspace generation token, so same-ID, same-root recreation cannot yet be distinguished from restart; cold state therefore requires explicit reactivation and never replays native work.
+
+Turning a workspace off preserves SQLite, inboxes, Attachments, Results, logs, profile snapshots, and compatibility evidence. It refuses while any Task is nonterminal or reviewing, a Worker is busy, or a Worktree Hold exists. It never cancels, approves, clears, reverts, cleans, publishes, or discards work.
+
 ### Harness Session
 
 A Harness Session is one live activation of a Harness.
@@ -409,7 +417,7 @@ Per-session capabilities prevent accidental or ordinary protocol-level impersona
 
 ### OMP
 
-The MVP pins OMP `17.0.2` and starts `omp --mode rpc` in the Worker pane. The adapter:
+The MVP starts the explicitly selected OMP executable with `--mode rpc` in the Worker pane. The adapter:
 
 - waits for the `ready` frame and correlates interleaved responses by ID;
 - uses `prompt` when idle, `follow_up` for queued active-Task input, and `steer` for explicit steering;
@@ -422,7 +430,7 @@ The selected Worker launch profile may enable OMP `task`, `hub`, extensions, ski
 
 ### Codex
 
-The MVP pins Codex `0.144.5` and starts `codex app-server --listen stdio://`. The adapter:
+The MVP starts the explicitly selected Codex executable with `app-server --listen stdio://`. The adapter:
 
 - performs `initialize` followed by `initialized`;
 - starts one persistent thread for the Harness Session;
@@ -436,12 +444,13 @@ Codex native multi-agent behavior is permitted by the Worker profile and remains
 
 ### Compatibility
 
-Both adapters reject an unverified version. Compatibility fixtures must be regenerated or captured from the installed version and prove launch, delivery, steering, completion, cancellation, native multi-agent tolerance, and shutdown before a new version is accepted.
+Harness releases are not pinned. Each new Session resolves its selected executable, requires a successful bounded nonempty UTF-8 `--version` result, records the raw observed version, and then proves compatibility through the native handshake. OMP requires `ready`, correlated `set_host_tools`, and `get_state`; Codex requires `initialize`, `initialized`, and persistent thread creation. Missing semantics fail closed regardless of version text. A running Session retains its executable, profile snapshot and digest, model, and compatibility evidence; updates are observed only by a later Session and are never installed automatically.
 
 ## Herdr interface
 
 The plugin manifest declares:
 
+- a workspace-context `workspace` action for per-workspace setup and desired state;
 - a normal `worker` pane entrypoint that owns the Harness Host and native process; and
 - a `harness-network` popup entrypoint that reads durable state and sends control commands.
 

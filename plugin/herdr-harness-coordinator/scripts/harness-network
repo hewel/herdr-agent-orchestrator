@@ -5,4 +5,14 @@ set -eu
 : "${HERDR_PLUGIN_STATE_DIR:?Herdr did not provide HERDR_PLUGIN_STATE_DIR}"
 
 coordinator_bin="${HERDR_COORDINATOR_BIN:-herdr-harness-coordinator}"
-exec "$coordinator_bin" popup
+if [ -n "${HERDR_SUPERVISOR_CAPABILITY:-}" ]; then
+  exec "$coordinator_bin" popup
+fi
+
+: "${HERDR_WORKSPACE_ID:?Herdr workspace context is required for first setup}"
+exec "$coordinator_bin" workspace \
+  --state-dir "$HERDR_PLUGIN_STATE_DIR" \
+  get \
+  --workspace "$HERDR_WORKSPACE_ID" \
+  --root "$PWD" \
+  --session-socket "$HERDR_SOCKET_PATH"

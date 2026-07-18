@@ -18,12 +18,15 @@ The implementation targets the [Herdr socket API](https://herdr.dev/docs/socket-
 
 ## Plugin entrypoints
 
-The manifest requires Herdr `0.7.4` and declares:
+The manifest uses Herdr `0.7.4` as a minimum feature floor, requires socket protocol `16`, and declares:
 
 ```text
 worker          placement = "tab", focus = false
 harness-network placement = "popup"
+workspace       context = "workspace"
 ```
+
+Herdr product releases newer than `0.7.4` are accepted while protocol `16` remains compatible. The workspace action targets the invoking workspace and calls idempotent desired-state operations; the Coordinator never maps workspace state to Herdr's global plugin enable/disable switch.
 
 The Worker entrypoint receives a Coordinator Harness Session ID, connects to the local broker, validates the Session, and becomes the Harness Host that starts and owns OMP or Codex.
 

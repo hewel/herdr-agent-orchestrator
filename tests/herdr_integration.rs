@@ -42,6 +42,17 @@ fn rejects_a_snapshot_from_an_unverified_herdr_protocol() {
 }
 
 #[test]
+fn accepts_a_newer_herdr_release_when_socket_protocol_is_compatible() {
+    let snapshot = SessionSnapshot {
+        version: "0.9.1".to_owned(),
+        protocol: HERDR_PROTOCOL,
+        panes: Vec::new(),
+    };
+
+    snapshot.validate_compatibility().unwrap();
+}
+
+#[test]
 fn worker_open_request_is_unfocused_and_carries_the_durable_session_capability() {
     let request = PluginPaneOpenParams::worker(
         "session-capability-1",
@@ -53,6 +64,11 @@ fn worker_open_request_is_unfocused_and_carries_the_durable_session_capability()
     assert_eq!(request.placement.as_deref(), Some("tab"));
     assert!(!request.focus);
     assert_eq!(request.workspace_id.as_deref(), Some("4"));
+    assert_eq!(request.cwd, None);
+    assert_eq!(
+        request.env.get("HERDR_HARNESS_CWD").map(String::as_str),
+        Some("/repo")
+    );
     assert_eq!(
         request
             .env
@@ -60,6 +76,14 @@ fn worker_open_request_is_unfocused_and_carries_the_durable_session_capability()
             .map(String::as_str),
         Some("session-capability-1")
     );
+}
+
+#[test]
+fn popup_open_request_targets_the_invoking_workspace() {
+    let request = PluginPaneOpenParams::popup("wF".to_owned());
+
+    assert_eq!(request.workspace_id.as_deref(), Some("wF"));
+    assert!(request.focus);
 }
 
 #[test]
@@ -126,12 +150,38 @@ fn plugin_manifest_declares_the_resolved_mvp_entrypoints() {
     let manifest: toml::Value = toml::from_str(&manifest).unwrap();
 
     assert_eq!(manifest["min_herdr_version"].as_str(), Some(HERDR_VERSION));
+    assert_eq!(manifest["id"].as_str(), Some("herdr-harness-coordinator"));
+    let actions = manifest["actions"].as_array().unwrap();
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0]["id"].as_str(), Some("workspace"));
+    assert_eq!(actions[0]["contexts"][0].as_str(), Some("workspace"));
+    assert_eq!(
+        actions[0]["command"][0].as_str(),
+        Some("./scripts/workspace")
+    );
     let panes = manifest["panes"].as_array().unwrap();
     assert_eq!(panes.len(), 2);
     assert_eq!(panes[0]["id"].as_str(), Some("worker"));
     assert_eq!(panes[0]["placement"].as_str(), Some("tab"));
     assert_eq!(panes[1]["id"].as_str(), Some("harness-network"));
     assert_eq!(panes[1]["placement"].as_str(), Some("popup"));
+}
+
+#[test]
+fn workspace_action_opens_the_setup_popup_in_the_invoking_workspace() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let output =
+        std::process::Command::new(root.join("plugin/herdr-harness-coordinator/scripts/workspace"))
+            .env("HERDR_BIN", "/bin/echo")
+            .env("HERDR_WORKSPACE_ID", "wF")
+            .output()
+            .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "plugin pane open --plugin herdr-harness-coordinator --entrypoint harness-network --workspace wF --focus\n"
+    );
 }
 
 #[test]
@@ -143,6 +193,7 @@ fn worker_script_forwards_the_session_capability_and_inherited_herdr_environment
             .env("HERDR_SOCKET_PATH", "/tmp/herdr.sock")
             .env("HERDR_PLUGIN_STATE_DIR", "/tmp/coordinator-state")
             .env("HERDR_HARNESS_SESSION_ID", "session-capability-1")
+            .env("HERDR_HARNESS_CWD", &root)
             .output()
             .unwrap();
 
@@ -162,6 +213,7 @@ fn popup_script_never_receives_or_assumes_a_harness_identity() {
     .env("HERDR_COORDINATOR_BIN", "/bin/echo")
     .env("HERDR_SOCKET_PATH", "/tmp/herdr.sock")
     .env("HERDR_PLUGIN_STATE_DIR", "/tmp/coordinator-state")
+    .env("HERDR_SUPERVISOR_CAPABILITY", "capability")
     .output()
     .unwrap();
 

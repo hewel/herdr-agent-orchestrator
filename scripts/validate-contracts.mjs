@@ -180,6 +180,8 @@ for (const [fixtureDirectory, schemaFile] of fixtureSchemas) {
   }
 }
 
+await loadSchema(join(schemaRoot, "harness-launch-profile-v2.schema.json"));
+
 const routeFixture = await readJson(join(fixtureRoot, "semantic-invalid", "worker-to-worker-route.invalid.json"));
 const authenticatedSenderOwnsSubmission = !("from" in routeFixture.submission);
 const routeAllowed = routeFixture.authenticated_sender.tier === "supervisor"

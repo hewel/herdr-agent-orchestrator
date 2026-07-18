@@ -9,13 +9,38 @@ use std::{
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::contract::{HarnessId, HarnessKind, HarnessLaunchProfileV1, Validate};
+use crate::contract::{
+    HarnessId, HarnessKind, HarnessLaunchProfileV1, HarnessLaunchProfileV2, Validate,
+};
+
+/// Version-neutral immutable launch profile contents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchProfileSnapshot {
+    /// Public schema version that produced this normalized view.
+    pub schema_version: u32,
+    /// Durable profile ID.
+    pub id: HarnessId,
+    /// Native Harness Kind.
+    pub kind: HarnessKind,
+    /// Absolute path or v2 bare command.
+    pub executable: String,
+    /// Optional native profile selection.
+    pub provider_profile: Option<String>,
+    /// Explicit model, when present in v1; always present in v2.
+    pub model: Option<String>,
+    /// Environment allowlist.
+    pub inherit_env: Vec<String>,
+    /// OMP configuration overlays.
+    pub config_overlays: Vec<PathBuf>,
+}
 
 /// Exact profile selection retained with a Harness Session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedLaunchProfile {
     /// Parsed, validated public profile.
-    pub profile: HarnessLaunchProfileV1,
+    pub profile: LaunchProfileSnapshot,
+    /// Absolute executable resolved for this new Harness Session.
+    pub executable: PathBuf,
     /// Exact source file contents.
     pub snapshot: String,
     /// Lowercase SHA-256 of [`Self::snapshot`].
@@ -73,11 +98,19 @@ pub enum ProfileError {
         /// Invalid file reference.
         path: PathBuf,
     },
+    /// A v2 bare executable was absent from the current `PATH`.
+    #[error("launch profile `{profile}` cannot resolve executable `{executable}` through PATH")]
+    ExecutableNotFound {
+        /// Selected profile.
+        profile: HarnessId,
+        /// Bare executable name.
+        executable: String,
+    },
 }
 
 #[derive(Debug, Clone)]
 struct RegistryEntry {
-    profile: HarnessLaunchProfileV1,
+    profile: LaunchProfileSnapshot,
     snapshot: String,
     digest: String,
 }
@@ -120,17 +153,12 @@ impl ProfileRegistry {
                 path: path.clone(),
                 source,
             })?;
-            let profile: HarnessLaunchProfileV1 =
-                toml::from_str(&snapshot).map_err(|source| ProfileError::Toml {
+            let profile = parse_launch_profile_snapshot(&snapshot).map_err(|message| {
+                ProfileError::Validation {
                     path: path.clone(),
-                    source,
-                })?;
-            profile
-                .validate()
-                .map_err(|error| ProfileError::Validation {
-                    path: path.clone(),
-                    message: error.to_string(),
-                })?;
+                    message,
+                }
+            })?;
             validate_files(&profile)?;
             let id = profile.id.clone();
             let digest = hex::encode(Sha256::digest(snapshot.as_bytes()));
@@ -185,34 +213,159 @@ impl ProfileRegistry {
                 actual: kind,
             });
         }
-        let allow = entry
-            .profile
-            .inherit_env
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let environment = environment
-            .into_iter()
-            .map(|(key, value)| (key.into(), value.into()))
-            .filter(|(key, _)| allow.contains(key))
-            .collect();
-        Ok(ResolvedLaunchProfile {
-            profile: entry.profile.clone(),
-            snapshot: entry.snapshot.clone(),
-            digest: entry.digest.clone(),
-            environment,
-        })
+        resolve_entry(entry, environment)
+    }
+
+    /// Resolves one exact profile ID and accepts the Kind declared by that profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProfileError`] when the selected profile is absent or cannot resolve.
+    pub fn resolve_selected<I, K, V>(
+        &self,
+        id: &HarnessId,
+        environment: I,
+    ) -> Result<ResolvedLaunchProfile, ProfileError>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        let entry = self
+            .entries
+            .get(id)
+            .ok_or_else(|| ProfileError::NotFound(id.clone()))?;
+        resolve_entry(entry, environment)
     }
 }
 
-fn validate_files(profile: &HarnessLaunchProfileV1) -> Result<(), ProfileError> {
-    for path in std::iter::once(&profile.executable).chain(&profile.config_overlays) {
+fn resolve_entry<I, K, V>(
+    entry: &RegistryEntry,
+    environment: I,
+) -> Result<ResolvedLaunchProfile, ProfileError>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: Into<String>,
+    V: Into<String>,
+{
+    let environment = environment
+        .into_iter()
+        .map(|(key, value)| (key.into(), value.into()))
+        .collect::<BTreeMap<_, _>>();
+    let executable = resolve_executable(&entry.profile, &environment)?;
+    let allow = entry
+        .profile
+        .inherit_env
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let environment = environment
+        .into_iter()
+        .filter(|(key, _)| allow.contains(key))
+        .collect();
+    Ok(ResolvedLaunchProfile {
+        profile: entry.profile.clone(),
+        executable,
+        snapshot: entry.snapshot.clone(),
+        digest: entry.digest.clone(),
+        environment,
+    })
+}
+
+fn validate_files(profile: &LaunchProfileSnapshot) -> Result<(), ProfileError> {
+    let executable = Path::new(&profile.executable);
+    let paths = profile
+        .config_overlays
+        .iter()
+        .map(PathBuf::as_path)
+        .chain(executable.is_absolute().then_some(executable));
+    for path in paths {
         if !fs::metadata(path).is_ok_and(|metadata| metadata.is_file()) {
             return Err(ProfileError::MissingFile {
                 profile: profile.id.clone(),
-                path: path.clone(),
+                path: path.to_path_buf(),
             });
         }
     }
     Ok(())
+}
+
+/// Decodes and validates either the immutable v1 or flexible v2 profile contract.
+///
+/// # Errors
+///
+/// Returns a validation diagnostic for malformed TOML or unsupported contract versions.
+pub fn parse_launch_profile_snapshot(snapshot: &str) -> Result<LaunchProfileSnapshot, String> {
+    let value: toml::Value = toml::from_str(snapshot).map_err(|error| error.to_string())?;
+    match value
+        .get("schema_version")
+        .and_then(toml::Value::as_integer)
+    {
+        Some(1) => {
+            let profile: HarnessLaunchProfileV1 =
+                toml::from_str(snapshot).map_err(|error| error.to_string())?;
+            profile.validate().map_err(|error| error.to_string())?;
+            Ok(LaunchProfileSnapshot {
+                schema_version: 1,
+                id: profile.id,
+                kind: profile.kind,
+                executable: profile.executable.to_string_lossy().into_owned(),
+                provider_profile: Some(profile.provider_profile),
+                model: profile.model,
+                inherit_env: profile.inherit_env,
+                config_overlays: profile.config_overlays,
+            })
+        }
+        Some(2) => {
+            let profile: HarnessLaunchProfileV2 =
+                toml::from_str(snapshot).map_err(|error| error.to_string())?;
+            profile.validate().map_err(|error| error.to_string())?;
+            Ok(LaunchProfileSnapshot {
+                schema_version: 2,
+                id: profile.id,
+                kind: profile.kind,
+                executable: profile.executable,
+                provider_profile: profile.provider_profile,
+                model: Some(profile.model),
+                inherit_env: profile.inherit_env,
+                config_overlays: profile.config_overlays,
+            })
+        }
+        Some(version) => Err(format!(
+            "unsupported launch profile schema version {version}"
+        )),
+        None => Err("launch profile schema_version is required".to_owned()),
+    }
+}
+
+/// Resolves a normalized profile executable for one new Session.
+///
+/// # Errors
+///
+/// Returns [`ProfileError`] when an absolute file is missing or a bare command is absent from `PATH`.
+pub fn resolve_executable(
+    profile: &LaunchProfileSnapshot,
+    environment: &BTreeMap<String, String>,
+) -> Result<PathBuf, ProfileError> {
+    let executable = PathBuf::from(&profile.executable);
+    if executable.is_absolute() {
+        return fs::metadata(&executable)
+            .is_ok_and(|metadata| metadata.is_file())
+            .then_some(executable.clone())
+            .ok_or_else(|| ProfileError::MissingFile {
+                profile: profile.id.clone(),
+                path: executable,
+            });
+    }
+    let path = environment
+        .get("PATH")
+        .map(String::as_str)
+        .unwrap_or_default();
+    std::env::split_paths(path)
+        .map(|directory| directory.join(&profile.executable))
+        .find(|candidate| fs::metadata(candidate).is_ok_and(|metadata| metadata.is_file()))
+        .ok_or_else(|| ProfileError::ExecutableNotFound {
+            profile: profile.id.clone(),
+            executable: profile.executable.clone(),
+        })
 }
