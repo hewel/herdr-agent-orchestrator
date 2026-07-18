@@ -52,6 +52,7 @@ async fn popup_renders_durable_state_through_the_real_broker_boundary() {
     assert!(rendered.starts_with("Harness Network\n\n"));
     assert!(rendered.contains("supervisor"));
     assert!(rendered.contains("Tasks"));
+    assert!(rendered.contains("Scheduling"));
 
     task.abort();
 }

@@ -1,14 +1,33 @@
 use std::{fs, path::Path};
 
 use herdr_harness_coordinator::contract::{
-    DeliveryReceiptV1, HarnessDefinitionV1, MessageSubmissionV1, RepositoryObservationV1,
-    ResultManifestV1, TaskSubmissionV1, Validate,
+    DeliveryReceiptV1, DependencyCondition, DependencyFailurePolicy, HarnessDefinitionV1,
+    MessageSubmissionV1, RepositoryObservationV1, ResultManifestV1, TaskSubmissionV1, Validate,
 };
 use serde::de::DeserializeOwned;
 
 fn read<T: DeserializeOwned>(path: impl AsRef<Path>) -> Result<T, serde_json::Error> {
     let bytes = fs::read(path).expect("fixture must be readable");
     serde_json::from_slice(&bytes)
+}
+
+#[test]
+fn legacy_and_dependency_aware_tasks_share_the_v1_contract() {
+    let legacy: TaskSubmissionV1 = read("schemas/fixtures/task-submission/mutating.valid.json")
+        .expect("legacy Task fixture must remain valid");
+    let dependent: TaskSubmissionV1 = read("schemas/fixtures/task-submission/dependent.valid.json")
+        .expect("dependent Task fixture must deserialize");
+
+    assert!(legacy.depends_on.is_empty());
+    assert_eq!(dependent.depends_on.len(), 1);
+    assert_eq!(
+        dependent.depends_on[0].condition,
+        DependencyCondition::ResultReady
+    );
+    assert_eq!(
+        dependent.depends_on[0].failure_policy,
+        DependencyFailurePolicy::Cancel
+    );
 }
 
 #[test]

@@ -79,6 +79,8 @@ harness_complete
 
 Worker routes are limited to the Supervisor. Native descendants share the containing Harness Session capability and are therefore attributed to the Worker Harness. The top-level OMP prompt requires one consolidated `harness_complete` call, but this is a cooperative contract rather than child-process isolation.
 
+The shared MCP surface may advertise the Supervisor-only `harness_task_graph` query, but a Worker capability cannot invoke it. Dependency inputs arrive only as immutable Attachment references on the assigned Task; dependency edges never open a Worker-to-Worker route.
+
 A blocking `harness_request` persists a Question and moves the Task to `waiting`. `harness_complete` validates `ResultManifestV1` and stores a candidate Result. Neither tool alone completes the native turn.
 
 ## Events and completion

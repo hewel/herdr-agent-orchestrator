@@ -2,14 +2,15 @@ use std::path::PathBuf;
 
 use herdr_harness_coordinator::{
     contract::{
-        AttachmentId, DeliveryIntent, HarnessDefinitionV1, HarnessId, HarnessKind, HarnessTier,
-        MessageKind, MessageSubmissionV1, ObservationCheckpoint, RepositoryAccess,
-        ResultManifestV1, SCHEMA_VERSION, TaskId, TaskRepositoryAuthorityV1, TaskSubmissionV1,
+        AttachmentId, DeliveryIntent, DependencyCondition, DependencyFailurePolicy,
+        HarnessDefinitionV1, HarnessId, HarnessKind, HarnessTier, MessageKind, MessageSubmissionV1,
+        ObservationCheckpoint, RepositoryAccess, ResultManifestV1, SCHEMA_VERSION,
+        TaskDependencyV1, TaskId, TaskRepositoryAuthorityV1, TaskSubmissionV1,
         VerificationResultV1, WriteScopeV1,
     },
     core::{
         ActorContext, CommandOutcome, Coordinator, CoordinatorCommand, CoordinatorQuery,
-        DeliveryUnknownResolution, QueryResult, SessionCapability, TaskState,
+        DeliveryUnknownResolution, QueryResult, SessionCapability, TaskSchedulingState, TaskState,
     },
 };
 use sha2::{Digest, Sha256};
@@ -67,6 +68,7 @@ async fn request_keys_replay_original_outcomes_and_reject_changed_payloads() {
         request_key: Some("task-retry-1".to_owned()),
         worker_id: worker_id.clone(),
         related_task_id: None,
+        depends_on: Vec::new(),
         title: "Idempotent task".to_owned(),
         instructions: "Prove that task retries return the original outcome.".to_owned(),
         attachments: Vec::new(),
@@ -108,7 +110,7 @@ async fn request_keys_replay_original_outcomes_and_reject_changed_payloads() {
     let error = coordinator
         .execute(
             ActorContext::Session {
-                capability: supervisor,
+                capability: supervisor.clone(),
             },
             CoordinatorCommand::CreateTask {
                 submission: changed,
@@ -120,6 +122,433 @@ async fn request_keys_replay_original_outcomes_and_reject_changed_payloads() {
         error.category,
         herdr_harness_coordinator::core::ErrorCategory::Conflict
     );
+}
+
+#[tokio::test]
+async fn dependent_tasks_are_persisted_blocked_and_exposed_by_the_graph_query() {
+    let (state, coordinator, supervisor, _worker, upstream_task_id) = seeded_task().await;
+    let CommandOutcome::TaskCreated {
+        task_id: dependent_task_id,
+        ..
+    } = coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorCommand::CreateTask {
+                submission: TaskSubmissionV1 {
+                    schema_version: SCHEMA_VERSION,
+                    request_key: None,
+                    worker_id: "omp-worker".parse().expect("worker ID must be valid"),
+                    related_task_id: Some(upstream_task_id),
+                    depends_on: vec![TaskDependencyV1 {
+                        task_id: upstream_task_id,
+                        condition: DependencyCondition::Approved,
+                        failure_policy: DependencyFailurePolicy::Cancel,
+                    }],
+                    title: "Use the approved implementation".to_owned(),
+                    instructions: "Run only after the upstream implementation is approved."
+                        .to_owned(),
+                    attachments: Vec::new(),
+                    repository: TaskRepositoryAuthorityV1 {
+                        root: state.path().join("project"),
+                        access: RepositoryAccess::ReadOnly,
+                        write_scopes: Vec::new(),
+                    },
+                },
+            },
+        )
+        .await
+        .expect("dependent Task must be accepted")
+    else {
+        panic!("Task creation returned the wrong outcome")
+    };
+
+    let QueryResult::TaskGraph(graph) = coordinator
+        .query(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorQuery::TaskGraph,
+        )
+        .await
+        .expect("Supervisor must inspect the Task graph")
+    else {
+        panic!("graph query returned the wrong result")
+    };
+    let dependent = graph
+        .iter()
+        .find(|entry| entry.task.id == dependent_task_id)
+        .expect("dependent Task must appear");
+    assert_eq!(dependent.scheduling_state, TaskSchedulingState::Blocked);
+    assert_eq!(dependent.dependencies.len(), 1);
+    assert_eq!(dependent.dependencies[0].task_id, upstream_task_id);
+    assert_eq!(dependent.worker_queue_position, None);
+    assert!(
+        graph
+            .iter()
+            .find(|entry| entry.task.id == upstream_task_id)
+            .expect("upstream Task must appear")
+            .dependents
+            .contains(&dependent_task_id)
+    );
+
+    drop(coordinator);
+    let restarted = Coordinator::open(state.path())
+        .await
+        .expect("Coordinator must reopen with a blocked graph");
+    let QueryResult::TaskGraph(recovered) = restarted
+        .query(
+            ActorContext::Session {
+                capability: supervisor,
+            },
+            CoordinatorQuery::TaskGraph,
+        )
+        .await
+        .expect("dependency graph must survive restart")
+    else {
+        panic!("restart query returned the wrong result")
+    };
+    assert_eq!(
+        recovered
+            .iter()
+            .find(|entry| entry.task.id == dependent_task_id)
+            .expect("dependent Task must recover")
+            .scheduling_state,
+        TaskSchedulingState::Blocked
+    );
+}
+
+#[tokio::test]
+async fn missing_dependency_is_rejected_without_committing_the_task() {
+    let (state, coordinator, supervisor, _worker, _task_id) = seeded_task().await;
+    let missing = TaskId::new();
+    let error = coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorCommand::CreateTask {
+                submission: TaskSubmissionV1 {
+                    schema_version: SCHEMA_VERSION,
+                    request_key: None,
+                    worker_id: "omp-worker".parse().expect("worker ID must be valid"),
+                    related_task_id: None,
+                    depends_on: vec![TaskDependencyV1 {
+                        task_id: missing,
+                        condition: DependencyCondition::Approved,
+                        failure_policy: DependencyFailurePolicy::Cancel,
+                    }],
+                    title: "Invalid dependency".to_owned(),
+                    instructions: "This Task must not be committed to durable state.".to_owned(),
+                    attachments: Vec::new(),
+                    repository: TaskRepositoryAuthorityV1 {
+                        root: state.path().join("project"),
+                        access: RepositoryAccess::ReadOnly,
+                        write_scopes: Vec::new(),
+                    },
+                },
+            },
+        )
+        .await
+        .expect_err("missing dependencies must be rejected");
+    assert_eq!(
+        error.category,
+        herdr_harness_coordinator::core::ErrorCategory::NotFound
+    );
+    let QueryResult::Tasks(tasks) = coordinator
+        .query(
+            ActorContext::Session {
+                capability: supervisor,
+            },
+            CoordinatorQuery::ListTasks,
+        )
+        .await
+        .expect("Task list must remain readable")
+    else {
+        panic!("Task query returned the wrong result")
+    };
+    assert_eq!(tasks.len(), 1);
+}
+
+#[tokio::test]
+async fn dependent_created_after_terminal_failure_obeys_cancel_policy() {
+    let (state, coordinator, supervisor, _worker, upstream) = seeded_task().await;
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorCommand::CancelTask { task_id: upstream },
+        )
+        .await
+        .expect("upstream Task must cancel");
+    let dependent = create_dependent_task(
+        &state,
+        &coordinator,
+        &supervisor,
+        upstream,
+        DependencyCondition::Approved,
+        "Cancel after failed upstream",
+    )
+    .await;
+    assert_task_state(
+        &coordinator,
+        &supervisor,
+        dependent,
+        TaskState::Cancelled,
+        0,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "dependency revision binding is an end-to-end lifecycle proof"
+)]
+async fn result_ready_rebinds_before_dispatch_and_dispatch_freezes_the_revision() {
+    let (state, coordinator, supervisor, worker, upstream_task_id) = seeded_task().await;
+    let result_ready_task = create_dependent_task(
+        &state,
+        &coordinator,
+        &supervisor,
+        upstream_task_id,
+        DependencyCondition::ResultReady,
+        "Review the implementation",
+    )
+    .await;
+    let approved_task = create_dependent_task(
+        &state,
+        &coordinator,
+        &supervisor,
+        upstream_task_id,
+        DependencyCondition::Approved,
+        "Use the approved implementation",
+    )
+    .await;
+    let evidence_path = state.path().join("dependency-verification.txt");
+    std::fs::write(&evidence_path, "verified\n").expect("evidence fixture");
+    let CommandOutcome::AttachmentAdmitted { attachment } = coordinator
+        .execute(
+            ActorContext::Session {
+                capability: worker.clone(),
+            },
+            CoordinatorCommand::AdmitAttachment {
+                source: evidence_path,
+                media_type: "text/plain".to_owned(),
+                original_name: "dependency-verification.txt".to_owned(),
+            },
+        )
+        .await
+        .expect("evidence admission must succeed")
+    else {
+        panic!("admission returned the wrong outcome")
+    };
+    let CommandOutcome::TaskDispatching { message_id, .. } = coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorCommand::DispatchTask {
+                task_id: upstream_task_id,
+            },
+        )
+        .await
+        .expect("upstream Task must dispatch")
+    else {
+        panic!("dispatch returned the wrong outcome")
+    };
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: worker.clone(),
+            },
+            CoordinatorCommand::AcceptDelivery {
+                message_id,
+                native_correlation: "dependency-turn-0".to_owned(),
+            },
+        )
+        .await
+        .expect("dispatch must be accepted");
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: worker.clone(),
+            },
+            CoordinatorCommand::CompleteTask {
+                manifest: result_manifest(upstream_task_id, "revision zero", attachment.id),
+                native_turn_id: "dependency-turn-0".to_owned(),
+            },
+        )
+        .await
+        .expect("Result must be accepted");
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: worker.clone(),
+            },
+            CoordinatorCommand::RecordTurnCompleted {
+                task_id: upstream_task_id,
+                native_turn_id: "dependency-turn-0".to_owned(),
+                succeeded: true,
+            },
+        )
+        .await
+        .expect("Result must settle into review");
+    assert_scheduling_state(
+        &coordinator,
+        &supervisor,
+        result_ready_task,
+        TaskSchedulingState::Ready,
+        Some(0),
+    )
+    .await;
+    assert_scheduling_state(
+        &coordinator,
+        &supervisor,
+        approved_task,
+        TaskSchedulingState::Blocked,
+        None,
+    )
+    .await;
+
+    let CommandOutcome::MessageCreated {
+        message_id: correction_id,
+    } = coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorCommand::SendMessage {
+                submission: message(
+                    "omp-worker",
+                    upstream_task_id,
+                    MessageKind::Correction,
+                    "Revise the result before downstream work starts.",
+                    None,
+                ),
+            },
+        )
+        .await
+        .expect("Correction must be queued")
+    else {
+        panic!("Correction returned the wrong outcome")
+    };
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: worker.clone(),
+            },
+            CoordinatorCommand::AcceptDelivery {
+                message_id: correction_id,
+                native_correlation: "dependency-turn-1".to_owned(),
+            },
+        )
+        .await
+        .expect("Correction must be accepted");
+    assert_scheduling_state(
+        &coordinator,
+        &supervisor,
+        result_ready_task,
+        TaskSchedulingState::Blocked,
+        None,
+    )
+    .await;
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: worker.clone(),
+            },
+            CoordinatorCommand::CompleteTask {
+                manifest: result_manifest(upstream_task_id, "revision one", attachment.id),
+                native_turn_id: "dependency-turn-1".to_owned(),
+            },
+        )
+        .await
+        .expect("revised Result must be accepted");
+    coordinator
+        .execute(
+            ActorContext::Session { capability: worker },
+            CoordinatorCommand::RecordTurnCompleted {
+                task_id: upstream_task_id,
+                native_turn_id: "dependency-turn-1".to_owned(),
+                succeeded: true,
+            },
+        )
+        .await
+        .expect("revised Result must settle");
+    let CommandOutcome::ObservationRecorded { digest, .. } = coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorCommand::CaptureRepositoryObservation {
+                task_id: upstream_task_id,
+                checkpoint: ObservationCheckpoint::Approval,
+            },
+        )
+        .await
+        .expect("approval evidence must capture")
+    else {
+        panic!("capture returned the wrong outcome")
+    };
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorCommand::ApproveTask {
+                task_id: upstream_task_id,
+                result_revision: 1,
+                observation_digest: digest,
+            },
+        )
+        .await
+        .expect("upstream Result must approve");
+    assert_scheduling_state(
+        &coordinator,
+        &supervisor,
+        result_ready_task,
+        TaskSchedulingState::Ready,
+        Some(1),
+    )
+    .await;
+    assert_scheduling_state(
+        &coordinator,
+        &supervisor,
+        approved_task,
+        TaskSchedulingState::Ready,
+        Some(1),
+    )
+    .await;
+
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorCommand::DispatchTask {
+                task_id: result_ready_task,
+            },
+        )
+        .await
+        .expect("FIFO head must dispatch");
+    let QueryResult::ResolvedTaskInput(input) = coordinator
+        .query(
+            ActorContext::Session {
+                capability: supervisor,
+            },
+            CoordinatorQuery::ResolvedTaskInput {
+                task_id: result_ready_task,
+            },
+        )
+        .await
+        .expect("bound Task input must resolve")
+    else {
+        panic!("resolved input returned the wrong projection")
+    };
+    assert_eq!(input.dependency_results[0].result_revision, 1);
 }
 
 #[tokio::test]
@@ -687,7 +1116,16 @@ async fn question_reply_result_and_correction_follow_the_v1_lifecycle() {
 
 #[tokio::test]
 async fn queued_cancellation_is_terminal_without_native_dispatch() {
-    let (_state, coordinator, supervisor, _worker, task_id) = seeded_task().await;
+    let (state, coordinator, supervisor, _worker, task_id) = seeded_task().await;
+    let dependent = create_dependent_task(
+        &state,
+        &coordinator,
+        &supervisor,
+        task_id,
+        DependencyCondition::Approved,
+        "Cancelled dependency consumer",
+    )
+    .await;
     coordinator
         .execute(
             ActorContext::Session {
@@ -698,6 +1136,14 @@ async fn queued_cancellation_is_terminal_without_native_dispatch() {
         .await
         .expect("queued Task must cancel immediately");
     assert_task_state(&coordinator, &supervisor, task_id, TaskState::Cancelled, 0).await;
+    assert_task_state(
+        &coordinator,
+        &supervisor,
+        dependent,
+        TaskState::Cancelled,
+        0,
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -1032,6 +1478,7 @@ async fn supervisor_can_queue_a_mutating_task_for_an_explicit_worker() {
         request_key: Some("task-1".to_owned()),
         worker_id,
         related_task_id: None,
+        depends_on: Vec::new(),
         title: "Implement bounded change".to_owned(),
         instructions: "Change only src/lib.rs and report verification.".to_owned(),
         attachments: Vec::new(),
@@ -1164,6 +1611,7 @@ async fn seeded_task() -> (
                     request_key: None,
                     worker_id,
                     related_task_id: None,
+                    depends_on: Vec::new(),
                     title: "Lifecycle proof".to_owned(),
                     instructions: "Exercise the durable lifecycle.".to_owned(),
                     attachments: Vec::new(),
@@ -1183,6 +1631,79 @@ async fn seeded_task() -> (
         panic!("Task creation must return an ID")
     };
     (state, coordinator, supervisor, worker, task_id)
+}
+
+async fn create_dependent_task(
+    state: &tempfile::TempDir,
+    coordinator: &Coordinator,
+    supervisor: &SessionCapability,
+    upstream_task_id: TaskId,
+    condition: DependencyCondition,
+    title: &str,
+) -> TaskId {
+    let CommandOutcome::TaskCreated { task_id, .. } = coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorCommand::CreateTask {
+                submission: TaskSubmissionV1 {
+                    schema_version: SCHEMA_VERSION,
+                    request_key: None,
+                    worker_id: "omp-worker".parse().expect("worker ID must be valid"),
+                    related_task_id: Some(upstream_task_id),
+                    depends_on: vec![TaskDependencyV1 {
+                        task_id: upstream_task_id,
+                        condition,
+                        failure_policy: DependencyFailurePolicy::Cancel,
+                    }],
+                    title: title.to_owned(),
+                    instructions: "Consume the immutable upstream Result snapshot.".to_owned(),
+                    attachments: Vec::new(),
+                    repository: TaskRepositoryAuthorityV1 {
+                        root: state.path().join("project"),
+                        access: RepositoryAccess::ReadOnly,
+                        write_scopes: Vec::new(),
+                    },
+                },
+            },
+        )
+        .await
+        .expect("dependent Task must be created")
+    else {
+        panic!("Task creation returned the wrong outcome")
+    };
+    task_id
+}
+
+async fn assert_scheduling_state(
+    coordinator: &Coordinator,
+    supervisor: &SessionCapability,
+    task_id: TaskId,
+    expected: TaskSchedulingState,
+    expected_revision: Option<u32>,
+) {
+    let QueryResult::TaskGraph(graph) = coordinator
+        .query(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorQuery::TaskGraph,
+        )
+        .await
+        .expect("Task graph query must succeed")
+    else {
+        panic!("Task graph query returned the wrong projection")
+    };
+    let task = graph
+        .iter()
+        .find(|entry| entry.task.id == task_id)
+        .expect("Task must appear in graph");
+    assert_eq!(task.scheduling_state, expected);
+    assert_eq!(
+        task.dependencies[0].satisfied_by_result_revision,
+        expected_revision
+    );
 }
 
 fn message(

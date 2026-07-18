@@ -327,10 +327,15 @@ async fn run_worker_host_inner(
 /// # Errors
 ///
 /// Returns an error when authentication, broker queries, or response decoding fails.
+#[expect(
+    clippy::too_many_lines,
+    reason = "popup rendering keeps the compact Supervisor projection together"
+)]
 pub async fn render_popup(socket: &Path, bearer: String) -> Result<String> {
     let capability = SessionCapability::from_bearer(bearer)?;
     let status = broker_query(socket, capability.clone(), CoordinatorQuery::HarnessStatus).await?;
     let tasks = broker_query(socket, capability.clone(), CoordinatorQuery::ListTasks).await?;
+    let graph = broker_query(socket, capability.clone(), CoordinatorQuery::TaskGraph).await?;
     let inbox = broker_query(socket, capability.clone(), CoordinatorQuery::Inbox).await?;
     let holds = broker_query(socket, capability, CoordinatorQuery::ActiveHolds).await?;
     let QueryResult::HarnessStatus(status) = status else {
@@ -338,6 +343,9 @@ pub async fn render_popup(socket: &Path, bearer: String) -> Result<String> {
     };
     let QueryResult::Tasks(tasks) = tasks else {
         bail!("invalid Task list response")
+    };
+    let QueryResult::TaskGraph(graph) = graph else {
+        bail!("invalid Task graph response")
     };
     let QueryResult::Inbox(inbox) = inbox else {
         bail!("invalid inbox response")
@@ -368,6 +376,57 @@ pub async fn render_popup(socket: &Path, bearer: String) -> Result<String> {
             "{} · {} · {:?} · revision {}",
             task.id, task.worker_id, task.state, task.result_revision
         );
+    }
+    output.push_str("\nScheduling\n");
+    for entry in graph {
+        let execution = if entry.task.state == TaskState::Queued {
+            "Not started".to_owned()
+        } else {
+            format!("{:?}", entry.task.state)
+        };
+        let _ = writeln!(
+            output,
+            "{} · {:?} · {} · queue {}{}{}",
+            entry.task.id,
+            entry.scheduling_state,
+            execution,
+            entry
+                .worker_queue_position
+                .map_or_else(|| "-".to_owned(), |position| position.to_string()),
+            if entry.waiting_for_worker {
+                " · waiting Worker"
+            } else {
+                ""
+            },
+            if entry.waiting_for_repository {
+                " · waiting repository"
+            } else {
+                ""
+            },
+        );
+        for dependency in entry.dependencies {
+            let status = dependency.satisfied_by_result_revision.map_or_else(
+                || "awaiting".to_owned(),
+                |revision| format!("Result revision {revision}"),
+            );
+            let _ = writeln!(
+                output,
+                "  {} · {:?} · {}",
+                dependency.task_id, dependency.condition, status
+            );
+        }
+        if !entry.dependents.is_empty() {
+            let _ = writeln!(
+                output,
+                "  dependents · {}",
+                entry
+                    .dependents
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
     }
     output.push_str("\nInbox\n");
     for message in inbox {
@@ -556,11 +615,24 @@ async fn resolve_delivery(
     let (text, intent, attachment_ids) = if message.kind == "task" {
         let task: TaskSubmissionV1 =
             serde_json::from_value(message.body.clone()).context("decoding root Task Message")?;
-        (
-            task.instructions,
-            DeliveryIntent::FollowUp,
-            task.attachments,
+        let task_id = task_id.context("root Task delivery must carry a Task identity")?;
+        let resolved = broker_query(
+            socket,
+            capability.clone(),
+            CoordinatorQuery::ResolvedTaskInput { task_id },
         )
+        .await?;
+        let QueryResult::ResolvedTaskInput(resolved) = resolved else {
+            bail!("broker returned the wrong resolved Task input projection");
+        };
+        let mut attachments = resolved.explicit_attachments;
+        attachments.extend(
+            resolved
+                .dependency_results
+                .into_iter()
+                .map(|dependency| dependency.attachment_id),
+        );
+        (task.instructions, DeliveryIntent::FollowUp, attachments)
     } else {
         let message: MessageSubmissionV1 =
             serde_json::from_value(message.body.clone()).context("decoding Bus Message")?;

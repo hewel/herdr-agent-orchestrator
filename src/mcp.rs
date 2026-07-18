@@ -174,6 +174,7 @@ impl McpServer {
         let operation = match name {
             "harness_list" => query(CoordinatorQuery::HarnessStatus),
             "harness_status" => query(CoordinatorQuery::ListTasks),
+            "harness_task_graph" => query(CoordinatorQuery::TaskGraph),
             "harness_inbox" => query(CoordinatorQuery::Inbox),
             "harness_task_create" => execute(CoordinatorCommand::CreateTask {
                 submission: serde_json::from_value(arguments)
@@ -562,6 +563,11 @@ fn tools() -> Vec<Value> {
         tool(
             "harness_status",
             "List durable Tasks and lifecycle states.",
+            empty.clone(),
+        ),
+        tool(
+            "harness_task_graph",
+            "Inspect Task dependencies, blockers, bound Result revisions, and Worker queue positions.",
             empty.clone(),
         ),
         tool(

@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "request_key": "review-implementation-v1",
+  "worker_id": "codex-review",
+  "related_task_id": "019f7000-0000-7000-8000-000000000010",
+  "depends_on": [
+    {
+      "task_id": "019f7000-0000-7000-8000-000000000010",
+      "condition": "result_ready",
+      "failure_policy": "cancel"
+    }
+  ],
+  "title": "Review implementation",
+  "instructions": "Review the bound implementation Result for correctness.",
+  "attachments": [],
+  "repository": {
+    "root": "/workspace/project",
+    "access": "read_only",
+    "write_scopes": []
+  }
+}

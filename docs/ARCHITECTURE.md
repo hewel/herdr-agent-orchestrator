@@ -7,7 +7,7 @@ Herdr Harness Coordinator is a lightweight Rust plugin that connects autonomous 
 The Coordinator is not a workflow engine and does not replace OMP, Codex, or their child-agent behavior. It owns only:
 
 - durable Harness identities and live Harness Sessions;
-- one Supervisor-to-Worker Task queue;
+- one Supervisor-authored global Task dependency graph and per-Worker FIFO admission;
 - short cross-harness messages and immutable Attachments;
 - delivery attempts, receipts, questions, corrections, and approvals;
 - top-level harness process and Herdr pane lifecycle;
@@ -138,10 +138,27 @@ pub struct TaskSubmissionV1 {
     pub request_key: Option<String>,
     pub worker_id: HarnessId,
     pub related_task_id: Option<TaskId>,
+    pub depends_on: Vec<TaskDependencyV1>,
     pub title: String,
     pub instructions: String,
     pub attachments: Vec<AttachmentId>,
     pub repository: TaskRepositoryAuthorityV1,
+}
+
+pub struct TaskDependencyV1 {
+    pub task_id: TaskId,
+    pub condition: DependencyCondition,
+    pub failure_policy: DependencyFailurePolicy,
+}
+
+pub enum DependencyCondition {
+    ResultReady,
+    Approved,
+}
+
+pub enum DependencyFailurePolicy {
+    Cancel,
+    KeepBlocked,
 }
 
 pub struct TaskRepositoryAuthorityV1 {
@@ -163,7 +180,32 @@ pub enum WriteScopeV1 {
 
 All MVP Tasks target a Git worktree. The canonical worktree root must match the selected Worker's registered repository. A mutating Task requires at least one write scope; a read-only Task requires none. Paths are normalized repository-relative UTF-8 paths and may not be absolute, traverse parents, enter `.git`, or escape through symlinks.
 
-`related_task_id` records review or verification context but creates no automatic dependency or workflow. The Supervisor remains responsible for sequencing related Tasks.
+`related_task_id` records informational review or verification context for presentation and audit. It never controls scheduling. `depends_on` records immutable scheduling edges to existing Tasks in the same Coordinator state directory and repository authority. The Supervisor remains responsible for Task decomposition, Worker choice, and graph design; the Coordinator only validates and admits the declared graph.
+
+Dependency submission rejects missing or duplicate upstream Tasks, self-edges, cross-state-directory or cross-repository edges, unsupported conditions, and cycles before committing the Task. Dependency edges cannot be changed after dispatch. The Coordinator does not create branches: fan-out is several declared Tasks becoming Ready together, and fan-in is one Task waiting for all of its declared edges.
+
+### Task scheduling
+
+The global dependency graph is an admission layer above the existing per-Worker FIFO behavior:
+
+```mermaid
+flowchart TD
+    DAG["Global Task DAG"] --> Ready["Ready Task set"]
+    Ready --> OMPQueue["OMP Worker FIFO"]
+    Ready --> CodexQueue["Codex Worker FIFO"]
+    OMPQueue --> OMP["OMP Harness"]
+    CodexQueue --> Codex["Codex Harness"]
+```
+
+Scheduling state is independent of execution state. `Blocked` means at least one dependency condition is unsatisfied. `Ready` means every dependency condition is satisfied, but Worker capacity, FIFO position, repository admission, or a Worktree Hold may still prevent dispatch. A Task with no dependencies is immediately Ready. A Blocked Task never acquires an Advisory Worktree Lease.
+
+Ready Tasks targeting different idle Workers may dispatch concurrently. For one Worker, creation order remains FIFO: a later Ready Task does not bypass an earlier Ready Task whose repository admission is waiting. The Worker Session still runs one active top-level Task, and repository eligibility remains a separate, later admission check. Dependency edges never create Worker-to-Worker communication.
+
+`ResultReady` is satisfied only when a valid structured Result exists, the native top-level turn has settled, the Task has entered `Reviewing`, and no Worktree Hold prevents using that checkpoint. `Approved` is satisfied only after explicit Supervisor Approval. Each satisfied edge records the exact upstream Result revision. Dispatch freezes that revision and delivers a Coordinator-owned immutable Result snapshot Attachment; large Results are not inlined into Task text.
+
+If a Correction is accepted before a dependent dispatches, provisional `ResultReady` satisfaction is revoked and the dependent is blocked until a new reviewable revision is available. A Correction never silently changes an already-dispatched dependent and never causes automatic downstream replay. The Supervisor may create, cancel, or replace stale downstream work explicitly.
+
+Each edge has a simple failure policy. `Cancel`, the default, cancels an undispatched dependent when its upstream Task fails or is cancelled. `KeepBlocked` leaves it for explicit Supervisor reconciliation. Delivery uncertainty, Worktree Holds, and an unapproved `Approved` dependency keep dependents Blocked; the Coordinator does not infer success.
 
 ### Task lifecycle
 
@@ -288,7 +330,7 @@ Native acceptance is not Task processing or completion. OMP prompt acknowledgeme
 
 The Coordinator retries automatically only while it can prove no provider bytes were accepted, including while a Harness is offline. If dispatch might have succeeded but acknowledgement is lost, the attempt becomes `Unknown`; Tasks, Corrections, Replies, and cancellation are never blindly replayed. The Supervisor must inspect and explicitly retry, cancel, or reconcile.
 
-FollowUp ordering is FIFO per Worker. One active Task is permitted per Worker Session. A Task acquires repository authority only when it reaches the head of the queue and the Worker and worktree are eligible.
+FollowUp ordering is FIFO per Worker. The dependency graph first determines whether a Task is Ready; per-Worker FIFO then determines dispatch order, Worker capacity determines whether the head may start, and repository admission determines whether a mutating Task may acquire authority. One active Task is permitted per Worker Session. A Task acquires repository authority only when it is Ready, reaches the head of the queue, and the Worker and worktree are eligible.
 
 ### Attachments
 
@@ -341,7 +383,7 @@ impl Coordinator {
 }
 ```
 
-Commands cover Supervisor registration, Worker start/stop, Task creation, Question, Reply, Correction, Notification, Result completion, Approval, cancellation, Worktree Hold clearance, and session events. Queries cover Harnesses, Sessions, Tasks, inboxes, receipts, worktree state, and popup views.
+Commands cover Supervisor registration, Worker start/stop, Task creation, Question, Reply, Correction, Notification, Result completion, Approval, cancellation, Worktree Hold clearance, and session events. Queries cover Harnesses, Sessions, Tasks, the Task graph and readiness blockers, inboxes, receipts, worktree state, and popup views.
 
 Routing, authorization, idempotency, Task transitions, queue eligibility, SQLite transactions, leases, receipts, and attachment admission stay behind this interface. Callers do not manipulate tables or state transitions directly.
 
@@ -378,10 +420,12 @@ One Coordinator daemon per `$HERDR_PLUGIN_STATE_DIR` owns SQLite and a local Uni
 
 Worker Hosts reconnect after a broker restart and replay sequenced host events from their retained buffer. A cold Herdr restart loses the original processes: active Sessions fail, pending mail remains, and any dispatched mutating Task enters Worktree Hold. The Coordinator never automatically adopts, resumes, or replays uncertain native work.
 
+Dependency edges, satisfied Result revisions, and frozen dependency inputs survive restart. The Coordinator reevaluates Blocked and Ready Tasks against durable state without duplicating dispatch. Delivery uncertainty and repository Holds continue to block inference or replay.
+
 SQLite stores:
 
 - Harness definitions and Harness Sessions;
-- Tasks, Result revisions, and Task transitions;
+- Tasks, immutable dependency edges, scheduling transitions, Result revision bindings, Result revisions, and Task transitions;
 - messages, delivery attempts, receipts, and inbox read state;
 - attachment metadata;
 - Repository Observations, Advisory Worktree Leases, and Worktree Holds;
@@ -399,6 +443,7 @@ Harness tools:
 ```text
 harness_list
 harness_status
+harness_task_graph
 harness_inbox
 harness_task_create
 harness_send
@@ -461,7 +506,7 @@ OMP Worker · working · inbox 0
 Supervisor · review ready · inbox 1
 ```
 
-The popup lists durable Harnesses and current Sessions, then shows the selected Task, inbox, Result revisions, repository evidence, and available actions:
+The popup lists durable Harnesses and current Sessions, then shows the selected Task, inbox, Result revisions, repository evidence, dependency blockers and bindings, Worker queue position, and available actions:
 
 ```text
 Harness Network
@@ -469,6 +514,10 @@ Harness Network
 ● supervisor       Codex · Supervisor · inbox 1
 ● omp-worker       OMP · Worker · reviewing
 ○ codex-review     Codex · Worker · idle
+
+Task final-verification · blocked · queued on omp-worker
+✓ backend-implementation  result_ready · revision 2
+● frontend-implementation approved · awaiting Approval
 
 [o] Focus  [m] Message  [i] Inbox  [c] Cancel task  [Esc] Close
 ```
@@ -480,7 +529,7 @@ Closing the popup never cancels a Task or closes a Worker pane.
 ### Milestone 1: Coordinator Core and OMP path
 
 1. Versioned domain contracts, SQLite migrations, attachments, routing, and Task lifecycle.
-2. Coordinator-owned queues, receipts, idempotency, Repository Observations, leases, and holds.
+2. Coordinator-owned dependency admission, queues, receipts, idempotency, Repository Observations, leases, and holds.
 3. Unix-socket daemon, CLI, Worker Host, and Herdr pane binding.
 4. OMP adapter and Coordinator tool bridge with native multi-agent behavior enabled by profile.
 5. Full Supervisor → OMP Task → Result → Correction or Approval proof.
@@ -522,7 +571,8 @@ The second release repeats the same top-level coordination path for Codex.
 - automatic Harness or model selection;
 - Worker-to-Worker messages;
 - provider-native child visualization or addressing;
-- automatic Task decomposition or workflow DAGs;
+- automatic Task decomposition, dynamic Task generation, or general-purpose workflow definitions;
+- arbitrary dependency expressions, loops, or recurring workflows;
 - multiple mutating Tasks in one worktree;
 - automatic worktrees, merges, publication, rollback, or cleanup;
 - hostile-process isolation and credential brokering;

@@ -68,7 +68,8 @@ The Coordinator launches Workers. `register` cannot adopt an arbitrary Worker pr
 | `schema_version` | exactly `1` |
 | `request_key` | optional 1-128 Unicode scalar idempotency key, additionally limited to 512 UTF-8 bytes by typed validation |
 | `worker_id` | existing Worker Harness |
-| `related_task_id` | optional existing Task visible to the Supervisor |
+| `related_task_id` | optional existing Task used only for UI grouping, audit context, and the related-review repository rule; it does not control scheduling |
+| `depends_on` | at most 32 immutable scheduling dependencies; omitted by legacy v1 payloads as an empty array |
 | `title` | 1-160 Unicode scalar values |
 | `instructions` | 1-16,384 Unicode scalar values, additionally limited to 65,536 UTF-8 bytes by typed validation |
 | `attachments` | at most 32 admitted Attachment IDs |
@@ -83,7 +84,33 @@ Repository authority contains an absolute canonical `root`, `access`, and `write
 - Paths reject empty components, `.`, `..`, absolute forms, backslashes, NUL, repeated separators, trailing separators, repository metadata, nested repositories, submodules, and symlink escape.
 - Duplicate scopes and an exact file contained by a declared subtree are rejected. Nested subtrees are normalized to the broader scope.
 
-The Coordinator generates the Task and root Task-message IDs in one transaction. A Task is queued only after its Worker, Attachments, repository identity, and public shape validate.
+Each `depends_on` entry contains an existing upstream `task_id`, a `condition`, and an optional `failure_policy` that defaults to `cancel`.
+
+- `result_ready` requires a valid Result, settled native top-level turn, `reviewing` state, and no Worktree Hold. The exact satisfying Result revision is recorded.
+- `approved` requires explicit Supervisor Approval and records the approved Result revision.
+- `cancel` cancels an undispatched dependent if the upstream Task fails or is cancelled.
+- `keep_blocked` preserves the dependent for explicit Supervisor reconciliation.
+
+The Coordinator rejects a missing upstream Task, self-dependency, repeated upstream Task, unsupported condition, cycle, cross-state-directory dependency, repository-authority mismatch, or dependency-edge mutation after dispatch. Validation, including defensive topological cycle validation, completes before any Task or edge is committed. Dependencies do not select Workers, generate Tasks, or authorize direct Worker-to-Worker messages.
+
+The Coordinator generates the Task and root Task-message IDs in one transaction. A Task and all dependency edges persist only after its Worker, Attachments, repository identity, graph, and public shape validate.
+
+## Task scheduling contract
+
+Scheduling readiness is distinct from the Task execution lifecycle:
+
+```text
+blocked
+ready
+```
+
+`blocked` means at least one declared condition is unsatisfied. `ready` means all conditions are satisfied, but it does not promise immediate dispatch. A Task with no dependencies is immediately `ready`. Worker capacity, per-Worker FIFO position, repository leases, and Worktree Holds remain independent admission gates.
+
+The Coordinator reevaluates affected Tasks when Tasks and Results change state, a Hold is created or cleared, a Worker becomes available or reconnects, or repository authority becomes available. Readiness and downstream failure transitions are transactional and idempotent. Several Tasks may become Ready in one reevaluation; no explicit branch queues are created.
+
+Ready Tasks for one Worker retain Task creation order. A later Task cannot bypass the earliest Ready Task if that earlier Task is waiting for Worker or repository admission. Ready Tasks assigned to separate idle Workers may dispatch concurrently. A Blocked Task never acquires a repository lease.
+
+For every satisfied dependency, the Coordinator creates or reuses an immutable Result snapshot Attachment and records the satisfying Result revision. When the dependent dispatches, its dependency inputs are frozen to those revisions. A pre-dispatch Correction or new Worktree Hold revokes provisional `result_ready` satisfaction and reblocks the dependent; a later revision may satisfy it again. Once dispatched, a newer upstream revision never mutates or replays downstream work automatically.
 
 ## Task state contract
 
@@ -116,7 +143,7 @@ Key rules:
 - `reviewing → approved` requires Supervisor Approval and a matching current Repository Observation.
 - Terminal failure or cancellation after mutating dispatch creates or preserves a Worktree Hold.
 
-One Worker may have one Task in `dispatching`, `working`, `waiting`, `reviewing`, or `cancelling`. Later Tasks stay FIFO `queued`.
+One Worker may have one Task in `dispatching`, `working`, `waiting`, `reviewing`, or `cancelling`. Ready Tasks wait in FIFO order until the active slot and repository admission are available. `delivery_unknown` never satisfies an edge and never triggers automatic replay.
 
 ## Message admission
 
@@ -207,6 +234,12 @@ Attachment admission:
 6. returns the generated Attachment ID.
 
 After admission, messages reference only Attachment IDs. Missing or digest-mismatched stored files are durable corruption and block delivery. Automatic garbage collection is deferred.
+
+Explicit Task Attachments and dependency Result snapshots are resolved separately. The dependent Worker receives immutable Attachment references and upstream Task and Result revision metadata; the Coordinator never inlines a large upstream Result into Task text.
+
+## Task graph query
+
+`harness_task_graph` is a Supervisor-only read query. For each Task it reports scheduling and execution state, dependency conditions and failure policies, satisfied Result revisions, direct dependents, Worker queue position, and whether Worker capacity or repository admission is the current wait. It does not expose database mutation or permit dependency editing.
 
 ## Command idempotency
 

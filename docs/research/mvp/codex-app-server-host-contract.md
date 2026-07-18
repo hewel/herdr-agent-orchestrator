@@ -75,6 +75,8 @@ harness_complete
 
 Calls are attributed to the containing Worker Harness, including calls made by a native child. The top-level turn must produce one valid `ResultManifestV1` through `harness_complete`.
 
+The shared MCP surface may advertise the Supervisor-only `harness_task_graph` query, but a Worker capability cannot invoke it. Dependency inputs arrive only as immutable Attachment references on the assigned Task; dependency edges never open a Worker-to-Worker route.
+
 The broker stores the Result candidate immediately. The Task moves to `reviewing` only after matching `turn/completed` with completed status and a successful Result Repository Observation. A terminal turn without one valid Result fails the Task.
 
 ## Events

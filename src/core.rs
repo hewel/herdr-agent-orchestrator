@@ -1,7 +1,7 @@
 //! Transactional command/query boundary for durable Coordinator state.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     fs::File,
     path::{Path, PathBuf},
     str::FromStr,
@@ -23,11 +23,11 @@ use uuid::Uuid;
 use crate::adapter::AdapterCapabilities;
 use crate::attachment::{AttachmentMetadata, AttachmentStore};
 use crate::contract::{
-    CommandEvidenceV1, DeliveryAttemptId, DeliveryIntent, HarnessDefinitionV1, HarnessId,
-    HarnessSessionId, HarnessTier, MessageId, MessageKind, MessageSubmissionV1,
-    ObservationCheckpoint, RepositoryAccess, RepositoryObservationId, RepositoryObservationV1,
-    ResultManifestV1, SCHEMA_VERSION, ScopeClassification, TaskId, TaskSubmissionV1, Validate,
-    WorktreeHoldId, WriteScopeV1,
+    CommandEvidenceV1, DeliveryAttemptId, DeliveryIntent, DependencyCondition,
+    DependencyFailurePolicy, HarnessDefinitionV1, HarnessId, HarnessSessionId, HarnessTier,
+    MessageId, MessageKind, MessageSubmissionV1, ObservationCheckpoint, RepositoryAccess,
+    RepositoryObservationId, RepositoryObservationV1, ResultManifestV1, SCHEMA_VERSION,
+    ScopeClassification, TaskId, TaskSubmissionV1, Validate, WorktreeHoldId, WriteScopeV1,
 };
 use crate::profile::parse_launch_profile_snapshot;
 use crate::repository::{GitRepository, RepositorySnapshot};
@@ -288,6 +288,8 @@ pub enum CoordinatorQuery {
     },
     /// Return all Tasks in durable FIFO order.
     ListTasks,
+    /// Return dependency, readiness, and admission details for all Tasks.
+    TaskGraph,
     /// Return unread Messages addressed to the authenticated Harness.
     Inbox,
     /// Return one row per durable Harness for popup presentation.
@@ -300,6 +302,8 @@ pub enum CoordinatorQuery {
     GetAttachment {
         attachment_id: crate::contract::AttachmentId,
     },
+    /// Return explicit and frozen dependency inputs for one Task delivery.
+    ResolvedTaskInput { task_id: TaskId },
 }
 
 /// Durable Task lifecycle state.
@@ -326,6 +330,40 @@ pub enum TaskState {
     Cancelled,
     /// Task failed.
     Failed,
+}
+
+/// Logical dependency readiness, independent of native Task execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskSchedulingState {
+    /// At least one declared dependency is not satisfied.
+    Blocked,
+    /// Every declared dependency is satisfied; capacity admission may still wait.
+    Ready,
+}
+
+impl TaskSchedulingState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Blocked => "blocked",
+            Self::Ready => "ready",
+        }
+    }
+}
+
+impl FromStr for TaskSchedulingState {
+    type Err = CoordinatorError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "blocked" => Ok(Self::Blocked),
+            "ready" => Ok(Self::Ready),
+            _ => Err(CoordinatorError::new(
+                ErrorCategory::StorageFailure,
+                format!("unknown Task scheduling state `{value}`"),
+            )),
+        }
+    }
 }
 
 impl TaskState {
@@ -379,6 +417,42 @@ pub struct TaskView {
     pub state: TaskState,
     /// Current Result revision.
     pub result_revision: u32,
+}
+
+/// One persisted dependency edge in a Task graph projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskDependencyView {
+    pub task_id: TaskId,
+    pub condition: crate::contract::DependencyCondition,
+    pub failure_policy: crate::contract::DependencyFailurePolicy,
+    pub satisfied_by_result_revision: Option<u32>,
+}
+
+/// Scheduling projection used by the Supervisor and popup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskGraphView {
+    pub task: TaskView,
+    pub scheduling_state: TaskSchedulingState,
+    pub dependencies: Vec<TaskDependencyView>,
+    pub dependents: Vec<TaskId>,
+    pub worker_queue_position: Option<u32>,
+    pub waiting_for_worker: bool,
+    pub waiting_for_repository: bool,
+}
+
+/// Immutable upstream Result reference delivered to a dependent Worker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DependencyResultRef {
+    pub task_id: TaskId,
+    pub result_revision: u32,
+    pub attachment_id: crate::contract::AttachmentId,
+}
+
+/// Attachment-only resolved input; Result bodies are never inlined into Task text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedTaskInputView {
+    pub explicit_attachments: Vec<crate::contract::AttachmentId>,
+    pub dependency_results: Vec<DependencyResultRef>,
 }
 
 /// Compact durable Harness and live Session projection.
@@ -525,6 +599,8 @@ pub enum QueryResult {
     Task(TaskView),
     /// Durable Tasks in FIFO order.
     Tasks(Vec<TaskView>),
+    /// Global dependency-aware scheduling projection.
+    TaskGraph(Vec<TaskGraphView>),
     /// Unread inbox Messages.
     Inbox(Vec<InboxMessageView>),
     /// Popup-oriented Harness rows.
@@ -535,6 +611,8 @@ pub enum QueryResult {
     Session(SessionSelfView),
     /// Immutable Attachment metadata.
     Attachment(AttachmentMetadata),
+    /// Frozen delivery input for a Task.
+    ResolvedTaskInput(ResolvedTaskInputView),
 }
 
 /// One Coordinator daemon's deep transactional state module.
@@ -591,7 +669,27 @@ impl Coordinator {
             let file = coordinator.try_lock_worktree(lease.get("repository_key"))?;
             coordinator.lease_files.lock().await.insert(task_id, file);
         }
+        coordinator.recover_task_scheduling().await?;
         Ok(coordinator)
+    }
+
+    async fn recover_task_scheduling(&self) -> Result<(), CoordinatorError> {
+        let mut transaction = self.pool.begin().await.map_err(CoordinatorError::storage)?;
+        let task_ids = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM tasks WHERE state = 'queued' AND scheduling_state = 'blocked'",
+        )
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(CoordinatorError::storage)?;
+        let now = timestamp();
+        for task_id in task_ids {
+            reevaluate_new_task_dependencies(&mut transaction, parse_uuid_id(&task_id)?, &now)
+                .await?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(CoordinatorError::storage)
     }
 
     /// Executes one authenticated command atomically.
@@ -869,6 +967,10 @@ impl Coordinator {
     /// # Errors
     ///
     /// Returns [`CoordinatorError`] when authentication or storage fails.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one exhaustive query authorization and projection boundary"
+    )]
     pub async fn query(
         &self,
         actor: ActorContext,
@@ -920,6 +1022,10 @@ impl Coordinator {
                 }))
             }
             CoordinatorQuery::ListTasks => self.list_tasks().await,
+            CoordinatorQuery::TaskGraph => {
+                self.require_supervisor(&actor)?;
+                self.task_graph().await
+            }
             CoordinatorQuery::Inbox => self.inbox(&actor).await,
             CoordinatorQuery::HarnessStatus => self.harness_status().await,
             CoordinatorQuery::ActiveHolds => {
@@ -929,6 +1035,48 @@ impl Coordinator {
             CoordinatorQuery::SessionSelf => self.session_self(&actor).await,
             CoordinatorQuery::GetAttachment { attachment_id } => {
                 self.get_attachment(attachment_id).await
+            }
+            CoordinatorQuery::ResolvedTaskInput { task_id } => {
+                let row = sqlx::query("SELECT worker_id, submission_json FROM tasks WHERE id = ?")
+                    .bind(task_id.to_string())
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(CoordinatorError::storage)?
+                    .ok_or_else(|| {
+                        CoordinatorError::new(ErrorCategory::NotFound, "Task does not exist")
+                    })?;
+                if actor.tier != HarnessTier::Supervisor
+                    && row.get::<&str, _>("worker_id") != actor.id.as_str()
+                {
+                    return Err(CoordinatorError::new(
+                        ErrorCategory::Forbidden,
+                        "only the Supervisor or assigned Worker may resolve Task input",
+                    ));
+                }
+                let submission: TaskSubmissionV1 = serde_json::from_str(row.get("submission_json"))
+                    .map_err(CoordinatorError::storage)?;
+                let dependencies = sqlx::query("SELECT dependency_task_id, satisfied_by_result_revision, result_snapshot_attachment_id FROM task_dependencies WHERE task_id = ? AND bound_at IS NOT NULL ORDER BY dependency_task_id")
+                    .bind(task_id.to_string())
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(CoordinatorError::storage)?
+                    .iter()
+                    .map(|dependency| {
+                        let revision: i64 = dependency.get("satisfied_by_result_revision");
+                        Ok(DependencyResultRef {
+                            task_id: parse_uuid_id(dependency.get("dependency_task_id"))?,
+                            result_revision: u32::try_from(revision)
+                                .map_err(CoordinatorError::storage)?,
+                            attachment_id: parse_uuid_id(
+                                dependency.get("result_snapshot_attachment_id"),
+                            )?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, CoordinatorError>>()?;
+                Ok(QueryResult::ResolvedTaskInput(ResolvedTaskInputView {
+                    explicit_attachments: submission.attachments,
+                    dependency_results: dependencies,
+                }))
             }
         }
     }
@@ -1052,6 +1200,69 @@ impl Coordinator {
             .map(task_view_from_row)
             .collect::<Result<Vec<_>, _>>()?;
         Ok(QueryResult::Tasks(tasks))
+    }
+
+    async fn task_graph(&self) -> Result<QueryResult, CoordinatorError> {
+        let rows = sqlx::query("SELECT id, worker_id, state, scheduling_state, result_revision, submission_json, created_sequence FROM tasks ORDER BY created_sequence")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        let mut graph = Vec::with_capacity(rows.len());
+        for row in rows {
+            let task = task_view_from_row(&row)?;
+            let dependencies = sqlx::query("SELECT dependency_task_id, condition, failure_policy, satisfied_by_result_revision FROM task_dependencies WHERE task_id = ? ORDER BY dependency_task_id")
+                .bind(task.id.to_string())
+                .fetch_all(&self.pool)
+                .await
+                .map_err(CoordinatorError::storage)?
+                .iter()
+                .map(task_dependency_view_from_row)
+                .collect::<Result<Vec<_>, _>>()?;
+            let dependents = sqlx::query_scalar::<_, String>("SELECT task_id FROM task_dependencies WHERE dependency_task_id = ? ORDER BY task_id")
+                .bind(task.id.to_string())
+                .fetch_all(&self.pool)
+                .await
+                .map_err(CoordinatorError::storage)?
+                .iter()
+                .map(|id| parse_uuid_id(id))
+                .collect::<Result<Vec<_>, _>>()?;
+            let scheduling_state = TaskSchedulingState::from_str(row.get("scheduling_state"))?;
+            let position: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE worker_id = ? AND scheduling_state = 'ready' AND state = 'queued' AND created_sequence <= ?")
+                .bind(task.worker_id.as_str())
+                .bind(row.get::<i64, _>("created_sequence"))
+                .fetch_one(&self.pool)
+                .await
+                .map_err(CoordinatorError::storage)?;
+            let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE worker_id = ? AND id <> ? AND state IN ('dispatching','working','waiting','reviewing','cancelling','delivery_unknown')")
+                .bind(task.worker_id.as_str())
+                .bind(task.id.to_string())
+                .fetch_one(&self.pool)
+                .await
+                .map_err(CoordinatorError::storage)?;
+            let submission: TaskSubmissionV1 = serde_json::from_str(row.get("submission_json"))
+                .map_err(CoordinatorError::storage)?;
+            let repository_key = submission.repository.root.to_string_lossy();
+            let repository_blockers: i64 = sqlx::query_scalar("SELECT (SELECT COUNT(*) FROM worktree_holds WHERE repository_key = ? AND cleared_at IS NULL) + (SELECT COUNT(*) FROM worktree_leases WHERE repository_key = ? AND released_at IS NULL AND task_id <> ?)")
+                .bind(repository_key.as_ref())
+                .bind(repository_key.as_ref())
+                .bind(task.id.to_string())
+                .fetch_one(&self.pool)
+                .await
+                .map_err(CoordinatorError::storage)?;
+            let is_waiting =
+                scheduling_state == TaskSchedulingState::Ready && task.state == TaskState::Queued;
+            graph.push(TaskGraphView {
+                task,
+                scheduling_state,
+                dependencies,
+                dependents,
+                worker_queue_position: is_waiting
+                    .then(|| u32::try_from(position).unwrap_or(u32::MAX)),
+                waiting_for_worker: is_waiting && active != 0,
+                waiting_for_repository: is_waiting && repository_blockers != 0,
+            });
+        }
+        Ok(QueryResult::TaskGraph(graph))
     }
 
     async fn inbox(&self, actor: &AuthenticatedActor) -> Result<QueryResult, CoordinatorError> {
@@ -1475,24 +1686,75 @@ impl Coordinator {
                 ));
             }
         }
+        for dependency in &submission.depends_on {
+            let upstream = sqlx::query("SELECT submission_json FROM tasks WHERE id = ?")
+                .bind(dependency.task_id.to_string())
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(CoordinatorError::storage)?
+                .ok_or_else(|| {
+                    CoordinatorError::new(
+                        ErrorCategory::NotFound,
+                        format!("dependency Task {} does not exist", dependency.task_id),
+                    )
+                })?;
+            let upstream_submission: TaskSubmissionV1 =
+                serde_json::from_str(upstream.get("submission_json"))
+                    .map_err(CoordinatorError::storage)?;
+            let upstream_repository = GitRepository::open(&upstream_submission.repository.root)
+                .map_err(|error| {
+                    CoordinatorError::new(ErrorCategory::InvalidInput, error.to_string())
+                })?;
+            if upstream_repository.identity().worktree_root != *canonical_root {
+                return Err(CoordinatorError::new(
+                    ErrorCategory::InvalidInput,
+                    "dependency Task belongs to a different canonical worktree",
+                ));
+            }
+        }
         let sequence = next_sequence(&mut transaction, "task_create").await?;
         let task_id = TaskId::new();
         let message_id = MessageId::new();
         let now = timestamp();
         let submission_json =
             serde_json::to_string(&submission).map_err(CoordinatorError::storage)?;
-        sqlx::query("INSERT INTO tasks (id, worker_id, related_task_id, submission_json, state, created_sequence, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+        let scheduling_state = if submission.depends_on.is_empty() {
+            TaskSchedulingState::Ready
+        } else {
+            TaskSchedulingState::Blocked
+        };
+        sqlx::query("INSERT INTO tasks (id, worker_id, related_task_id, submission_json, state, scheduling_state, created_sequence, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(task_id.to_string())
             .bind(submission.worker_id.as_str())
             .bind(submission.related_task_id.map(|id| id.to_string()))
             .bind(&submission_json)
             .bind(TaskState::Queued.as_str())
+            .bind(scheduling_state.as_str())
             .bind(sequence)
             .bind(&now)
             .bind(&now)
             .execute(&mut *transaction)
             .await
             .map_err(CoordinatorError::storage)?;
+        sqlx::query("INSERT INTO task_scheduling_transitions (task_id, from_state, to_state, evidence_json, created_at) VALUES (?, NULL, ?, '{}', ?)")
+            .bind(task_id.to_string())
+            .bind(scheduling_state.as_str())
+            .bind(&now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        for dependency in &submission.depends_on {
+            sqlx::query("INSERT INTO task_dependencies (task_id, dependency_task_id, condition, failure_policy) VALUES (?, ?, ?, ?)")
+                .bind(task_id.to_string())
+                .bind(dependency.task_id.to_string())
+                .bind(dependency_condition_as_str(dependency.condition))
+                .bind(dependency_failure_policy_as_str(dependency.failure_policy))
+                .execute(&mut *transaction)
+                .await
+                .map_err(CoordinatorError::storage)?;
+        }
+        validate_acyclic_task_graph(&mut transaction).await?;
+        reevaluate_new_task_dependencies(&mut transaction, task_id, &now).await?;
         sqlx::query("INSERT INTO task_transitions (task_id, from_state, to_state, evidence_json, created_at) VALUES (?, NULL, 'queued', '{}', ?)")
             .bind(task_id.to_string())
             .bind(&now)
@@ -1557,14 +1819,32 @@ impl Coordinator {
     )]
     async fn commit_dispatch(&self, task_id: TaskId) -> Result<CommandOutcome, CoordinatorError> {
         let mut transaction = self.pool.begin().await.map_err(CoordinatorError::storage)?;
-        let row = sqlx::query("SELECT worker_id, state, submission_json FROM tasks WHERE id = ?")
+        let row = sqlx::query("SELECT worker_id, state, scheduling_state, created_sequence, submission_json FROM tasks WHERE id = ?")
             .bind(task_id.to_string())
             .fetch_optional(&mut *transaction)
             .await
             .map_err(CoordinatorError::storage)?
             .ok_or_else(|| CoordinatorError::new(ErrorCategory::NotFound, "Task does not exist"))?;
         require_state(row.get("state"), TaskState::Queued)?;
+        if row.get::<&str, _>("scheduling_state") != TaskSchedulingState::Ready.as_str() {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidState,
+                "Task dependencies are not satisfied",
+            ));
+        }
         let worker_id: &str = row.get("worker_id");
+        let earlier: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE worker_id = ? AND scheduling_state = 'ready' AND state = 'queued' AND created_sequence < ?")
+            .bind(worker_id)
+            .bind(row.get::<i64, _>("created_sequence"))
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        if earlier != 0 {
+            return Err(CoordinatorError::new(
+                ErrorCategory::Conflict,
+                "an earlier Ready Task owns the Worker FIFO head",
+            ));
+        }
         let submission: TaskSubmissionV1 =
             serde_json::from_str(row.get("submission_json")).map_err(CoordinatorError::storage)?;
         let session_id: Option<String> = sqlx::query_scalar(
@@ -1673,6 +1953,27 @@ impl Coordinator {
             .map_err(CoordinatorError::storage)?;
         let message_id = parse_uuid_id::<MessageId>(message.get("id"))?;
         let now = timestamp();
+        let unmet_dependencies: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM task_dependencies WHERE task_id = ? AND satisfied_at IS NULL",
+        )
+        .bind(task_id.to_string())
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(CoordinatorError::storage)?;
+        if unmet_dependencies != 0 {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidState,
+                "Task dependencies changed before dispatch",
+            ));
+        }
+        sqlx::query(
+            "UPDATE task_dependencies SET bound_at = ? WHERE task_id = ? AND bound_at IS NULL",
+        )
+        .bind(&now)
+        .bind(task_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .map_err(CoordinatorError::storage)?;
         sqlx::query("UPDATE tasks SET state = 'dispatching', active_session_id = ?, updated_at = ? WHERE id = ?")
             .bind(&session_id)
             .bind(&now)
@@ -1741,14 +2042,32 @@ impl Coordinator {
     }
 
     async fn preflight_dispatch(&self, task_id: TaskId) -> Result<(), CoordinatorError> {
-        let row = sqlx::query("SELECT worker_id, state, submission_json FROM tasks WHERE id = ?")
+        let row = sqlx::query("SELECT worker_id, state, scheduling_state, created_sequence, submission_json FROM tasks WHERE id = ?")
             .bind(task_id.to_string())
             .fetch_optional(&self.pool)
             .await
             .map_err(CoordinatorError::storage)?
             .ok_or_else(|| CoordinatorError::new(ErrorCategory::NotFound, "Task does not exist"))?;
         require_state(row.get("state"), TaskState::Queued)?;
+        if row.get::<&str, _>("scheduling_state") != TaskSchedulingState::Ready.as_str() {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidState,
+                "Task dependencies are not satisfied",
+            ));
+        }
         let worker_id: &str = row.get("worker_id");
+        let earlier: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE worker_id = ? AND scheduling_state = 'ready' AND state = 'queued' AND created_sequence < ?")
+            .bind(worker_id)
+            .bind(row.get::<i64, _>("created_sequence"))
+            .fetch_one(&self.pool)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        if earlier != 0 {
+            return Err(CoordinatorError::new(
+                ErrorCategory::Conflict,
+                "an earlier Ready Task owns the Worker FIFO head",
+            ));
+        }
         let online: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM harness_sessions WHERE harness_id = ? AND ended_at IS NULL AND presence = 'online'")
             .bind(worker_id)
             .fetch_one(&self.pool)
@@ -1834,7 +2153,7 @@ impl Coordinator {
             return Ok(CommandOutcome::NoTaskAvailable);
         }
         let task_id: Option<String> = sqlx::query_scalar(
-            "SELECT id FROM tasks WHERE worker_id = ? AND state = 'queued' ORDER BY created_sequence LIMIT 1",
+            "SELECT id FROM tasks WHERE worker_id = ? AND state = 'queued' AND scheduling_state = 'ready' ORDER BY created_sequence LIMIT 1",
         )
         .bind(actor.id.as_str())
         .fetch_optional(&self.pool)
@@ -2101,6 +2420,7 @@ impl Coordinator {
                         &now,
                     )
                     .await?;
+                    revoke_unbound_result_dependencies(&mut transaction, task_id, &now).await?;
                 }
                 _ => {}
             }
@@ -2127,6 +2447,35 @@ impl Coordinator {
                 "native turn ID must contain 1 to 512 bytes",
             ));
         }
+        let task = sqlx::query("SELECT worker_id, state FROM tasks WHERE id = ?")
+            .bind(manifest.task_id.to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(CoordinatorError::storage)?
+            .ok_or_else(|| CoordinatorError::new(ErrorCategory::NotFound, "Task does not exist"))?;
+        if task.get::<&str, _>("worker_id") != actor.id.as_str() {
+            return Err(CoordinatorError::new(
+                ErrorCategory::Forbidden,
+                "only the assigned Worker may complete this Task",
+            ));
+        }
+        require_state(task.get("state"), TaskState::Working)?;
+        let mut attachment_ids = manifest.attachments.clone();
+        attachment_ids.extend(manifest.verification.iter().map(|entry| entry.evidence));
+        for attachment_id in attachment_ids {
+            let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM attachments WHERE id = ?")
+                .bind(attachment_id.to_string())
+                .fetch_one(&self.pool)
+                .await
+                .map_err(CoordinatorError::storage)?;
+            if exists == 0 {
+                return Err(CoordinatorError::new(
+                    ErrorCategory::NotFound,
+                    "Result references an unknown Attachment",
+                ));
+            }
+        }
+        let snapshot_attachment = self.admit_dependency_result_snapshot(&manifest).await?;
         // Reserve the write lock before attachment and Task reads. A deferred SQLite
         // transaction can lose its later read-to-write upgrade to concurrent Host events.
         let mut transaction = self
@@ -2161,6 +2510,13 @@ impl Coordinator {
             .execute(&mut *transaction)
             .await
             .map_err(|error| CoordinatorError::new(ErrorCategory::Conflict, error.to_string()))?;
+        sqlx::query("INSERT INTO result_dependency_snapshots (task_id, result_revision, attachment_id) VALUES (?, ?, ?)")
+            .bind(manifest.task_id.to_string())
+            .bind(revision_i64)
+            .bind(snapshot_attachment.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?;
         transaction
             .commit()
             .await
@@ -2251,6 +2607,9 @@ impl Coordinator {
         };
         let now = timestamp();
         transition_exact(&mut transaction, task_id, current, next, false, &now).await?;
+        if next == TaskState::Failed {
+            cascade_failed_dependencies(&mut transaction, task_id, &now).await?;
+        }
         let submission: TaskSubmissionV1 =
             serde_json::from_str(task.get("submission_json")).map_err(CoordinatorError::storage)?;
         if next == TaskState::Failed || out_of_scope {
@@ -2274,6 +2633,16 @@ impl Coordinator {
             }
         }
         if next == TaskState::Reviewing {
+            if !out_of_scope {
+                satisfy_downstream_dependencies(
+                    &mut transaction,
+                    task_id,
+                    DependencyCondition::ResultReady,
+                    u32::try_from(revision).map_err(CoordinatorError::storage)?,
+                    &now,
+                )
+                .await?;
+            }
             let supervisor_id: String =
                 sqlx::query_scalar("SELECT id FROM harnesses WHERE tier = 'supervisor' LIMIT 1")
                     .fetch_one(&mut *transaction)
@@ -2539,6 +2908,45 @@ impl Coordinator {
         Ok(Some(attachment.id))
     }
 
+    async fn admit_dependency_result_snapshot(
+        &self,
+        manifest: &ResultManifestV1,
+    ) -> Result<crate::contract::AttachmentId, CoordinatorError> {
+        let temporary_dir = self.state_dir.join("tmp");
+        tokio::fs::create_dir_all(&temporary_dir)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        let temporary = temporary_dir.join(format!(
+            "dependency-result-{}-{}.tmp",
+            manifest.task_id,
+            Uuid::now_v7()
+        ));
+        let snapshot = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "dependency_task_id": manifest.task_id,
+            "result": manifest,
+        }))
+        .map_err(CoordinatorError::storage)?;
+        tokio::fs::write(&temporary, snapshot)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        let outcome = self
+            .admit_attachment(
+                temporary.clone(),
+                "application/json".to_owned(),
+                format!("task-{}-result.json", manifest.task_id),
+            )
+            .await;
+        let _ = tokio::fs::remove_file(temporary).await;
+        match outcome? {
+            CommandOutcome::AttachmentAdmitted { attachment } => Ok(attachment.id),
+            _ => Err(CoordinatorError::new(
+                ErrorCategory::StorageFailure,
+                "generated Result snapshot admission returned an unexpected outcome",
+            )),
+        }
+    }
+
     async fn verify_repository_checkpoint_current(
         &self,
         task_id: TaskId,
@@ -2602,17 +3010,15 @@ impl Coordinator {
         task_id: TaskId,
         reason: &str,
     ) -> Result<(), CoordinatorError> {
-        let submission_json: Option<String> =
-            sqlx::query_scalar("SELECT submission_json FROM tasks WHERE id = ?")
-                .bind(task_id.to_string())
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(CoordinatorError::storage)?;
+        let mut transaction = self.pool.begin().await.map_err(CoordinatorError::storage)?;
+        let task = sqlx::query("SELECT submission_json, state FROM tasks WHERE id = ?")
+            .bind(task_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?
+            .ok_or_else(|| CoordinatorError::new(ErrorCategory::NotFound, "Task does not exist"))?;
         let submission: TaskSubmissionV1 =
-            serde_json::from_str(&submission_json.ok_or_else(|| {
-                CoordinatorError::new(ErrorCategory::NotFound, "Task does not exist")
-            })?)
-            .map_err(CoordinatorError::storage)?;
+            serde_json::from_str(task.get("submission_json")).map_err(CoordinatorError::storage)?;
         let hold_task_id = if submission.repository.access == RepositoryAccess::Mutating {
             task_id
         } else {
@@ -2629,7 +3035,14 @@ impl Coordinator {
             .bind(hold_task_id.to_string())
             .bind(reason)
             .bind(timestamp())
-            .execute(&self.pool)
+            .execute(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        if task.get::<&str, _>("state") == TaskState::Reviewing.as_str() {
+            revoke_unbound_result_dependencies(&mut transaction, task_id, &timestamp()).await?;
+        }
+        transaction
+            .commit()
             .await
             .map_err(CoordinatorError::storage)?;
         Ok(())
@@ -2685,6 +3098,7 @@ impl Coordinator {
             &now,
         )
         .await?;
+        cascade_failed_dependencies(&mut transaction, task_id, &now).await?;
         let submission: TaskSubmissionV1 =
             serde_json::from_str(row.get("submission_json")).map_err(CoordinatorError::storage)?;
         if submission.repository.access == RepositoryAccess::Mutating {
@@ -2824,6 +3238,14 @@ impl Coordinator {
             &now,
         )
         .await?;
+        satisfy_downstream_dependencies(
+            &mut transaction,
+            task_id,
+            DependencyCondition::Approved,
+            result_revision,
+            &now,
+        )
+        .await?;
         sqlx::query(
             "UPDATE worktree_leases SET released_at = ? WHERE task_id = ? AND released_at IS NULL",
         )
@@ -2870,6 +3292,7 @@ impl Coordinator {
         let now = timestamp();
         transition_exact(&mut transaction, task_id, current, next, false, &now).await?;
         if next == TaskState::Cancelled {
+            cascade_failed_dependencies(&mut transaction, task_id, &now).await?;
             sqlx::query("UPDATE worktree_leases SET released_at = ? WHERE task_id = ? AND released_at IS NULL")
                 .bind(&now)
                 .bind(task_id.to_string())
@@ -2948,6 +3371,7 @@ impl Coordinator {
             &now,
         )
         .await?;
+        cascade_failed_dependencies(&mut transaction, task_id, &now).await?;
         let submission: TaskSubmissionV1 =
             serde_json::from_str(task.get("submission_json")).map_err(CoordinatorError::storage)?;
         if submission.repository.access == RepositoryAccess::Mutating {
@@ -3138,6 +3562,9 @@ impl Coordinator {
             &now,
         )
         .await?;
+        if next == TaskState::Cancelled {
+            cascade_failed_dependencies(&mut transaction, task_id, &now).await?;
+        }
         sqlx::query("UPDATE worktree_holds SET cleared_at = ?, observation_id = ?, audit_note = ? WHERE task_id = ? AND cleared_at IS NULL")
             .bind(&now)
             .bind(observation_id)
@@ -3239,6 +3666,21 @@ impl Coordinator {
                 .execute(&mut *transaction)
                 .await
                 .map_err(CoordinatorError::storage)?;
+        } else {
+            let revision: i64 =
+                sqlx::query_scalar("SELECT result_revision FROM tasks WHERE id = ?")
+                    .bind(task_id.to_string())
+                    .fetch_one(&mut *transaction)
+                    .await
+                    .map_err(CoordinatorError::storage)?;
+            satisfy_downstream_dependencies(
+                &mut transaction,
+                task_id,
+                DependencyCondition::ResultReady,
+                u32::try_from(revision).map_err(CoordinatorError::storage)?,
+                &now,
+            )
+            .await?;
         }
         transaction
             .commit()
@@ -3561,6 +4003,7 @@ impl Coordinator {
                         &now,
                     )
                     .await?;
+                    cascade_failed_dependencies(&mut transaction, task_id, &now).await?;
                 }
             }
             if submission.repository.access == RepositoryAccess::Mutating {
@@ -4109,6 +4552,12 @@ impl UuidIdentity for HarnessSessionId {
     }
 }
 
+impl UuidIdentity for crate::contract::AttachmentId {
+    fn from_uuid(uuid: Uuid) -> Self {
+        Self(uuid)
+    }
+}
+
 fn parse_uuid_id<T: UuidIdentity>(value: &str) -> Result<T, CoordinatorError> {
     Uuid::parse_str(value)
         .map(T::from_uuid)
@@ -4123,6 +4572,353 @@ fn task_view_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<TaskView, Coordin
         state: TaskState::from_str(row.get("state"))?,
         result_revision: u32::try_from(revision).map_err(CoordinatorError::storage)?,
     })
+}
+
+fn task_dependency_view_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<TaskDependencyView, CoordinatorError> {
+    let condition = match row.get::<&str, _>("condition") {
+        "result_ready" => DependencyCondition::ResultReady,
+        "approved" => DependencyCondition::Approved,
+        value => {
+            return Err(CoordinatorError::new(
+                ErrorCategory::StorageFailure,
+                format!("unknown dependency condition `{value}`"),
+            ));
+        }
+    };
+    let failure_policy = match row.get::<&str, _>("failure_policy") {
+        "cancel" => DependencyFailurePolicy::Cancel,
+        "keep_blocked" => DependencyFailurePolicy::KeepBlocked,
+        value => {
+            return Err(CoordinatorError::new(
+                ErrorCategory::StorageFailure,
+                format!("unknown dependency failure policy `{value}`"),
+            ));
+        }
+    };
+    let revision: Option<i64> = row.get("satisfied_by_result_revision");
+    Ok(TaskDependencyView {
+        task_id: parse_uuid_id(row.get("dependency_task_id"))?,
+        condition,
+        failure_policy,
+        satisfied_by_result_revision: revision
+            .map(u32::try_from)
+            .transpose()
+            .map_err(CoordinatorError::storage)?,
+    })
+}
+
+fn dependency_condition_as_str(condition: DependencyCondition) -> &'static str {
+    match condition {
+        DependencyCondition::ResultReady => "result_ready",
+        DependencyCondition::Approved => "approved",
+    }
+}
+
+fn dependency_failure_policy_as_str(policy: DependencyFailurePolicy) -> &'static str {
+    match policy {
+        DependencyFailurePolicy::Cancel => "cancel",
+        DependencyFailurePolicy::KeepBlocked => "keep_blocked",
+    }
+}
+
+async fn reevaluate_new_task_dependencies(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    task_id: TaskId,
+    now: &str,
+) -> Result<(), CoordinatorError> {
+    let edges = sqlx::query("SELECT d.dependency_task_id, d.condition, t.state, t.result_revision, t.approved_result_revision, t.submission_json FROM task_dependencies d JOIN tasks t ON t.id = d.dependency_task_id WHERE d.task_id = ?")
+        .bind(task_id.to_string())
+        .fetch_all(&mut **transaction)
+        .await
+        .map_err(CoordinatorError::storage)?;
+    for edge in edges {
+        let condition = edge.get::<&str, _>("condition");
+        let state = edge.get::<&str, _>("state");
+        let revision = if condition == "approved" && state == "approved" {
+            edge.get::<Option<i64>, _>("approved_result_revision")
+        } else if condition == "result_ready" && matches!(state, "reviewing" | "approved") {
+            let submission: TaskSubmissionV1 = serde_json::from_str(edge.get("submission_json"))
+                .map_err(CoordinatorError::storage)?;
+            let holds: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM worktree_holds WHERE repository_key = ? AND cleared_at IS NULL")
+                .bind(submission.repository.root.to_string_lossy().as_ref())
+                .fetch_one(&mut **transaction)
+                .await
+                .map_err(CoordinatorError::storage)?;
+            (holds == 0).then_some(edge.get::<i64, _>("result_revision"))
+        } else {
+            None
+        };
+        if let Some(revision) = revision {
+            let snapshot_exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM result_dependency_snapshots WHERE task_id = ? AND result_revision = ?")
+                .bind(edge.get::<&str, _>("dependency_task_id"))
+                .bind(revision)
+                .fetch_one(&mut **transaction)
+                .await
+                .map_err(CoordinatorError::storage)?;
+            if snapshot_exists == 0 {
+                continue;
+            }
+            sqlx::query("UPDATE task_dependencies SET satisfied_at = ?, satisfied_by_result_revision = ?, result_snapshot_attachment_id = (SELECT attachment_id FROM result_dependency_snapshots WHERE task_id = ? AND result_revision = ?) WHERE task_id = ? AND dependency_task_id = ?")
+                .bind(now)
+                .bind(revision)
+                .bind(edge.get::<&str, _>("dependency_task_id"))
+                .bind(revision)
+                .bind(task_id.to_string())
+                .bind(edge.get::<&str, _>("dependency_task_id"))
+                .execute(&mut **transaction)
+                .await
+                .map_err(CoordinatorError::storage)?;
+        }
+    }
+    let unmet: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM task_dependencies WHERE task_id = ? AND satisfied_at IS NULL",
+    )
+    .bind(task_id.to_string())
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(CoordinatorError::storage)?;
+    let failed_dependency: Option<(String, String)> = sqlx::query_as(
+        "SELECT d.dependency_task_id, d.failure_policy FROM task_dependencies d JOIN tasks upstream ON upstream.id = d.dependency_task_id WHERE d.task_id = ? AND upstream.state IN ('failed', 'cancelled') AND d.satisfied_at IS NULL LIMIT 1",
+    )
+    .bind(task_id.to_string())
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(CoordinatorError::storage)?;
+    if failed_dependency.is_some_and(|(_, policy)| policy == "cancel") {
+        let changed = sqlx::query("UPDATE tasks SET state = 'cancelled', scheduling_state = 'blocked', updated_at = ? WHERE id = ? AND state = 'queued'")
+            .bind(now)
+            .bind(task_id.to_string())
+            .execute(&mut **transaction)
+            .await
+            .map_err(CoordinatorError::storage)?
+            .rows_affected();
+        if changed == 1 {
+            sqlx::query("INSERT INTO task_transitions (task_id, from_state, to_state, evidence_json, created_at) VALUES (?, 'queued', 'cancelled', '{\"reason\":\"dependency_already_failed\"}', ?)")
+                .bind(task_id.to_string())
+                .bind(now)
+                .execute(&mut **transaction)
+                .await
+                .map_err(CoordinatorError::storage)?;
+        }
+        return Ok(());
+    }
+    if unmet == 0 {
+        let changed = sqlx::query("UPDATE tasks SET scheduling_state = 'ready', updated_at = ? WHERE id = ? AND scheduling_state = 'blocked'")
+            .bind(now)
+            .bind(task_id.to_string())
+            .execute(&mut **transaction)
+            .await
+            .map_err(CoordinatorError::storage)?
+            .rows_affected();
+        if changed == 1 {
+            sqlx::query("INSERT INTO task_scheduling_transitions (task_id, from_state, to_state, evidence_json, created_at) VALUES (?, 'blocked', 'ready', '{\"reason\":\"already_satisfied\"}', ?)")
+                .bind(task_id.to_string())
+                .bind(now)
+                .execute(&mut **transaction)
+                .await
+                .map_err(CoordinatorError::storage)?;
+        }
+    }
+    Ok(())
+}
+
+async fn satisfy_downstream_dependencies(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    upstream_task_id: TaskId,
+    condition: DependencyCondition,
+    revision: u32,
+    now: &str,
+) -> Result<(), CoordinatorError> {
+    sqlx::query("UPDATE task_dependencies SET satisfied_at = ?, satisfied_by_result_revision = ?, result_snapshot_attachment_id = (SELECT attachment_id FROM result_dependency_snapshots WHERE task_id = ? AND result_revision = ?) WHERE dependency_task_id = ? AND condition = ? AND satisfied_at IS NULL AND EXISTS (SELECT 1 FROM result_dependency_snapshots WHERE task_id = ? AND result_revision = ?)")
+        .bind(now)
+        .bind(i64::from(revision))
+        .bind(upstream_task_id.to_string())
+        .bind(i64::from(revision))
+        .bind(upstream_task_id.to_string())
+        .bind(dependency_condition_as_str(condition))
+        .bind(upstream_task_id.to_string())
+        .bind(i64::from(revision))
+        .execute(&mut **transaction)
+        .await
+        .map_err(CoordinatorError::storage)?;
+    let dependent_ids = sqlx::query_scalar::<_, String>("SELECT DISTINCT task_id FROM task_dependencies WHERE dependency_task_id = ? AND condition = ?")
+        .bind(upstream_task_id.to_string())
+        .bind(dependency_condition_as_str(condition))
+        .fetch_all(&mut **transaction)
+        .await
+        .map_err(CoordinatorError::storage)?;
+    for dependent_id in dependent_ids {
+        let unmet: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM task_dependencies WHERE task_id = ? AND satisfied_at IS NULL",
+        )
+        .bind(&dependent_id)
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(CoordinatorError::storage)?;
+        if unmet == 0 {
+            let changed = sqlx::query("UPDATE tasks SET scheduling_state = 'ready', updated_at = ? WHERE id = ? AND scheduling_state = 'blocked' AND state = 'queued'")
+                .bind(now)
+                .bind(&dependent_id)
+                .execute(&mut **transaction)
+                .await
+                .map_err(CoordinatorError::storage)?
+                .rows_affected();
+            if changed == 1 {
+                sqlx::query("INSERT INTO task_scheduling_transitions (task_id, from_state, to_state, evidence_json, created_at) VALUES (?, 'blocked', 'ready', '{}', ?)")
+                    .bind(&dependent_id)
+                    .bind(now)
+                    .execute(&mut **transaction)
+                    .await
+                    .map_err(CoordinatorError::storage)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn revoke_unbound_result_dependencies(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    upstream_task_id: TaskId,
+    now: &str,
+) -> Result<(), CoordinatorError> {
+    let dependent_ids = sqlx::query_scalar::<_, String>("SELECT task_id FROM task_dependencies WHERE dependency_task_id = ? AND condition = 'result_ready' AND satisfied_at IS NOT NULL AND bound_at IS NULL")
+        .bind(upstream_task_id.to_string())
+        .fetch_all(&mut **transaction)
+        .await
+        .map_err(CoordinatorError::storage)?;
+    sqlx::query("UPDATE task_dependencies SET satisfied_at = NULL, satisfied_by_result_revision = NULL, result_snapshot_attachment_id = NULL WHERE dependency_task_id = ? AND condition = 'result_ready' AND bound_at IS NULL")
+        .bind(upstream_task_id.to_string())
+        .execute(&mut **transaction)
+        .await
+        .map_err(CoordinatorError::storage)?;
+    for dependent_id in dependent_ids {
+        let changed = sqlx::query("UPDATE tasks SET scheduling_state = 'blocked', updated_at = ? WHERE id = ? AND scheduling_state = 'ready' AND state = 'queued'")
+            .bind(now)
+            .bind(&dependent_id)
+            .execute(&mut **transaction)
+            .await
+            .map_err(CoordinatorError::storage)?
+            .rows_affected();
+        if changed == 1 {
+            sqlx::query("INSERT INTO task_scheduling_transitions (task_id, from_state, to_state, evidence_json, created_at) VALUES (?, 'ready', 'blocked', '{\"reason\":\"upstream_correction\"}', ?)")
+                .bind(&dependent_id)
+                .bind(now)
+                .execute(&mut **transaction)
+                .await
+                .map_err(CoordinatorError::storage)?;
+        }
+    }
+    Ok(())
+}
+
+async fn cascade_failed_dependencies(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    failed_task_id: TaskId,
+    now: &str,
+) -> Result<(), CoordinatorError> {
+    let mut failed = VecDeque::from([failed_task_id.to_string()]);
+    while let Some(upstream_id) = failed.pop_front() {
+        let edges = sqlx::query("SELECT task_id, failure_policy FROM task_dependencies WHERE dependency_task_id = ? AND bound_at IS NULL")
+            .bind(&upstream_id)
+            .fetch_all(&mut **transaction)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        for edge in edges {
+            let dependent_id = edge.get::<String, _>("task_id");
+            sqlx::query("UPDATE task_dependencies SET satisfied_at = NULL, satisfied_by_result_revision = NULL, result_snapshot_attachment_id = NULL WHERE task_id = ? AND dependency_task_id = ? AND bound_at IS NULL")
+                .bind(&dependent_id)
+                .bind(&upstream_id)
+                .execute(&mut **transaction)
+                .await
+                .map_err(CoordinatorError::storage)?;
+            if edge.get::<&str, _>("failure_policy") == "cancel" {
+                let changed = sqlx::query("UPDATE tasks SET state = 'cancelled', scheduling_state = 'blocked', updated_at = ? WHERE id = ? AND state = 'queued'")
+                    .bind(now)
+                    .bind(&dependent_id)
+                    .execute(&mut **transaction)
+                    .await
+                    .map_err(CoordinatorError::storage)?
+                    .rows_affected();
+                if changed == 1 {
+                    sqlx::query("INSERT INTO task_transitions (task_id, from_state, to_state, evidence_json, created_at) VALUES (?, 'queued', 'cancelled', '{\"reason\":\"dependency_failed\"}', ?)")
+                        .bind(&dependent_id)
+                        .bind(now)
+                        .execute(&mut **transaction)
+                        .await
+                        .map_err(CoordinatorError::storage)?;
+                    failed.push_back(dependent_id);
+                }
+            } else {
+                let changed = sqlx::query("UPDATE tasks SET scheduling_state = 'blocked', updated_at = ? WHERE id = ? AND state = 'queued' AND scheduling_state = 'ready'")
+                    .bind(now)
+                    .bind(&dependent_id)
+                    .execute(&mut **transaction)
+                    .await
+                    .map_err(CoordinatorError::storage)?
+                    .rows_affected();
+                if changed == 1 {
+                    sqlx::query("INSERT INTO task_scheduling_transitions (task_id, from_state, to_state, evidence_json, created_at) VALUES (?, 'ready', 'blocked', '{\"reason\":\"dependency_failed\"}', ?)")
+                        .bind(&dependent_id)
+                        .bind(now)
+                        .execute(&mut **transaction)
+                        .await
+                        .map_err(CoordinatorError::storage)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn validate_acyclic_task_graph(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<(), CoordinatorError> {
+    let nodes = sqlx::query_scalar::<_, String>("SELECT id FROM tasks")
+        .fetch_all(&mut **transaction)
+        .await
+        .map_err(CoordinatorError::storage)?;
+    let edges = sqlx::query("SELECT task_id, dependency_task_id FROM task_dependencies")
+        .fetch_all(&mut **transaction)
+        .await
+        .map_err(CoordinatorError::storage)?;
+    let mut incoming = nodes
+        .iter()
+        .map(|node| (node.clone(), 0_usize))
+        .collect::<BTreeMap<_, _>>();
+    let mut downstream = BTreeMap::<String, Vec<String>>::new();
+    for edge in edges {
+        let task_id = edge.get::<String, _>("task_id");
+        let dependency_id = edge.get::<String, _>("dependency_task_id");
+        *incoming.entry(task_id.clone()).or_default() += 1;
+        downstream.entry(dependency_id).or_default().push(task_id);
+    }
+    let mut ready = incoming
+        .iter()
+        .filter_map(|(node, count)| (*count == 0).then_some(node.clone()))
+        .collect::<VecDeque<_>>();
+    let mut visited = 0_usize;
+    while let Some(node) = ready.pop_front() {
+        visited += 1;
+        for dependent in downstream.get(&node).into_iter().flatten() {
+            let count = incoming.get_mut(dependent).ok_or_else(|| {
+                CoordinatorError::new(ErrorCategory::StorageFailure, "dependency graph is corrupt")
+            })?;
+            *count -= 1;
+            if *count == 0 {
+                ready.push_back(dependent.clone());
+            }
+        }
+    }
+    if visited == incoming.len() {
+        Ok(())
+    } else {
+        Err(CoordinatorError::new(
+            ErrorCategory::InvalidInput,
+            "Task dependencies contain a cycle",
+        ))
+    }
 }
 
 fn message_kind_name(kind: MessageKind) -> &'static str {

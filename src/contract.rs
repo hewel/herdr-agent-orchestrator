@@ -375,6 +375,40 @@ impl Validate for TaskRepositoryAuthorityV1 {
     }
 }
 
+/// Required upstream checkpoint for one scheduling edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DependencyCondition {
+    /// The dependency has a valid Result and its native turn entered Reviewing.
+    ResultReady,
+    /// The Supervisor approved the dependency's Result.
+    Approved,
+}
+
+/// Behavior when one required dependency fails or is cancelled.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DependencyFailurePolicy {
+    /// Cancel the undispatched dependent Task.
+    #[default]
+    Cancel,
+    /// Retain the dependent Task as Blocked for Supervisor reconciliation.
+    KeepBlocked,
+}
+
+/// One immutable scheduling edge from a Task to an upstream Task.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskDependencyV1 {
+    /// Existing upstream Task.
+    pub task_id: TaskId,
+    /// State required before the dependent may run.
+    pub condition: DependencyCondition,
+    /// Failure behavior for this edge.
+    #[serde(default)]
+    pub failure_policy: DependencyFailurePolicy,
+}
+
 /// Public bounded Task request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -387,6 +421,9 @@ pub struct TaskSubmissionV1 {
     pub worker_id: HarnessId,
     /// Optional related Task context.
     pub related_task_id: Option<TaskId>,
+    /// Immutable scheduling dependencies, distinct from informational relation.
+    #[serde(default)]
+    pub depends_on: Vec<TaskDependencyV1>,
     /// Short Task title.
     pub title: String,
     /// Full bounded instructions.
@@ -404,6 +441,15 @@ impl Validate for TaskSubmissionV1 {
         validate_text("title", &self.title, 160, usize::MAX)?;
         validate_text("instructions", &self.instructions, 16_384, 65_536)?;
         validate_unique_limit("attachments", &self.attachments, 32)?;
+        validate_unique_limit("depends_on", &self.depends_on, 32)?;
+        let unique_dependencies = self
+            .depends_on
+            .iter()
+            .map(|dependency| dependency.task_id)
+            .collect::<std::collections::HashSet<_>>();
+        if unique_dependencies.len() != self.depends_on.len() {
+            return field_error("depends_on", "contains repeated upstream Tasks");
+        }
         self.repository.validate()
     }
 }
