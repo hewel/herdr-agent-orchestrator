@@ -496,7 +496,7 @@ impl Coordinator {
     ///
     /// # Errors
     ///
-    /// Returns [`CoordinatorError`] when directories, SQLite, or migrations fail.
+    /// Returns [`CoordinatorError`] when directories, `SQLite`, or migrations fail.
     pub async fn open(state_dir: impl AsRef<Path>) -> Result<Self, CoordinatorError> {
         let state_dir = state_dir.as_ref().to_path_buf();
         tokio::fs::create_dir_all(&state_dir)
@@ -527,6 +527,10 @@ impl Coordinator {
     /// # Errors
     ///
     /// Returns a stable [`CoordinatorError`] for validation, authorization, conflict, or storage failure.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one exhaustive command authorization boundary"
+    )]
     pub async fn execute(
         &self,
         actor: ActorContext,
@@ -725,7 +729,7 @@ impl Coordinator {
         }
     }
 
-    /// Executes one authenticated query without exposing SQLite internals.
+    /// Executes one authenticated query without exposing `SQLite` internals.
     ///
     /// # Errors
     ///
@@ -1094,6 +1098,10 @@ impl Coordinator {
         })
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "atomic durable Worker registration transaction"
+    )]
     async fn start_worker(
         &self,
         definition: HarnessDefinitionV1,
@@ -1202,6 +1210,10 @@ impl Coordinator {
         })
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "atomic Task, lease, and root Message transaction"
+    )]
     async fn create_task(
         &self,
         actor: &AuthenticatedActor,
@@ -1392,6 +1404,10 @@ impl Coordinator {
         })
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "route authorization and persistence are one transaction"
+    )]
     async fn send_message(
         &self,
         actor: &AuthenticatedActor,
@@ -1585,7 +1601,7 @@ impl Coordinator {
                         false,
                         &now,
                     )
-                    .await?
+                    .await?;
                 }
                 "reply" => {
                     transition_exact(
@@ -1596,7 +1612,7 @@ impl Coordinator {
                         false,
                         &now,
                     )
-                    .await?
+                    .await?;
                 }
                 "correction" => {
                     transition_exact(
@@ -1607,7 +1623,7 @@ impl Coordinator {
                         true,
                         &now,
                     )
-                    .await?
+                    .await?;
                 }
                 _ => {}
             }
@@ -1776,6 +1792,10 @@ impl Coordinator {
         })
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Approval preconditions and release are one transaction"
+    )]
     async fn approve_task(
         &self,
         task_id: TaskId,
@@ -2450,6 +2470,10 @@ impl Coordinator {
         })
     }
 
+    #[expect(
+        clippy::unused_self,
+        reason = "kept on the deep Coordinator authorization boundary"
+    )]
     fn require_supervisor(&self, actor: &AuthenticatedActor) -> Result<(), CoordinatorError> {
         if actor.tier == HarnessTier::Supervisor {
             Ok(())

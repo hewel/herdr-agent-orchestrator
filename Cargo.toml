@@ -37,7 +37,7 @@ uuid = { version = "1.18", features = ["serde", "v7"] }
 tempfile = "3.23"
 
 [lints.rust]
-future_incompatible = "warn"
+future_incompatible = { level = "warn", priority = -1 }
 nonstandard_style = "deny"
 unsafe_code = "deny"
 

@@ -1,6 +1,6 @@
 //! Pane-resident Worker Host and terminal popup entrypoint behavior.
 
-use std::{collections::BTreeMap, path::Path, time::Duration};
+use std::{collections::BTreeMap, fmt::Write as _, path::Path, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt;
@@ -33,6 +33,10 @@ const PRE_WRITE_RETRIES: usize = 3;
 ///
 /// Returns an error when Session bootstrap, profile validation, broker delivery, or the
 /// provider lifecycle fails.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the Host loop owns one provider lifecycle and event stream"
+)]
 pub async fn run_worker_host(socket: &Path, state_dir: &Path, bearer: String) -> Result<()> {
     let capability = SessionCapability::from_bearer(bearer)?;
     let session = broker_query(socket, capability.clone(), CoordinatorQuery::SessionSelf).await?;
@@ -200,6 +204,10 @@ pub async fn run_worker_host(socket: &Path, state_dir: &Path, bearer: String) ->
 /// Renders one durable text snapshot for the Herdr popup entrypoint.
 ///
 /// Mutating popup actions use the same broker command frames through the `call` CLI.
+///
+/// # Errors
+///
+/// Returns an error when authentication, broker queries, or response decoding fails.
 pub async fn render_popup(socket: &Path, bearer: String) -> Result<String> {
     let capability = SessionCapability::from_bearer(bearer)?;
     let status = broker_query(socket, capability.clone(), CoordinatorQuery::HarnessStatus).await?;
@@ -216,8 +224,9 @@ pub async fn render_popup(socket: &Path, bearer: String) -> Result<String> {
     };
     let mut output = String::from("Harness Network\n\n");
     for harness in status {
-        output.push_str(&format!(
-            "{} {} · {:?} · {} · inbox {}\n",
+        let _ = writeln!(
+            output,
+            "{} {} · {:?} · {} · inbox {}",
             if harness.presence == "online" {
                 "●"
             } else {
@@ -227,22 +236,24 @@ pub async fn render_popup(socket: &Path, bearer: String) -> Result<String> {
             harness.tier,
             harness.activity,
             harness.unread_messages
-        ));
+        );
     }
     output.push_str("\nTasks\n");
     for task in tasks {
-        output.push_str(&format!(
-            "{} · {} · {:?} · revision {}\n",
+        let _ = writeln!(
+            output,
+            "{} · {} · {:?} · revision {}",
             task.id, task.worker_id, task.state, task.result_revision
-        ));
+        );
     }
     if !holds.is_empty() {
         output.push_str("\nWorktree Holds\n");
         for hold in holds {
-            output.push_str(&format!(
-                "{} · {} · {}\n",
+            let _ = writeln!(
+                output,
+                "{} · {} · {}",
                 hold.task_id, hold.repository_key, hold.reason
-            ));
+            );
         }
     }
     Ok(output)

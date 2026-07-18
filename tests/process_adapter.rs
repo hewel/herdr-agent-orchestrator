@@ -50,7 +50,7 @@ async fn omp_process_adapter_separates_acceptance_from_agent_end() {
     let provider = executable(
         temp.path(),
         "fake-omp",
-        r##"#!/bin/sh
+        r#"#!/bin/sh
 if [ "$1" = "--version" ]; then echo 'omp/17.0.2'; exit 0; fi
 echo '{"type":"ready"}'
 while IFS= read -r line; do
@@ -67,7 +67,7 @@ while IFS= read -r line; do
       ;;
   esac
 done
-"##,
+"#,
     );
     let mut adapter = OmpProcessAdapter::new().with_timeouts(
         Duration::from_secs(2),
@@ -110,7 +110,7 @@ async fn codex_process_adapter_initializes_thread_and_observes_completion() {
     let provider = executable(
         temp.path(),
         "fake-codex",
-        r##"#!/bin/sh
+        r#"#!/bin/sh
 if [ "$1" = "--version" ]; then echo 'codex-cli 0.144.5'; exit 0; fi
 while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
@@ -125,7 +125,7 @@ while IFS= read -r line; do
       ;;
   esac
 done
-"##,
+"#,
     );
     let mut adapter = CodexProcessAdapter::new().with_timeouts(
         Duration::from_secs(2),

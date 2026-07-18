@@ -1,6 +1,10 @@
 //! Versioned public values shared by every Coordinator transport.
 
-use std::{fmt, path::PathBuf, str::FromStr};
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+    str::FromStr,
+};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -98,7 +102,7 @@ macro_rules! uuid_id {
         pub struct $name(pub Uuid);
 
         impl $name {
-            /// Generates a time-ordered UUIDv7 identity.
+            /// Generates a time-ordered `UUIDv7` identity.
             #[must_use]
             pub fn new() -> Self {
                 Self(Uuid::now_v7())
@@ -709,7 +713,7 @@ fn validate_request_key(value: Option<&str>) -> Result<(), ValidationError> {
     value.map_or(Ok(()), |key| validate_text("request_key", key, 128, 512))
 }
 
-fn validate_absolute_path(field: &'static str, path: &PathBuf) -> Result<(), ValidationError> {
+fn validate_absolute_path(field: &'static str, path: &Path) -> Result<(), ValidationError> {
     let Some(text) = path.to_str() else {
         return field_error(field, "must be UTF-8");
     };
@@ -719,7 +723,7 @@ fn validate_absolute_path(field: &'static str, path: &PathBuf) -> Result<(), Val
     Ok(())
 }
 
-fn validate_relative_path(field: &'static str, path: &PathBuf) -> Result<(), ValidationError> {
+fn validate_relative_path(field: &'static str, path: &Path) -> Result<(), ValidationError> {
     let Some(text) = path.to_str() else {
         return field_error(field, "must be UTF-8");
     };

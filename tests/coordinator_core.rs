@@ -39,9 +39,8 @@ async fn supervisor_registration_makes_the_harness_queryable() {
         )
         .await
         .expect("registration must succeed");
-    let capability = match outcome {
-        CommandOutcome::SupervisorRegistered { capability, .. } => capability,
-        _ => panic!("registration returned the wrong outcome"),
+    let CommandOutcome::SupervisorRegistered { capability, .. } = outcome else {
+        panic!("registration returned the wrong outcome")
     };
 
     let result = coordinator
@@ -51,9 +50,8 @@ async fn supervisor_registration_makes_the_harness_queryable() {
         )
         .await
         .expect("authenticated query must succeed");
-    let harnesses = match result {
-        QueryResult::Harnesses(harnesses) => harnesses,
-        _ => panic!("list query returned the wrong result"),
+    let QueryResult::Harnesses(harnesses) = result else {
+        panic!("list query returned the wrong result")
     };
 
     assert_eq!(
@@ -63,6 +61,7 @@ async fn supervisor_registration_makes_the_harness_queryable() {
 }
 
 #[tokio::test]
+#[expect(clippy::too_many_lines, reason = "single end-to-end lifecycle proof")]
 async fn question_reply_result_and_correction_follow_the_v1_lifecycle() {
     let (state, coordinator, supervisor, worker, task_id) = seeded_task().await;
     let evidence_path = state.path().join("verification.txt");
@@ -837,10 +836,10 @@ async fn assert_task_state(
 
 fn worker_profile(model: Option<&str>) -> (String, String) {
     let executable = std::env::current_exe().expect("test executable path");
+    let executable = executable.display();
     let model = model.map_or_else(String::new, |model| format!("model = {model:?}\n"));
     let snapshot = format!(
-        "schema_version = 1\nid = \"omp-worker\"\nkind = \"omp\"\nexecutable = {:?}\nprovider_profile = \"test-worker\"\n{model}",
-        executable
+        "schema_version = 1\nid = \"omp-worker\"\nkind = \"omp\"\nexecutable = \"{executable}\"\nprovider_profile = \"test-worker\"\n{model}"
     );
     let digest = hex::encode(Sha256::digest(snapshot.as_bytes()));
     (snapshot, digest)

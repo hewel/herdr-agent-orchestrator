@@ -17,7 +17,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Own SQLite state and the local JSONL Unix socket.
+    /// Own `SQLite` state and the local JSONL Unix socket.
     Daemon {
         /// Durable state directory.
         #[arg(long, env = "HERDR_PLUGIN_STATE_DIR")]
@@ -26,13 +26,13 @@ enum Command {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
-    /// Send one BrokerRequest JSON value from stdin and print one response.
+    /// Send one `BrokerRequest` JSON value from stdin and print one response.
     Call {
         /// Broker Unix socket.
         #[arg(long, env = "HERDR_COORDINATOR_SOCKET")]
         socket: PathBuf,
     },
-    /// Proxy newline-delimited BrokerRequest values between stdio and the broker.
+    /// Proxy newline-delimited `BrokerRequest` values between stdio and the broker.
     StdioProxy {
         /// Broker Unix socket.
         #[arg(long, env = "HERDR_COORDINATOR_SOCKET")]

@@ -79,9 +79,7 @@ impl McpServer {
             .get("method")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        if id.is_none() {
-            return None;
-        }
+        id.as_ref()?;
         let id = id.unwrap_or(Value::Null);
         let result = match method {
             "initialize" => Ok(json!({
@@ -197,6 +195,10 @@ impl McpServer {
     }
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the bridge preserves typed Core commands until broker serialization"
+)]
 enum ToolOperation {
     Execute(CoordinatorCommand),
     Query(CoordinatorQuery),
@@ -316,10 +318,18 @@ fn tools() -> Vec<Value> {
     ]
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "the schema Value is moved directly into the JSON result"
+)]
 fn tool(name: &str, description: &str, input_schema: Value) -> Value {
     json!({"name":name,"description":description,"inputSchema":input_schema})
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "the correlation Value is moved directly into the JSON result"
+)]
 fn protocol_error(id: Value, code: i32, message: &str) -> Value {
     json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}})
 }
@@ -335,6 +345,10 @@ async fn write_json(output: &mut tokio::io::Stdout, value: &Value) -> Result<()>
 }
 
 /// Convenience constructor used by the CLI.
+///
+/// # Errors
+///
+/// Returns an error when the Session bearer does not match the v1 capability shape.
 pub fn from_bearer(socket: &Path, bearer: String) -> Result<McpServer> {
     Ok(McpServer::new(
         socket.to_path_buf(),

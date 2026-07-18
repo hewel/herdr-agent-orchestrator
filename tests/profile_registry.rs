@@ -9,9 +9,9 @@ use herdr_harness_coordinator::{
 fn registry_resolves_only_the_explicit_profile_and_filters_environment() {
     let directory = tempfile::tempdir().expect("profile directory");
     let executable = std::env::current_exe().expect("test executable path");
+    let executable = executable.display();
     let source = format!(
-        "schema_version = 1\nid = \"omp-main\"\nkind = \"omp\"\nexecutable = {:?}\nprovider_profile = \"coordinator-worker\"\ninherit_env = [\"PATH\", \"API_TOKEN\"]\n",
-        executable
+        "schema_version = 1\nid = \"omp-main\"\nkind = \"omp\"\nexecutable = \"{executable}\"\nprovider_profile = \"coordinator-worker\"\ninherit_env = [\"PATH\", \"API_TOKEN\"]\n"
     );
     fs::write(directory.path().join("omp.toml"), &source).expect("profile fixture");
 
@@ -40,11 +40,11 @@ fn registry_resolves_only_the_explicit_profile_and_filters_environment() {
 fn registry_rejects_kind_mismatch_instead_of_routing_automatically() {
     let directory = tempfile::tempdir().expect("profile directory");
     let executable = std::env::current_exe().expect("test executable path");
+    let executable = executable.display();
     fs::write(
         directory.path().join("omp.toml"),
         format!(
-            "schema_version = 1\nid = \"omp-main\"\nkind = \"omp\"\nexecutable = {:?}\nprovider_profile = \"coordinator-worker\"\n",
-            executable
+            "schema_version = 1\nid = \"omp-main\"\nkind = \"omp\"\nexecutable = \"{executable}\"\nprovider_profile = \"coordinator-worker\"\n"
         ),
     )
     .expect("profile fixture");
