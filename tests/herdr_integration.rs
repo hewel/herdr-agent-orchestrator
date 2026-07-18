@@ -188,7 +188,10 @@ fn workspace_action_opens_the_setup_popup_in_the_invoking_workspace() {
         std::process::Command::new(root.join("plugin/herdr-harness-coordinator/scripts/workspace"))
             .env("HERDR_BIN", "/bin/echo")
             .env("HERDR_WORKSPACE_ID", "wF")
-            .env("HERDR_PANE_ID", "wF:p7")
+            .env(
+                "HERDR_PLUGIN_CONTEXT_JSON",
+                r#"{"workspace_id":"wF","focused_pane_id":"wF:p7"}"#,
+            )
             .output()
             .unwrap();
 
