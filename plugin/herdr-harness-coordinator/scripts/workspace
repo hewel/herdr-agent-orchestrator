@@ -2,14 +2,9 @@
 set -eu
 
 : "${HERDR_WORKSPACE_ID:?Herdr workspace action context is required}"
-: "${HERDR_PLUGIN_CONTEXT_JSON:?Herdr plugin action context is required}"
 HERDR_BIN="${HERDR_BIN:-herdr}"
-target_pane=$(printf '%s\n' "$HERDR_PLUGIN_CONTEXT_JSON" | sed -n 's/.*"focused_pane_id":"\([A-Za-z0-9:_-]*\)".*/\1/p')
-[ -n "$target_pane" ] || { echo "Herdr action context omitted focused_pane_id" >&2; exit 1; }
 
 exec "$HERDR_BIN" plugin pane open \
   --plugin herdr-harness-coordinator \
   --entrypoint harness-network \
-  --workspace "$HERDR_WORKSPACE_ID" \
-  --target-pane "$target_pane" \
   --focus
