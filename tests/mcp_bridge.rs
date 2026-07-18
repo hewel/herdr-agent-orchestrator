@@ -34,9 +34,8 @@ async fn mcp_initialization_and_tool_discovery_match_the_pinned_revision() {
         .handle(json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}))
         .await
         .expect("request response");
-    let names = listed["result"]["tools"]
-        .as_array()
-        .expect("tools")
+    let tools = listed["result"]["tools"].as_array().expect("tools");
+    let names = tools
         .iter()
         .map(|tool| tool["name"].as_str().expect("tool name"))
         .collect::<Vec<_>>();
@@ -49,6 +48,20 @@ async fn mcp_initialization_and_tool_discovery_match_the_pinned_revision() {
     assert!(names.contains(&"harness_supervisor_event_ack"));
     assert!(names.contains(&"harness_supervisor_event_reconcile"));
     assert!(names.contains(&"harness_task_graph_watch"));
+    let task_create = tools
+        .iter()
+        .find(|tool| tool["name"] == "harness_task_create")
+        .expect("Task creation tool");
+    let required = task_create["inputSchema"]["required"]
+        .as_array()
+        .expect("typed Task schema");
+    assert!(required.iter().any(|field| field == "attachments"));
+    assert!(required.iter().any(|field| field == "repository"));
+    let complete = tools
+        .iter()
+        .find(|tool| tool["name"] == "harness_complete")
+        .expect("completion tool");
+    assert_eq!(complete["inputSchema"]["required"][0], "manifest");
 }
 
 #[tokio::test]

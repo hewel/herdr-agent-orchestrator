@@ -666,6 +666,74 @@ fn tool_result(response: BrokerResponse) -> Result<Value> {
     }))
 }
 
+fn task_submission_schema() -> Value {
+    json!({
+        "type":"object",
+        "required":["schema_version","worker_id","task_role","session_reuse","title","instructions","attachments","repository"],
+        "properties":{
+            "schema_version":{"type":"integer","const":1},
+            "request_key":{"type":"string","minLength":1},
+            "worker_id":{"type":"string","minLength":1},
+            "related_task_id":{"type":"string","format":"uuid"},
+            "depends_on":{"type":"array","maxItems":32,"items":{"type":"object","required":["task_id","condition","failure_policy"],"properties":{"task_id":{"type":"string","format":"uuid"},"condition":{"type":"string","enum":["result_ready","approved"]},"failure_policy":{"type":"string","enum":["cancel","keep_blocked"]}},"additionalProperties":false}},
+            "task_role":{"type":"string","enum":["implementation","investigation","review","verification","other"]},
+            "session_reuse":{"type":"string","enum":["required","prefer","fresh","auto"]},
+            "preferred_session_id":{"type":"string","format":"uuid"},
+            "title":{"type":"string","minLength":1,"maxLength":160},
+            "instructions":{"type":"string","minLength":1,"maxLength":16384},
+            "attachments":{"type":"array","maxItems":32,"items":{"type":"string","format":"uuid"}},
+            "repository":{"type":"object","required":["root","access","write_scopes"],"properties":{"root":{"type":"string","minLength":1},"access":{"type":"string","enum":["read_only","mutating"]},"write_scopes":{"type":"array","items":{"type":"object","required":["kind","path"],"properties":{"kind":{"type":"string","enum":["exact_file","subtree"]},"path":{"type":"string","minLength":1}},"additionalProperties":false}}},"additionalProperties":false}
+        },
+        "additionalProperties":false
+    })
+}
+
+fn message_submission_schema() -> Value {
+    json!({
+        "type":"object",
+        "required":["schema_version","to","kind","text","attachments"],
+        "properties":{
+            "schema_version":{"type":"integer","const":1},
+            "request_key":{"type":"string","minLength":1},
+            "to":{"type":"string","minLength":1},
+            "task_id":{"type":"string","format":"uuid"},
+            "kind":{"type":"string","enum":["question","reply","correction","notification"]},
+            "text":{"type":"string","minLength":1,"maxLength":16384},
+            "attachments":{"type":"array","maxItems":32,"items":{"type":"string","format":"uuid"}},
+            "reply_to":{"type":"string","format":"uuid"},
+            "delivery":{"type":"string","enum":["follow_up","steer"],"default":"follow_up"},
+            "steer_reason":{"type":"string","minLength":1,"maxLength":1024}
+        },
+        "additionalProperties":false
+    })
+}
+
+fn complete_schema() -> Value {
+    json!({
+        "type":"object",
+        "required":["manifest"],
+        "properties":{
+            "native_turn_id":{"type":"string","minLength":1},
+            "manifest":{
+                "type":"object",
+                "required":["schema_version","task_id","summary","changed_files","verification","deviations","risks","attachments"],
+                "properties":{
+                    "schema_version":{"type":"integer","const":1},
+                    "task_id":{"type":"string","format":"uuid"},
+                    "summary":{"type":"string","minLength":1,"maxLength":16384},
+                    "changed_files":{"type":"array","items":{"type":"string","minLength":1}},
+                    "verification":{"type":"array","minItems":1,"items":{"type":"object","required":["command","exit_code","passed","evidence"],"properties":{"command":{"type":"string","minLength":1},"exit_code":{"type":"integer"},"passed":{"type":"boolean"},"evidence":{"type":"string","format":"uuid"}},"additionalProperties":false}},
+                    "deviations":{"type":"array","items":{"type":"string","minLength":1,"maxLength":4096}},
+                    "risks":{"type":"array","items":{"type":"string","minLength":1,"maxLength":4096}},
+                    "attachments":{"type":"array","maxItems":32,"items":{"type":"string","format":"uuid"}}
+                },
+                "additionalProperties":false
+            }
+        },
+        "additionalProperties":false
+    })
+}
+
 fn tools() -> Vec<Value> {
     let empty = json!({"type":"object","additionalProperties":false});
     let passthrough = json!({"type":"object","additionalProperties":true});
@@ -703,22 +771,22 @@ fn tools() -> Vec<Value> {
         tool(
             "harness_task_create",
             "Create a bounded Task for an explicit Worker.",
-            passthrough.clone(),
+            task_submission_schema(),
         ),
         tool(
             "harness_send",
             "Send a routed Reply, Correction, or Notification.",
-            passthrough.clone(),
+            message_submission_schema(),
         ),
         tool(
             "harness_request",
             "Send a blocking Worker Question to the Supervisor.",
-            passthrough.clone(),
+            message_submission_schema(),
         ),
         tool(
             "harness_complete",
             "Submit one Result candidate for the current native turn.",
-            passthrough.clone(),
+            complete_schema(),
         ),
         tool(
             "harness_attachment_create",
