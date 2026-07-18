@@ -102,7 +102,7 @@ After completion, the adapter calls `thread/read` with turns included and stores
 
 A blocking Question persists through the MCP bridge and moves the Task to `waiting`. The Supervisor Reply becomes a new turn in the same thread after the current turn settles. A Correction from `reviewing` also creates a new turn and Result revision.
 
-After Approval, another Task may use the same thread sequentially. The Task attachment and message remain the authoritative bounded assignment even though the native thread retains history.
+After Approval, another Task may use the same thread sequentially only when the Task's Session reuse policy and candidate checks admit it; the coordination contract's Session reuse rules are authoritative. The Task attachment and message remain the authoritative bounded assignment even though the native thread retains history.
 
 The Coordinator does not automatically resume or adopt a thread after Worker Host loss. A deliberate Worker restart creates a new Harness Session and thread under the same durable Harness identity.
 

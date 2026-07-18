@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "to": "supervisor",
+  "task_id": "019f7000-0000-7000-8000-000000000010",
+  "kind": "question",
+  "text": "Stop because the requested direction is unsafe.",
+  "attachments": [],
+  "delivery": "steer"
+}

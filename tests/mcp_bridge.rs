@@ -44,6 +44,10 @@ async fn mcp_initialization_and_tool_discovery_match_the_pinned_revision() {
     assert!(names.contains(&"harness_task_approve"));
     assert!(names.contains(&"harness_task_graph"));
     assert!(names.contains(&"harness_hold_clear"));
+    assert!(names.contains(&"harness_supervisor_events"));
+    assert!(names.contains(&"harness_supervisor_event_ack"));
+    assert!(names.contains(&"harness_supervisor_event_reconcile"));
+    assert!(names.contains(&"harness_task_graph_watch"));
 }
 
 #[tokio::test]

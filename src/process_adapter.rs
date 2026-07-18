@@ -27,7 +27,7 @@ use crate::{
         ResolvedDelivery, classify_codex_frame, classify_omp_frame, validate_codex_version_output,
         validate_omp_version_output,
     },
-    contract::HarnessKind,
+    contract::{HarnessKind, NativeSessionHealth},
     mcp::{self, McpServer},
 };
 
@@ -47,6 +47,11 @@ struct State {
     active_turn_id: Option<String>,
     queued_input_count: Option<u32>,
     model: Option<String>,
+    native_health: NativeSessionHealth,
+    context_tokens: Option<u64>,
+    context_window: Option<u64>,
+    context_percent: Option<f64>,
+    compaction_count: Option<u32>,
 }
 
 impl Default for State {
@@ -58,6 +63,11 @@ impl Default for State {
             active_turn_id: None,
             queued_input_count: None,
             model: None,
+            native_health: NativeSessionHealth::Healthy,
+            context_tokens: None,
+            context_window: None,
+            context_percent: None,
+            compaction_count: Some(0),
         }
     }
 }
@@ -175,6 +185,11 @@ impl ProcessAdapter {
             steerable: state.lifecycle == AdapterLifecycle::Working,
             queued_input_count: state.queued_input_count,
             model: state.model.clone(),
+            native_health: state.native_health,
+            context_tokens: state.context_tokens,
+            context_window: state.context_window,
+            context_percent: state.context_percent,
+            compaction_count: state.compaction_count,
         }
     }
 
@@ -246,6 +261,7 @@ impl HarnessAdapter for OmpProcessAdapter {
             active_turn_steering: true,
             active_turn_follow_up: true,
             cooperative_cancellation: true,
+            safe_compaction: true,
         }
     }
 
@@ -305,7 +321,7 @@ impl HarnessAdapter for OmpProcessAdapter {
         self.0
             .request(
                 HarnessKind::Omp,
-                json!({"type":"set_host_tools","tools":mcp::omp_host_tools()}),
+                json!({"type":"set_host_tools","tools":mcp::omp_host_tools(spec.tier)}),
                 id,
             )
             .await?;
@@ -402,8 +418,27 @@ impl HarnessAdapter for OmpProcessAdapter {
             state.session_id = field(&value, "sessionId");
             state.queued_input_count = number(&value, "queuedMessageCount");
             state.model = model(&value);
+            let usage = value.get("contextUsage").unwrap_or(&Value::Null);
+            state.context_tokens = unsigned(usage, "tokens");
+            state.context_window = unsigned(usage, "contextWindow");
+            state.context_percent = decimal(usage, "percent");
+            state.native_health = match state.context_percent {
+                Some(percent) if percent >= 70.0 => NativeSessionHealth::ContextPressure,
+                _ => NativeSessionHealth::Healthy,
+            };
         }
         Ok(self.0.snapshot().await)
+    }
+
+    async fn compact(&mut self) -> AdapterResult<()> {
+        let id = self.0.id();
+        self.0
+            .request(HarnessKind::Omp, json!({"type": "compact"}), id)
+            .await?;
+        let mut state = self.0.state.lock().await;
+        state.compaction_count = Some(state.compaction_count.unwrap_or_default() + 1);
+        state.native_health = NativeSessionHealth::Compacted;
+        Ok(())
     }
 
     fn events(&mut self) -> AdapterEventStream {
@@ -423,6 +458,7 @@ impl HarnessAdapter for CodexProcessAdapter {
             active_turn_steering: true,
             active_turn_follow_up: false,
             cooperative_cancellation: true,
+            safe_compaction: false,
         }
     }
 
@@ -435,6 +471,21 @@ impl HarnessAdapter for CodexProcessAdapter {
         let mut command = Command::new(&spec.executable);
         if let Some(profile) = &spec.provider_profile {
             command.arg("--profile").arg(profile);
+        }
+        if spec.tier == crate::contract::HarnessTier::Supervisor {
+            let coordinator = std::env::current_exe().map_err(|error| {
+                operation(
+                    HarnessKind::Codex,
+                    format!("cannot resolve Coordinator MCP executable: {error}"),
+                )
+            })?;
+            let command_value = serde_json::to_string(&coordinator.to_string_lossy())
+                .map_err(|error| operation(HarnessKind::Codex, error.to_string()))?;
+            command
+                .arg("-c")
+                .arg(format!("mcp_servers.herdr.command={command_value}"))
+                .arg("-c")
+                .arg("mcp_servers.herdr.args=[\"mcp\"]");
         }
         command.args(["app-server", "--listen", "stdio://", "--strict-config"]);
         let (mut child, stdin, stdout) = spawn(&mut command, spec, HarnessKind::Codex)?;
@@ -1011,6 +1062,14 @@ fn number(value: &Value, name: &str) -> Option<u32> {
         .get(name)
         .and_then(Value::as_u64)
         .and_then(|value| u32::try_from(value).ok())
+}
+
+fn unsigned(value: &Value, name: &str) -> Option<u64> {
+    value.get(name).and_then(Value::as_u64)
+}
+
+fn decimal(value: &Value, name: &str) -> Option<f64> {
+    value.get(name).and_then(Value::as_f64)
 }
 
 fn boolean(value: &Value, name: &str) -> bool {

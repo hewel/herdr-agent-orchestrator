@@ -1,6 +1,8 @@
 {
   "schema_version": 1,
   "worker_id": "omp-worker",
+  "task_role": "implementation",
+  "session_reuse": "auto",
   "title": "Edit an invalid path",
   "instructions": "This fixture must fail path validation.",
   "attachments": [],

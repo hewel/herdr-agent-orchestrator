@@ -26,6 +26,11 @@
     "delivery": {
       "enum": ["follow_up", "steer"],
       "default": "follow_up"
+    },
+    "steer_reason": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024
     }
   },
   "allOf": [
@@ -37,6 +42,14 @@
       "if": { "properties": { "kind": { "const": "reply" } } },
       "then": { "required": ["reply_to"] },
       "else": { "not": { "required": ["reply_to"] } }
+    },
+    {
+      "if": {
+        "required": ["delivery"],
+        "properties": { "delivery": { "const": "steer" } }
+      },
+      "then": { "required": ["steer_reason"] },
+      "else": { "not": { "required": ["steer_reason"] } }
     }
   ]
 }

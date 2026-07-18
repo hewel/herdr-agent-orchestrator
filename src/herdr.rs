@@ -22,6 +22,7 @@ pub const HERDR_VERSION: &str = "0.7.4";
 pub const HERDR_PROTOCOL: u32 = 16;
 pub const PLUGIN_ID: &str = "herdr-harness-coordinator";
 pub const WORKER_ENTRYPOINT: &str = "worker";
+pub const SUPERVISOR_ENTRYPOINT: &str = "supervisor";
 pub const POPUP_ENTRYPOINT: &str = "harness-network";
 pub const METADATA_SOURCE: &str = "herdr-harness-coordinator";
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
@@ -140,6 +141,24 @@ pub struct PluginPaneOpenParams {
 }
 
 impl PluginPaneOpenParams {
+    #[must_use]
+    pub fn supervisor(session_capability: &str, cwd: &Path, workspace_id: Option<String>) -> Self {
+        let mut env = BTreeMap::new();
+        env.insert(
+            "HERDR_SUPERVISOR_CAPABILITY".to_owned(),
+            session_capability.to_owned(),
+        );
+        Self {
+            plugin_id: PLUGIN_ID.to_owned(),
+            entrypoint: SUPERVISOR_ENTRYPOINT.to_owned(),
+            placement: Some("tab".to_owned()),
+            workspace_id,
+            cwd: Some(cwd.to_string_lossy().into_owned()),
+            env,
+            focus: true,
+        }
+    }
+
     #[must_use]
     pub fn worker(session_capability: &str, cwd: &Path, workspace_id: Option<String>) -> Self {
         let mut env = BTreeMap::new();

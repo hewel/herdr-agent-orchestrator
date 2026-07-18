@@ -12,9 +12,12 @@ use crate::{
     broker::{BrokerOperation, BrokerRequest, BrokerResponse, call},
     contract::{
         HarnessDefinitionV1, HarnessId, HarnessTier, MessageSubmissionV1, ObservationCheckpoint,
-        ResultManifestV1, SCHEMA_VERSION, TaskId,
+        ResultManifestV1, SCHEMA_VERSION, SupervisorEventId, TaskId,
     },
-    core::{ActorContext, CoordinatorCommand, CoordinatorQuery, SessionCapability},
+    core::{
+        ActorContext, CoordinatorCommand, CoordinatorQuery, SessionCapability,
+        SupervisorEventResolution,
+    },
     herdr::{HerdrSocketClient, PluginPaneOpenParams},
     profile::ProfileRegistry,
 };
@@ -159,6 +162,10 @@ impl McpServer {
         })
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one exhaustive MCP name-to-Core-operation authorization map"
+    )]
     async fn call_tool(&self, params: Value) -> Result<Value> {
         let name = params
             .get("name")
@@ -176,6 +183,7 @@ impl McpServer {
             "harness_status" => query(CoordinatorQuery::ListTasks),
             "harness_task_graph" => query(CoordinatorQuery::TaskGraph),
             "harness_inbox" => query(CoordinatorQuery::Inbox),
+            "harness_supervisor_events" => query(CoordinatorQuery::SupervisorEvents),
             "harness_task_create" => execute(CoordinatorCommand::CreateTask {
                 submission: serde_json::from_value(arguments)
                     .context("invalid TaskSubmissionV1")?,
@@ -216,6 +224,30 @@ impl McpServer {
                     task_id: args.task_id,
                     observation_digest: args.observation_digest,
                     audit_note: args.audit_note,
+                })
+            }
+            "harness_supervisor_event_ack" => {
+                let args: SupervisorEventAckArgs = serde_json::from_value(arguments)
+                    .context("invalid Supervisor event acknowledgement arguments")?;
+                execute(CoordinatorCommand::AcknowledgeSupervisorEvents {
+                    event_ids: args.event_ids,
+                })
+            }
+            "harness_supervisor_event_reconcile" => {
+                let args: SupervisorEventReconcileArgs = serde_json::from_value(arguments)
+                    .context("invalid Supervisor event reconciliation arguments")?;
+                execute(CoordinatorCommand::ReconcileSupervisorEvent {
+                    event_id: args.event_id,
+                    resolution: args.resolution,
+                    audit_note: args.audit_note,
+                })
+            }
+            "harness_task_graph_watch" => {
+                let args: TaskGraphWatchArgs = serde_json::from_value(arguments)
+                    .context("invalid Task graph watch arguments")?;
+                execute(CoordinatorCommand::WatchTaskGraph {
+                    root_task_ids: args.root_task_ids,
+                    request_key: args.request_key,
                 })
             }
             "harness_stop" => {
@@ -483,6 +515,10 @@ pub async fn verify_required_worker_tools(
     Ok(())
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "short-lived typed routing value avoids heap allocation at every MCP call"
+)]
 enum ToolOperation {
     Execute(CoordinatorCommand),
     Query(CoordinatorQuery),
@@ -537,6 +573,24 @@ struct StopArgs {
     worker_id: HarnessId,
 }
 
+#[derive(Deserialize)]
+struct SupervisorEventAckArgs {
+    event_ids: Vec<SupervisorEventId>,
+}
+
+#[derive(Deserialize)]
+struct SupervisorEventReconcileArgs {
+    event_id: SupervisorEventId,
+    resolution: SupervisorEventResolution,
+    audit_note: String,
+}
+
+#[derive(Deserialize)]
+struct TaskGraphWatchArgs {
+    root_task_ids: Vec<TaskId>,
+    request_key: Option<String>,
+}
+
 fn tool_result(response: BrokerResponse) -> Result<Value> {
     if let Some(error) = response.error {
         bail!("Coordinator {:?}: {}", error.category, error.message);
@@ -573,6 +627,11 @@ fn tools() -> Vec<Value> {
         tool(
             "harness_inbox",
             "Read unread Messages for this Harness.",
+            empty.clone(),
+        ),
+        tool(
+            "harness_supervisor_events",
+            "Inspect durable Supervisor event delivery and processing state.",
             empty,
         ),
         tool(
@@ -621,6 +680,21 @@ fn tools() -> Vec<Value> {
             passthrough,
         ),
         tool(
+            "harness_supervisor_event_ack",
+            "Acknowledge retry-safe durable Supervisor events as processed.",
+            json!({"type":"object","required":["event_ids"],"properties":{"event_ids":{"type":"array","minItems":1,"maxItems":32,"uniqueItems":true,"items":{"type":"string","format":"uuid"}}},"additionalProperties":false}),
+        ),
+        tool(
+            "harness_supervisor_event_reconcile",
+            "Explicitly reconcile an Unknown native Supervisor injection.",
+            json!({"type":"object","required":["event_id","resolution","audit_note"],"properties":{"event_id":{"type":"string","format":"uuid"},"resolution":{"type":"string","enum":["retry","processed","cancel"]},"audit_note":{"type":"string","minLength":1,"maxLength":4096}},"additionalProperties":false}),
+        ),
+        tool(
+            "harness_task_graph_watch",
+            "Register the explicit root Tasks whose review or terminal completion should wake the Supervisor.",
+            json!({"type":"object","required":["root_task_ids"],"properties":{"root_task_ids":{"type":"array","minItems":1,"maxItems":32,"uniqueItems":true,"items":{"type":"string","format":"uuid"}},"request_key":{"type":["string","null"]}},"additionalProperties":false}),
+        ),
+        tool(
             "harness_stop",
             "Stop one explicit Worker Host after settling active cancellation.",
             json!({"type":"object","required":["worker_id"],"properties":{"worker_id":{"type":"string"}},"additionalProperties":false}),
@@ -629,13 +703,15 @@ fn tools() -> Vec<Value> {
 }
 
 /// OMP RPC declarations for the Worker-safe Coordinator MCP tools.
-pub(crate) fn omp_host_tools() -> Vec<Value> {
+pub(crate) fn omp_host_tools(tier: HarnessTier) -> Vec<Value> {
     tools()
         .into_iter()
         .filter(|tool| {
             tool.get("name")
                 .and_then(Value::as_str)
-                .is_some_and(|name| REQUIRED_WORKER_TOOLS.contains(&name))
+                .is_some_and(|name| {
+                    tier == HarnessTier::Supervisor || REQUIRED_WORKER_TOOLS.contains(&name)
+                })
         })
         .map(|tool| {
             json!({

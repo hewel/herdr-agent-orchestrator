@@ -15,7 +15,7 @@
 - Require one active Supervisor per Coordinator state directory and one active Task per Worker. Reject Worker-to-Worker messaging.
 - Use `docs/research/mvp/coordination-contract.md` as the normative public Task/message/Result boundary.
 - The Worker pane owns the Harness Host and native process. The popup observes and controls durable state but never owns a Harness lifecycle.
-- A registered Supervisor is pull-notified through its durable inbox, Herdr metadata, and popup; the Coordinator cannot inject a new turn into an already-running Supervisor process.
+- Worker events always enter the durable Supervisor inbox. A Coordinator-managed Supervisor Host may additionally inject safe native follow-up turns into the visible bound Session; an unmanaged, already-running Supervisor remains pull-notified through inbox, metadata, and popup only.
 
 ## Repository coordination
 

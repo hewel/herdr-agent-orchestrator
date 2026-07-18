@@ -15,22 +15,27 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::{
     Row, SqlitePool,
-    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
+    sqlite::{
+        SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous,
+    },
 };
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::adapter::AdapterCapabilities;
+use crate::adapter::{AdapterCapabilities, AdapterLifecycle, AdapterSnapshot};
 use crate::attachment::{AttachmentMetadata, AttachmentStore};
 use crate::contract::{
     CommandEvidenceV1, DeliveryAttemptId, DeliveryIntent, DependencyCondition,
     DependencyFailurePolicy, HarnessDefinitionV1, HarnessId, HarnessSessionId, HarnessTier,
     MessageId, MessageKind, MessageSubmissionV1, ObservationCheckpoint, RepositoryAccess,
     RepositoryObservationId, RepositoryObservationV1, ResultManifestV1, SCHEMA_VERSION,
-    ScopeClassification, TaskId, TaskSubmissionV1, Validate, WorktreeHoldId, WriteScopeV1,
+    ScopeClassification, SessionReusePolicy, SupervisorEventDeliveryState, SupervisorEventId,
+    SupervisorEventKind, TaskGraphWatchId, TaskId, TaskRole, TaskSubmissionV1, Validate,
+    WorktreeHoldId, WriteScopeV1,
 };
 use crate::profile::parse_launch_profile_snapshot;
 use crate::repository::{GitRepository, RepositorySnapshot};
+use crate::session_reuse::{SessionReuseCandidate, effective_policy, evaluate_session_reuse};
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 
@@ -177,6 +182,8 @@ pub enum CoordinatorCommand {
     DispatchTask { task_id: TaskId },
     /// Atomically claim the assigned Worker's oldest eligible queued Task.
     ClaimNextTask,
+    /// Rotate an idle Worker to a fresh Coordinator/native Session in the same pane.
+    RotateWorkerSession,
     /// Admit a routed Question, Reply, Correction, or Notification.
     SendMessage { submission: MessageSubmissionV1 },
     /// Record native acceptance reported by the destination Host.
@@ -245,7 +252,48 @@ pub enum CoordinatorCommand {
         native_session_id: Option<String>,
         native_thread_id: Option<String>,
         effective_model: Option<String>,
+        safe_compaction: bool,
         evidence: HarnessCompatibilityEvidenceV1,
+    },
+    /// Register the native conversation bound by the managed Supervisor Host.
+    RecordSupervisorBinding {
+        native_session_id: Option<String>,
+        native_thread_id: Option<String>,
+    },
+    /// Mark the managed Supervisor native transport offline without ending durable state.
+    RecordSupervisorDisconnected { diagnostic: Option<String> },
+    /// Persist the latest provider-neutral native health evidence.
+    RecordAdapterSnapshot { snapshot: AdapterSnapshot },
+    /// Claim the oldest retry-safe durable Supervisor-attention event.
+    ClaimNextSupervisorEvent,
+    /// Record provider-native acceptance separately from model processing.
+    AcceptSupervisorEvent {
+        event_id: SupervisorEventId,
+        native_correlation: String,
+        evidence: String,
+    },
+    /// Mark an attempted native Supervisor injection as ambiguous.
+    MarkSupervisorEventUnknown {
+        event_id: SupervisorEventId,
+        diagnostic: String,
+    },
+    /// Return a definitively unwritten Supervisor injection to the FIFO.
+    ReleaseSupervisorEvent {
+        event_id: SupervisorEventId,
+        diagnostic: String,
+    },
+    /// Explicitly acknowledge one or more Inbox-backed events as processed.
+    AcknowledgeSupervisorEvents { event_ids: Vec<SupervisorEventId> },
+    /// Reconcile an event whose native injection is ambiguous.
+    ReconcileSupervisorEvent {
+        event_id: SupervisorEventId,
+        resolution: SupervisorEventResolution,
+        audit_note: String,
+    },
+    /// Register a durable completion watch for an explicit Task-root set.
+    WatchTaskGraph {
+        root_task_ids: Vec<TaskId>,
+        request_key: Option<String>,
     },
     /// Persist one monotonic pane-resident Host event for reconnect replay.
     RecordHostEvent { sequence: u64, event: Value },
@@ -272,6 +320,15 @@ pub enum DeliveryUnknownResolution {
     /// Create a new audited delivery attempt after proving repository state.
     Requeue,
     /// Terminate the Task without replaying the uncertain native request.
+    Cancel,
+}
+
+/// Explicit resolution for an ambiguous Supervisor native injection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SupervisorEventResolution {
+    Retry,
+    Processed,
     Cancel,
 }
 
@@ -304,6 +361,8 @@ pub enum CoordinatorQuery {
     },
     /// Return explicit and frozen dependency inputs for one Task delivery.
     ResolvedTaskInput { task_id: TaskId },
+    /// Return durable Supervisor events ordered by attention FIFO.
+    SupervisorEvents,
 }
 
 /// Durable Task lifecycle state.
@@ -417,6 +476,13 @@ pub struct TaskView {
     pub state: TaskState,
     /// Current Result revision.
     pub result_revision: u32,
+    pub task_role: TaskRole,
+    pub requested_session_policy: SessionReusePolicy,
+    pub effective_session_policy: Option<SessionReusePolicy>,
+    pub harness_session_id: Option<HarnessSessionId>,
+    pub session_reused: Option<bool>,
+    pub session_decision_reason: Option<String>,
+    pub context_percent: Option<String>,
 }
 
 /// One persisted dependency edge in a Task graph projection.
@@ -437,6 +503,7 @@ pub struct TaskGraphView {
     pub dependents: Vec<TaskId>,
     pub worker_queue_position: Option<u32>,
     pub waiting_for_worker: bool,
+    pub waiting_for_session: bool,
     pub waiting_for_repository: bool,
 }
 
@@ -487,6 +554,21 @@ pub struct InboxMessageView {
     pub body: Value,
     /// Latest native delivery state, when delivery applies.
     pub delivery_state: Option<String>,
+}
+
+/// Durable event delivery projection used by the Supervisor Host and popup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SupervisorEventView {
+    pub id: SupervisorEventId,
+    pub kind: SupervisorEventKind,
+    pub task_id: Option<TaskId>,
+    pub result_revision: Option<u32>,
+    pub source_message_id: Option<MessageId>,
+    pub summary: String,
+    pub attachments: Vec<crate::contract::AttachmentId>,
+    pub delivery_intent: DeliveryIntent,
+    pub state: SupervisorEventDeliveryState,
+    pub created_at: String,
 }
 
 /// Unresolved advisory Worktree Hold projection.
@@ -557,6 +639,15 @@ pub enum CommandOutcome {
     },
     /// Worker currently has no eligible queued Task.
     NoTaskAvailable,
+    /// The Worker Host must rotate before retrying this Task.
+    SessionRotationRequired { task_id: TaskId },
+    /// Required reuse needs one provider-native safe compaction before retry.
+    SessionCompactionRequired { task_id: TaskId },
+    /// New capability created for same-pane Worker Session rotation.
+    WorkerSessionRotated {
+        session_id: HarnessSessionId,
+        capability: SessionCapability,
+    },
     /// Public Bus Message was durably admitted.
     MessageCreated { message_id: MessageId },
     /// A native delivery was accepted and its effects applied.
@@ -585,6 +676,21 @@ pub enum CommandOutcome {
     HostReady,
     /// Native compatibility evidence was retained before readiness.
     HostCompatibilityRecorded,
+    /// Managed Supervisor native identity was durably bound.
+    SupervisorBound,
+    /// Managed Supervisor transport is offline; durable attention remains pending.
+    SupervisorDisconnected,
+    /// Latest native health and context evidence was retained.
+    AdapterSnapshotRecorded,
+    /// Oldest retry-safe event was reserved for native injection.
+    SupervisorEventClaimed { event: Option<SupervisorEventView> },
+    /// Supervisor event delivery state was updated.
+    SupervisorEventUpdated {
+        event_id: SupervisorEventId,
+        state: SupervisorEventDeliveryState,
+    },
+    /// Durable root Task watch was registered.
+    TaskGraphWatchRegistered { watch_id: TaskGraphWatchId },
     /// Monotonic Host event was persisted or replayed idempotently.
     HostEventRecorded { sequence: u64 },
 }
@@ -613,6 +719,8 @@ pub enum QueryResult {
     Attachment(AttachmentMetadata),
     /// Frozen delivery input for a Task.
     ResolvedTaskInput(ResolvedTaskInputView),
+    /// Durable Supervisor-attention events.
+    SupervisorEvents(Vec<SupervisorEventView>),
 }
 
 /// One Coordinator daemon's deep transactional state module.
@@ -779,6 +887,10 @@ impl Coordinator {
                 }
                 self.claim_next_task(&actor).await
             }
+            (ActorContext::Session { capability }, CoordinatorCommand::RotateWorkerSession) => {
+                let actor = self.authenticate(&capability).await?;
+                self.rotate_worker_session(&actor).await
+            }
             (
                 ActorContext::Session { capability },
                 CoordinatorCommand::SendMessage { submission },
@@ -933,6 +1045,7 @@ impl Coordinator {
                     native_session_id,
                     native_thread_id,
                     effective_model,
+                    safe_compaction,
                     evidence,
                 },
             ) => {
@@ -944,9 +1057,113 @@ impl Coordinator {
                     native_session_id,
                     native_thread_id,
                     effective_model,
+                    safe_compaction,
                     evidence,
                 )
                 .await
+            }
+            (
+                ActorContext::Session { capability },
+                CoordinatorCommand::RecordAdapterSnapshot { snapshot },
+            ) => {
+                let actor = self.authenticate(&capability).await?;
+                self.record_adapter_snapshot(&actor, snapshot).await
+            }
+            (
+                ActorContext::Session { capability },
+                CoordinatorCommand::RecordSupervisorBinding {
+                    native_session_id,
+                    native_thread_id,
+                },
+            ) => {
+                let actor = self.authenticate(&capability).await?;
+                self.record_supervisor_binding(&actor, native_session_id, native_thread_id)
+                    .await
+            }
+            (
+                ActorContext::Session { capability },
+                CoordinatorCommand::RecordSupervisorDisconnected { diagnostic },
+            ) => {
+                let actor = self.authenticate(&capability).await?;
+                self.record_supervisor_disconnected(&actor, diagnostic)
+                    .await
+            }
+            (
+                ActorContext::Session { capability },
+                CoordinatorCommand::ClaimNextSupervisorEvent,
+            ) => {
+                let actor = self.authenticate(&capability).await?;
+                self.require_supervisor(&actor)?;
+                self.claim_next_supervisor_event(&actor).await
+            }
+            (
+                ActorContext::Session { capability },
+                CoordinatorCommand::AcceptSupervisorEvent {
+                    event_id,
+                    native_correlation,
+                    evidence,
+                },
+            ) => {
+                let actor = self.authenticate(&capability).await?;
+                self.require_supervisor(&actor)?;
+                self.accept_supervisor_event(&actor, event_id, native_correlation, evidence)
+                    .await
+            }
+            (
+                ActorContext::Session { capability },
+                CoordinatorCommand::MarkSupervisorEventUnknown {
+                    event_id,
+                    diagnostic,
+                },
+            ) => {
+                let actor = self.authenticate(&capability).await?;
+                self.require_supervisor(&actor)?;
+                self.mark_supervisor_event_unknown(event_id, diagnostic)
+                    .await
+            }
+            (
+                ActorContext::Session { capability },
+                CoordinatorCommand::ReleaseSupervisorEvent {
+                    event_id,
+                    diagnostic,
+                },
+            ) => {
+                let actor = self.authenticate(&capability).await?;
+                self.require_supervisor(&actor)?;
+                self.release_supervisor_event(event_id, diagnostic).await
+            }
+            (
+                ActorContext::Session { capability },
+                CoordinatorCommand::AcknowledgeSupervisorEvents { event_ids },
+            ) => {
+                let actor = self.authenticate(&capability).await?;
+                self.require_supervisor(&actor)?;
+                self.acknowledge_supervisor_events(&actor, event_ids).await
+            }
+            (
+                ActorContext::Session { capability },
+                CoordinatorCommand::ReconcileSupervisorEvent {
+                    event_id,
+                    resolution,
+                    audit_note,
+                },
+            ) => {
+                let actor = self.authenticate(&capability).await?;
+                self.require_supervisor(&actor)?;
+                self.reconcile_supervisor_event(event_id, resolution, audit_note)
+                    .await
+            }
+            (
+                ActorContext::Session { capability },
+                CoordinatorCommand::WatchTaskGraph {
+                    root_task_ids,
+                    request_key,
+                },
+            ) => {
+                let actor = self.authenticate(&capability).await?;
+                self.require_supervisor(&actor)?;
+                self.watch_task_graph(&actor, root_task_ids, request_key)
+                    .await
             }
             (
                 ActorContext::Session { capability },
@@ -967,10 +1184,6 @@ impl Coordinator {
     /// # Errors
     ///
     /// Returns [`CoordinatorError`] when authentication or storage fails.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one exhaustive query authorization and projection boundary"
-    )]
     pub async fn query(
         &self,
         actor: ActorContext,
@@ -1000,7 +1213,7 @@ impl Coordinator {
             }
             CoordinatorQuery::GetTask { task_id } => {
                 let row =
-                    sqlx::query("SELECT worker_id, state, result_revision FROM tasks WHERE id = ?")
+                    sqlx::query("SELECT t.id, t.worker_id, t.state, t.result_revision, t.task_role, t.session_reuse_policy, b.effective_policy, b.harness_session_id, b.reused, b.decision_reason, b.context_percent FROM tasks t LEFT JOIN task_session_bindings b ON b.task_id = t.id AND b.superseded_at IS NULL WHERE t.id = ?")
                         .bind(task_id.to_string())
                         .fetch_optional(&self.pool)
                         .await
@@ -1008,18 +1221,7 @@ impl Coordinator {
                         .ok_or_else(|| {
                             CoordinatorError::new(ErrorCategory::NotFound, "Task does not exist")
                         })?;
-                let worker_id =
-                    HarnessId::from_str(row.get::<&str, _>("worker_id")).map_err(|error| {
-                        CoordinatorError::new(ErrorCategory::StorageFailure, error.to_string())
-                    })?;
-                let state = TaskState::from_str(row.get::<&str, _>("state"))?;
-                let revision: i64 = row.get("result_revision");
-                Ok(QueryResult::Task(TaskView {
-                    id: task_id,
-                    worker_id,
-                    state,
-                    result_revision: u32::try_from(revision).map_err(CoordinatorError::storage)?,
-                }))
+                Ok(QueryResult::Task(task_view_from_row(&row)?))
             }
             CoordinatorQuery::ListTasks => self.list_tasks().await,
             CoordinatorQuery::TaskGraph => {
@@ -1077,6 +1279,12 @@ impl Coordinator {
                     explicit_attachments: submission.attachments,
                     dependency_results: dependencies,
                 }))
+            }
+            CoordinatorQuery::SupervisorEvents => {
+                self.require_supervisor(&actor)?;
+                Ok(QueryResult::SupervisorEvents(
+                    self.supervisor_events().await?,
+                ))
             }
         }
     }
@@ -1190,7 +1398,7 @@ impl Coordinator {
 
     async fn list_tasks(&self) -> Result<QueryResult, CoordinatorError> {
         let rows = sqlx::query(
-            "SELECT id, worker_id, state, result_revision FROM tasks ORDER BY created_sequence",
+            "SELECT t.id, t.worker_id, t.state, t.result_revision, t.task_role, t.session_reuse_policy, b.effective_policy, b.harness_session_id, b.reused, b.decision_reason, b.context_percent FROM tasks t LEFT JOIN task_session_bindings b ON b.task_id = t.id AND b.superseded_at IS NULL ORDER BY t.created_sequence",
         )
         .fetch_all(&self.pool)
         .await
@@ -1203,7 +1411,7 @@ impl Coordinator {
     }
 
     async fn task_graph(&self) -> Result<QueryResult, CoordinatorError> {
-        let rows = sqlx::query("SELECT id, worker_id, state, scheduling_state, result_revision, submission_json, created_sequence FROM tasks ORDER BY created_sequence")
+        let rows = sqlx::query("SELECT t.id, t.worker_id, t.state, t.scheduling_state, t.result_revision, t.submission_json, t.created_sequence, t.task_role, t.session_reuse_policy, b.effective_policy, b.harness_session_id, b.reused, b.decision_reason, b.context_percent FROM tasks t LEFT JOIN task_session_bindings b ON b.task_id = t.id AND b.superseded_at IS NULL ORDER BY t.created_sequence")
             .fetch_all(&self.pool)
             .await
             .map_err(CoordinatorError::storage)?;
@@ -1251,6 +1459,8 @@ impl Coordinator {
                 .map_err(CoordinatorError::storage)?;
             let is_waiting =
                 scheduling_state == TaskSchedulingState::Ready && task.state == TaskState::Queued;
+            let waiting_for_session =
+                is_waiting && task.harness_session_id.is_none() && active == 0;
             graph.push(TaskGraphView {
                 task,
                 scheduling_state,
@@ -1259,6 +1469,7 @@ impl Coordinator {
                 worker_queue_position: is_waiting
                     .then(|| u32::try_from(position).unwrap_or(u32::MAX)),
                 waiting_for_worker: is_waiting && active != 0,
+                waiting_for_session,
                 waiting_for_repository: is_waiting && repository_blockers != 0,
             });
         }
@@ -1653,7 +1864,7 @@ impl Coordinator {
         {
             return Ok(outcome);
         }
-        let worker = sqlx::query("SELECT tier, cwd FROM harnesses WHERE id = ?")
+        let worker = sqlx::query("SELECT tier, cwd, model FROM harnesses WHERE id = ?")
             .bind(submission.worker_id.as_str())
             .fetch_optional(&mut *transaction)
             .await
@@ -1672,6 +1883,28 @@ impl Coordinator {
                 ErrorCategory::InvalidInput,
                 "Task repository does not match Worker registration",
             ));
+        }
+        let profile_digest: Option<String> = sqlx::query_scalar(
+            "SELECT profile_digest FROM harness_sessions WHERE harness_id = ? ORDER BY started_at DESC LIMIT 1",
+        )
+        .bind(submission.worker_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(CoordinatorError::storage)?
+        .flatten();
+        if let Some(preferred_session_id) = submission.preferred_session_id {
+            let preferred_worker: Option<String> =
+                sqlx::query_scalar("SELECT harness_id FROM harness_sessions WHERE id = ?")
+                    .bind(preferred_session_id.to_string())
+                    .fetch_optional(&mut *transaction)
+                    .await
+                    .map_err(CoordinatorError::storage)?;
+            if preferred_worker.as_deref() != Some(submission.worker_id.as_str()) {
+                return Err(CoordinatorError::new(
+                    ErrorCategory::InvalidInput,
+                    "preferred Session does not belong to the selected Worker",
+                ));
+            }
         }
         for attachment in &submission.attachments {
             let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM attachments WHERE id = ?")
@@ -1723,13 +1956,19 @@ impl Coordinator {
         } else {
             TaskSchedulingState::Blocked
         };
-        sqlx::query("INSERT INTO tasks (id, worker_id, related_task_id, submission_json, state, scheduling_state, created_sequence, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        sqlx::query("INSERT INTO tasks (id, worker_id, related_task_id, submission_json, state, scheduling_state, task_role, session_reuse_policy, preferred_session_id, expected_profile_digest, expected_model, expected_tool_policy_digest, created_sequence, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(task_id.to_string())
             .bind(submission.worker_id.as_str())
             .bind(submission.related_task_id.map(|id| id.to_string()))
             .bind(&submission_json)
             .bind(TaskState::Queued.as_str())
             .bind(scheduling_state.as_str())
+            .bind(task_role_as_str(submission.task_role))
+            .bind(session_reuse_policy_as_str(submission.session_reuse))
+            .bind(submission.preferred_session_id.map(|id| id.to_string()))
+            .bind(profile_digest.as_deref())
+            .bind(worker.get::<Option<&str>, _>("model"))
+            .bind(profile_digest.as_deref())
             .bind(sequence)
             .bind(&now)
             .bind(&now)
@@ -1794,8 +2033,271 @@ impl Coordinator {
         Ok(outcome)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Session identity, safety, and audit evidence are selected atomically"
+    )]
+    async fn prepare_task_session_binding(
+        &self,
+        task_id: TaskId,
+    ) -> Result<HarnessSessionId, CoordinatorError> {
+        let mut transaction = self.pool.begin().await.map_err(CoordinatorError::storage)?;
+        let existing_binding = sqlx::query_scalar::<_, String>(
+            "SELECT harness_session_id FROM task_session_bindings WHERE task_id = ? AND superseded_at IS NULL",
+        )
+        .bind(task_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(CoordinatorError::storage)?;
+        let task = sqlx::query("SELECT worker_id, state, scheduling_state, submission_json, expected_profile_digest, expected_model, expected_tool_policy_digest FROM tasks WHERE id = ?")
+            .bind(task_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?
+            .ok_or_else(|| CoordinatorError::new(ErrorCategory::NotFound, "Task does not exist"))?;
+        require_state(task.get("state"), TaskState::Queued)?;
+        if task.get::<&str, _>("scheduling_state") != TaskSchedulingState::Ready.as_str() {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidState,
+                "Task dependencies are not satisfied",
+            ));
+        }
+        let submission: TaskSubmissionV1 =
+            serde_json::from_str(task.get("submission_json")).map_err(CoordinatorError::storage)?;
+        let worker_id: &str = task.get("worker_id");
+        let related_session: Option<String> = if let Some(related_task_id) =
+            submission.related_task_id
+        {
+            sqlx::query_scalar("SELECT harness_session_id FROM task_session_bindings WHERE task_id = ? ORDER BY sequence DESC LIMIT 1")
+                .bind(related_task_id.to_string())
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(CoordinatorError::storage)?
+        } else {
+            None
+        };
+        let candidate_id = if existing_binding.is_some() {
+            existing_binding.clone()
+        } else if let Some(preferred) = submission.preferred_session_id {
+            Some(preferred.to_string())
+        } else if related_session.is_some() {
+            related_session
+        } else {
+            sqlx::query_scalar("SELECT id FROM harness_sessions WHERE harness_id = ? AND ended_at IS NULL ORDER BY started_at DESC LIMIT 1")
+                .bind(worker_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(CoordinatorError::storage)?
+        };
+        let candidate_id = candidate_id.ok_or_else(|| {
+            CoordinatorError::new(
+                ErrorCategory::TargetOffline,
+                "assigned Worker has no Session",
+            )
+        })?;
+        let session = sqlx::query("SELECT id, harness_id, presence, activity, profile_digest, effective_model, tool_policy_digest, native_health, context_tokens, context_window, context_percent, compaction_count, adapter_snapshot_json FROM harness_sessions WHERE id = ? AND ended_at IS NULL")
+            .bind(&candidate_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?
+            .ok_or_else(|| CoordinatorError::new(ErrorCategory::InvalidState, "required Session is unavailable"))?;
+        let candidate_session_id = parse_uuid_id::<HarnessSessionId>(session.get("id"))?;
+        let busy: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE active_session_id = ? AND id <> ? AND state IN ('dispatching','working','waiting','reviewing','cancelling','delivery_unknown')")
+            .bind(&candidate_id)
+            .bind(task_id.to_string())
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tasks WHERE active_session_id = ? AND state = 'waiting'",
+        )
+        .bind(&candidate_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(CoordinatorError::storage)?;
+        let unknown: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tasks WHERE active_session_id = ? AND state = 'delivery_unknown'",
+        )
+        .bind(&candidate_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(CoordinatorError::storage)?;
+        let cancelling: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tasks WHERE active_session_id = ? AND state = 'cancelling'",
+        )
+        .bind(&candidate_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(CoordinatorError::storage)?;
+        let holds: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM worktree_holds h JOIN tasks t ON t.id = h.task_id WHERE t.active_session_id = ? AND h.cleared_at IS NULL")
+            .bind(&candidate_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        let prior_bindings: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM task_session_bindings WHERE harness_session_id = ?",
+        )
+        .bind(&candidate_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(CoordinatorError::storage)?;
+        let native_health = native_session_health_from_str(session.get("native_health"))?;
+        let lifecycle = if session.get::<&str, _>("presence") == "online"
+            && session.get::<&str, _>("activity") == "idle"
+        {
+            AdapterLifecycle::Idle
+        } else if session.get::<&str, _>("presence") == "online" {
+            AdapterLifecycle::Working
+        } else {
+            AdapterLifecycle::Failed
+        };
+        let adapter = session
+            .get::<Option<&str>, _>("adapter_snapshot_json")
+            .and_then(|json| serde_json::from_str::<AdapterSnapshot>(json).ok())
+            .unwrap_or(AdapterSnapshot {
+                lifecycle,
+                session_id: None,
+                thread_id: None,
+                active_turn_id: None,
+                steerable: false,
+                queued_input_count: None,
+                model: session
+                    .get::<Option<&str>, _>("effective_model")
+                    .map(str::to_owned),
+                native_health,
+                context_tokens: session.get("context_tokens"),
+                context_window: session.get("context_window"),
+                context_percent: session.get("context_percent"),
+                compaction_count: session.get("compaction_count"),
+            });
+        let expected_profile = task.get::<Option<&str>, _>("expected_profile_digest");
+        let expected_model = task.get::<Option<&str>, _>("expected_model");
+        let expected_tool_policy = task.get::<Option<&str>, _>("expected_tool_policy_digest");
+        let candidate = SessionReuseCandidate {
+            session_id: candidate_session_id,
+            same_worker: session.get::<&str, _>("harness_id") == worker_id,
+            same_harness_kind: true,
+            same_launch_profile: expected_profile
+                == session.get::<Option<&str>, _>("profile_digest"),
+            same_repository: true,
+            same_tool_policy: expected_tool_policy
+                == session
+                    .get::<Option<&str>, _>("tool_policy_digest")
+                    .or(session.get::<Option<&str>, _>("profile_digest")),
+            compatible_model: expected_model == session.get::<Option<&str>, _>("effective_model"),
+            has_active_task: busy != 0,
+            has_unresolved_question: waiting != 0,
+            has_delivery_unknown: unknown != 0,
+            has_unresolved_cancellation: cancelling != 0,
+            has_session_worktree_hold: holds != 0,
+            native_protocol_unambiguous: native_health
+                != crate::contract::NativeSessionHealth::Ambiguous,
+            previously_bound: prior_bindings != 0,
+            adapter,
+        };
+        let policy = effective_policy(&submission);
+        let decision = if existing_binding.is_some()
+            || (policy == SessionReusePolicy::Fresh && prior_bindings == 0)
+        {
+            let mut compatibility_task = submission.clone();
+            compatibility_task.session_reuse = SessionReusePolicy::Prefer;
+            let compatibility = evaluate_session_reuse(&compatibility_task, &candidate);
+            if compatibility.reusable {
+                crate::session_reuse::SessionReuseDecision {
+                    reusable: true,
+                    effective_policy: policy,
+                    reason_code: if existing_binding.is_some() {
+                        "binding_revalidated".to_owned()
+                    } else {
+                        "fresh_unbound_session".to_owned()
+                    },
+                    reason: if existing_binding.is_some() {
+                        "existing Task binding remains compatible and healthy".to_owned()
+                    } else {
+                        "fresh compatible native Session has not executed another Task".to_owned()
+                    },
+                }
+            } else {
+                compatibility
+            }
+        } else {
+            evaluate_session_reuse(&submission, &candidate)
+        };
+        if !decision.reusable {
+            if existing_binding.is_some()
+                && submission.session_reuse != SessionReusePolicy::Required
+            {
+                let now = timestamp();
+                sqlx::query("UPDATE task_session_bindings SET superseded_at = ? WHERE task_id = ? AND superseded_at IS NULL")
+                    .bind(&now)
+                    .bind(task_id.to_string())
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(CoordinatorError::storage)?;
+                transaction
+                    .commit()
+                    .await
+                    .map_err(CoordinatorError::storage)?;
+            }
+            let category = if submission.session_reuse == SessionReusePolicy::Required {
+                ErrorCategory::InvalidState
+            } else {
+                ErrorCategory::TargetOffline
+            };
+            return Err(CoordinatorError::new(
+                category,
+                format!(
+                    "Session selection blocked: {} ({})",
+                    decision.reason, decision.reason_code
+                ),
+            ));
+        }
+        if existing_binding.is_some() {
+            transaction
+                .commit()
+                .await
+                .map_err(CoordinatorError::storage)?;
+            return Ok(candidate_session_id);
+        }
+        let now = timestamp();
+        let context_tokens = candidate
+            .adapter
+            .context_tokens
+            .map(i64::try_from)
+            .transpose()
+            .map_err(CoordinatorError::storage)?;
+        let context_window = candidate
+            .adapter
+            .context_window
+            .map(i64::try_from)
+            .transpose()
+            .map_err(CoordinatorError::storage)?;
+        sqlx::query("INSERT INTO task_session_bindings (task_id, harness_session_id, requested_policy, effective_policy, reused, reason_code, decision_reason, adapter_snapshot_json, context_tokens, context_window, context_percent, bound_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+            .bind(task_id.to_string())
+            .bind(&candidate_id)
+            .bind(session_reuse_policy_as_str(submission.session_reuse))
+            .bind(session_reuse_policy_as_str(decision.effective_policy))
+            .bind(i64::from(prior_bindings != 0))
+            .bind(&decision.reason_code)
+            .bind(&decision.reason)
+            .bind(serde_json::to_string(&candidate.adapter).map_err(CoordinatorError::storage)?)
+            .bind(context_tokens)
+            .bind(context_window)
+            .bind(candidate.adapter.context_percent)
+            .bind(&now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        transaction
+            .commit()
+            .await
+            .map_err(CoordinatorError::storage)?;
+        Ok(candidate_session_id)
+    }
+
     async fn dispatch_task(&self, task_id: TaskId) -> Result<CommandOutcome, CoordinatorError> {
         self.preflight_dispatch(task_id).await?;
+        self.prepare_task_session_binding(task_id).await?;
         self.capture_repository_checkpoint(task_id, ObservationCheckpoint::BeforeDispatch)
             .await?;
         let outcome = self.commit_dispatch(task_id).await;
@@ -1848,14 +2350,18 @@ impl Coordinator {
         let submission: TaskSubmissionV1 =
             serde_json::from_str(row.get("submission_json")).map_err(CoordinatorError::storage)?;
         let session_id: Option<String> = sqlx::query_scalar(
-            "SELECT id FROM harness_sessions WHERE harness_id = ? AND ended_at IS NULL AND presence = 'online' ORDER BY started_at DESC LIMIT 1",
+            "SELECT b.harness_session_id FROM task_session_bindings b JOIN harness_sessions s ON s.id = b.harness_session_id WHERE b.task_id = ? AND b.superseded_at IS NULL AND s.harness_id = ? AND s.ended_at IS NULL AND s.presence = 'online' AND s.activity = 'idle'",
         )
+        .bind(task_id.to_string())
         .bind(worker_id)
         .fetch_optional(&mut *transaction)
         .await
         .map_err(CoordinatorError::storage)?;
         let session_id = session_id.ok_or_else(|| {
-            CoordinatorError::new(ErrorCategory::TargetOffline, "assigned Worker is offline")
+            CoordinatorError::new(
+                ErrorCategory::TargetOffline,
+                "bound Worker Session is unavailable",
+            )
         })?;
         let busy: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM tasks WHERE worker_id = ? AND id <> ? AND state IN ('dispatching','working','waiting','reviewing','cancelling','delivery_unknown')",
@@ -2164,6 +2670,28 @@ impl Coordinator {
         };
         match self.dispatch_task(parse_uuid_id(&task_id)?).await {
             Err(error)
+                if error.category == ErrorCategory::TargetOffline
+                    && error.message.starts_with("Session selection blocked:") =>
+            {
+                Ok(CommandOutcome::SessionRotationRequired {
+                    task_id: parse_uuid_id(&task_id)?,
+                })
+            }
+            Err(error)
+                if error.category == ErrorCategory::InvalidState
+                    && error.message.starts_with("Session selection blocked:") =>
+            {
+                let task_id = parse_uuid_id(&task_id)?;
+                if error.message.contains("(context_pressure)")
+                    && self.required_compaction_available(actor).await?
+                {
+                    return Ok(CommandOutcome::SessionCompactionRequired { task_id });
+                }
+                self.record_session_blocker_event(task_id, &error.message)
+                    .await?;
+                Ok(CommandOutcome::NoTaskAvailable)
+            }
+            Err(error)
                 if matches!(
                     error.category,
                     ErrorCategory::RepositoryBlocked | ErrorCategory::TargetOffline
@@ -2173,6 +2701,115 @@ impl Coordinator {
             }
             outcome => outcome,
         }
+    }
+
+    async fn required_compaction_available(
+        &self,
+        actor: &AuthenticatedActor,
+    ) -> Result<bool, CoordinatorError> {
+        let row = sqlx::query("SELECT safe_compaction, compaction_count FROM harness_sessions WHERE id = ? AND ended_at IS NULL")
+            .bind(actor.session_id.to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        Ok(row.is_some_and(|row| {
+            row.get::<i64, _>("safe_compaction") != 0
+                && row
+                    .get::<Option<i64>, _>("compaction_count")
+                    .unwrap_or_default()
+                    == 0
+        }))
+    }
+
+    async fn record_session_blocker_event(
+        &self,
+        task_id: TaskId,
+        diagnostic: &str,
+    ) -> Result<(), CoordinatorError> {
+        let mut transaction = self.pool.begin().await.map_err(CoordinatorError::storage)?;
+        let now = timestamp();
+        insert_supervisor_event(
+            &mut transaction,
+            SupervisorEventKind::Notification,
+            Some(task_id),
+            None,
+            None,
+            &format!("task:{task_id}:session_blocked"),
+            diagnostic,
+            &[],
+            DeliveryIntent::FollowUp,
+            &now,
+        )
+        .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(CoordinatorError::storage)
+    }
+
+    async fn rotate_worker_session(
+        &self,
+        actor: &AuthenticatedActor,
+    ) -> Result<CommandOutcome, CoordinatorError> {
+        if actor.tier != HarnessTier::Worker {
+            return Err(CoordinatorError::new(
+                ErrorCategory::Forbidden,
+                "only a Worker Host may rotate its Session",
+            ));
+        }
+        let mut transaction = self.pool.begin().await.map_err(CoordinatorError::storage)?;
+        let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE worker_id = ? AND state IN ('dispatching','working','waiting','reviewing','cancelling','delivery_unknown')")
+            .bind(actor.id.as_str())
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        if active != 0 {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidState,
+                "Worker Session rotation requires no active Task",
+            ));
+        }
+        let old = sqlx::query("SELECT profile_snapshot_json, profile_digest, connection_generation FROM harness_sessions WHERE id = ? AND ended_at IS NULL AND presence = 'online' AND activity = 'idle'")
+            .bind(actor.session_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?
+            .ok_or_else(|| CoordinatorError::new(ErrorCategory::InvalidState, "Worker Session is not idle and online"))?;
+        let now = timestamp();
+        sqlx::query("UPDATE harness_sessions SET presence = 'stopped', activity = 'idle', ended_at = ?, last_seen_at = ? WHERE id = ?")
+            .bind(&now)
+            .bind(&now)
+            .bind(actor.session_id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        let session_id = HarnessSessionId::new();
+        let capability = SessionCapability::generate();
+        let generation: i64 = old.get("connection_generation");
+        sqlx::query("INSERT INTO harness_sessions (id, harness_id, harness_tier, capability_hash, connection_generation, presence, activity, profile_snapshot_json, profile_digest, native_health, started_at, last_seen_at) VALUES (?, ?, 'worker', ?, ?, 'starting', 'starting', ?, ?, 'ambiguous', ?, ?)")
+            .bind(session_id.to_string())
+            .bind(actor.id.as_str())
+            .bind(capability.digest())
+            .bind(generation + 1)
+            .bind(old.get::<Option<&str>, _>("profile_snapshot_json"))
+            .bind(old.get::<Option<&str>, _>("profile_digest"))
+            .bind(&now)
+            .bind(&now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        transaction
+            .commit()
+            .await
+            .map_err(CoordinatorError::storage)?;
+        self.issued_capabilities
+            .lock()
+            .await
+            .insert(session_id, capability.clone());
+        Ok(CommandOutcome::WorkerSessionRotated {
+            session_id,
+            capability,
+        })
     }
 
     #[expect(
@@ -2275,8 +2912,11 @@ impl Coordinator {
             ));
         }
         let recipient_session: Option<String> = sqlx::query_scalar(
-            "SELECT id FROM harness_sessions WHERE harness_id = ? AND ended_at IS NULL ORDER BY started_at DESC LIMIT 1",
+            "SELECT CASE WHEN ? = 'worker' AND ? IS NOT NULL THEN (SELECT b.harness_session_id FROM task_session_bindings b JOIN harness_sessions s ON s.id = b.harness_session_id WHERE b.task_id = ? AND b.superseded_at IS NULL AND s.ended_at IS NULL) ELSE (SELECT id FROM harness_sessions WHERE harness_id = ? AND ended_at IS NULL ORDER BY started_at DESC LIMIT 1) END",
         )
+        .bind(&recipient_tier)
+        .bind(submission.task_id.map(|id| id.to_string()))
+        .bind(submission.task_id.map(|id| id.to_string()))
         .bind(submission.to.as_str())
         .fetch_optional(&mut *transaction)
         .await
@@ -2324,6 +2964,43 @@ impl Coordinator {
                 &now,
             )
             .await?;
+            insert_supervisor_event(
+                &mut transaction,
+                SupervisorEventKind::BlockingQuestion,
+                Some(task_id),
+                None,
+                Some(message_id),
+                &format!("question:{message_id}"),
+                &submission.text,
+                &submission.attachments,
+                submission.delivery,
+                &now,
+            )
+            .await?;
+        } else if let Some(task_id) = submission.task_id {
+            match submission.kind {
+                MessageKind::Reply => {
+                    process_matching_supervisor_events(
+                        &mut transaction,
+                        SupervisorEventKind::BlockingQuestion,
+                        task_id,
+                        None,
+                        &now,
+                    )
+                    .await?;
+                }
+                MessageKind::Correction => {
+                    process_matching_supervisor_events(
+                        &mut transaction,
+                        SupervisorEventKind::ResultReady,
+                        task_id,
+                        None,
+                        &now,
+                    )
+                    .await?;
+                }
+                MessageKind::Question | MessageKind::Notification => {}
+            }
         }
         let outcome = CommandOutcome::MessageCreated { message_id };
         store_idempotent_outcome(
@@ -2356,7 +3033,7 @@ impl Coordinator {
             ));
         }
         let mut transaction = self.pool.begin().await.map_err(CoordinatorError::storage)?;
-        let message = sqlx::query("SELECT task_id, recipient_id, kind FROM messages WHERE id = ?")
+        let message = sqlx::query("SELECT m.task_id, m.recipient_id, m.kind, (SELECT target_session_id FROM delivery_attempts d WHERE d.message_id = m.id ORDER BY d.attempt_number DESC LIMIT 1) AS target_session_id FROM messages m WHERE m.id = ?")
             .bind(message_id.to_string())
             .fetch_optional(&mut *transaction)
             .await
@@ -2368,6 +3045,14 @@ impl Coordinator {
             return Err(CoordinatorError::new(
                 ErrorCategory::Forbidden,
                 "only the destination Host may accept delivery",
+            ));
+        }
+        if message.get::<Option<&str>, _>("target_session_id")
+            != Some(actor.session_id.to_string().as_str())
+        {
+            return Err(CoordinatorError::new(
+                ErrorCategory::Forbidden,
+                "native delivery was not addressed to this exact Harness Session",
             ));
         }
         let changed = sqlx::query("UPDATE delivery_attempts SET state = 'accepted', native_correlation = ?, provider_bytes_may_have_been_written = 1, updated_at = ? WHERE id = (SELECT id FROM delivery_attempts WHERE message_id = ? ORDER BY attempt_number DESC LIMIT 1) AND state IN ('pending','dispatching')")
@@ -2630,6 +3315,19 @@ impl Coordinator {
                 .execute(&mut *transaction)
                 .await
                 .map_err(CoordinatorError::storage)?;
+                insert_supervisor_event(
+                    &mut transaction,
+                    SupervisorEventKind::WorktreeHoldCreated,
+                    Some(hold_task_id),
+                    None,
+                    None,
+                    &format!("hold:{hold_task_id}:turn_settlement"),
+                    "Repository Worktree Hold created while settling the Worker turn",
+                    &[],
+                    DeliveryIntent::FollowUp,
+                    &now,
+                )
+                .await?;
             }
         }
         if next == TaskState::Reviewing {
@@ -2655,12 +3353,15 @@ impl Coordinator {
                 .map_err(CoordinatorError::storage)?;
             let message_id = MessageId::new();
             let sequence = next_sequence(&mut transaction, "result_message").await?;
+            let manifest_json = result_manifest.expect("reviewing requires a Result");
+            let manifest: ResultManifestV1 =
+                serde_json::from_str(&manifest_json).map_err(CoordinatorError::storage)?;
             sqlx::query("INSERT INTO messages (id, task_id, sender_id, recipient_id, kind, body_json, delivery_intent, created_sequence, created_at) VALUES (?, ?, ?, ?, 'result', ?, 'follow_up', ?, ?)")
                 .bind(message_id.to_string())
                 .bind(task_id.to_string())
                 .bind(actor.id.as_str())
                 .bind(&supervisor_id)
-                .bind(result_manifest.expect("reviewing requires a Result"))
+                .bind(&manifest_json)
                 .bind(sequence)
                 .bind(&now)
                 .execute(&mut *transaction)
@@ -2672,6 +3373,19 @@ impl Coordinator {
                 supervisor_session.as_deref(),
                 "pending",
                 false,
+                &now,
+            )
+            .await?;
+            insert_supervisor_event(
+                &mut transaction,
+                SupervisorEventKind::ResultReady,
+                Some(task_id),
+                Some(u32::try_from(revision).map_err(CoordinatorError::storage)?),
+                Some(message_id),
+                &format!("result:{task_id}:{revision}"),
+                &manifest.summary,
+                &manifest.attachments,
+                DeliveryIntent::FollowUp,
                 &now,
             )
             .await?;
@@ -3029,17 +3743,34 @@ impl Coordinator {
                 )
             })?
         };
-        sqlx::query("INSERT OR IGNORE INTO worktree_holds (id, repository_key, task_id, reason, created_at) VALUES (?, ?, ?, ?, ?)")
+        let now = timestamp();
+        let created = sqlx::query("INSERT OR IGNORE INTO worktree_holds (id, repository_key, task_id, reason, created_at) VALUES (?, ?, ?, ?, ?)")
             .bind(WorktreeHoldId::new().to_string())
             .bind(submission.repository.root.to_string_lossy().as_ref())
             .bind(hold_task_id.to_string())
             .bind(reason)
-            .bind(timestamp())
+            .bind(&now)
             .execute(&mut *transaction)
             .await
-            .map_err(CoordinatorError::storage)?;
+            .map_err(CoordinatorError::storage)?
+            .rows_affected();
+        if created == 1 {
+            insert_supervisor_event(
+                &mut transaction,
+                SupervisorEventKind::WorktreeHoldCreated,
+                Some(hold_task_id),
+                None,
+                None,
+                &format!("hold:{hold_task_id}:{reason}"),
+                &format!("Repository Worktree Hold created: {reason}"),
+                &[],
+                DeliveryIntent::FollowUp,
+                &now,
+            )
+            .await?;
+        }
         if task.get::<&str, _>("state") == TaskState::Reviewing.as_str() {
-            revoke_unbound_result_dependencies(&mut transaction, task_id, &timestamp()).await?;
+            revoke_unbound_result_dependencies(&mut transaction, task_id, &now).await?;
         }
         transaction
             .commit()
@@ -3110,6 +3841,19 @@ impl Coordinator {
                 .execute(&mut *transaction)
                 .await
                 .map_err(CoordinatorError::storage)?;
+            insert_supervisor_event(
+                &mut transaction,
+                SupervisorEventKind::WorktreeHoldCreated,
+                Some(task_id),
+                None,
+                None,
+                &format!("hold:{task_id}:repository_observation_failed"),
+                "Repository Worktree Hold created after observation failure",
+                &[],
+                DeliveryIntent::FollowUp,
+                &now,
+            )
+            .await?;
         } else {
             sqlx::query("UPDATE worktree_leases SET released_at = ? WHERE task_id = ? AND released_at IS NULL")
                 .bind(&now)
@@ -3246,6 +3990,14 @@ impl Coordinator {
             &now,
         )
         .await?;
+        process_matching_supervisor_events(
+            &mut transaction,
+            SupervisorEventKind::ResultReady,
+            task_id,
+            Some(result_revision),
+            &now,
+        )
+        .await?;
         sqlx::query(
             "UPDATE worktree_leases SET released_at = ? WHERE task_id = ? AND released_at IS NULL",
         )
@@ -3313,6 +4065,10 @@ impl Coordinator {
         })
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "cancellation settlement atomically records Task, lease, Hold, and Supervisor event state"
+    )]
     async fn record_cancellation_completed(
         &self,
         actor: &AuthenticatedActor,
@@ -3375,16 +4131,34 @@ impl Coordinator {
         let submission: TaskSubmissionV1 =
             serde_json::from_str(task.get("submission_json")).map_err(CoordinatorError::storage)?;
         if submission.repository.access == RepositoryAccess::Mutating {
+            let reason = if succeeded {
+                "cancelled_after_dispatch"
+            } else {
+                "cancellation_failed"
+            };
             let repository_key = submission.repository.root.to_string_lossy().into_owned();
             sqlx::query("INSERT INTO worktree_holds (id, repository_key, task_id, reason, created_at) VALUES (?, ?, ?, ?, ?)")
                 .bind(WorktreeHoldId::new().to_string())
                 .bind(repository_key)
                 .bind(task_id.to_string())
-                .bind(if succeeded { "cancelled_after_dispatch" } else { "cancellation_failed" })
+                .bind(reason)
                 .bind(&now)
                 .execute(&mut *transaction)
                 .await
                 .map_err(CoordinatorError::storage)?;
+            insert_supervisor_event(
+                &mut transaction,
+                SupervisorEventKind::WorktreeHoldCreated,
+                Some(task_id),
+                None,
+                None,
+                &format!("hold:{task_id}:{reason}"),
+                &format!("Repository Worktree Hold created: {reason}"),
+                &[],
+                DeliveryIntent::FollowUp,
+                &now,
+            )
+            .await?;
         } else {
             sqlx::query("UPDATE worktree_leases SET released_at = ? WHERE task_id = ? AND released_at IS NULL")
                 .bind(&now)
@@ -3403,6 +4177,10 @@ impl Coordinator {
         })
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "ambiguous delivery, Session failure, Hold, and attention event settle atomically"
+    )]
     async fn mark_delivery_unknown(
         &self,
         actor: &AuthenticatedActor,
@@ -3445,7 +4223,7 @@ impl Coordinator {
             .await
             .map_err(CoordinatorError::storage)?;
         sqlx::query("UPDATE delivery_attempts SET state = 'unknown', provider_bytes_may_have_been_written = 1, evidence_json = ?, updated_at = ? WHERE id = ?")
-            .bind(serde_json::json!({"diagnostic": diagnostic}).to_string())
+            .bind(serde_json::json!({"diagnostic": &diagnostic}).to_string())
             .bind(&now)
             .bind(attempt.get::<&str, _>("id"))
             .execute(&mut *transaction)
@@ -3480,6 +4258,19 @@ impl Coordinator {
             &now,
         )
         .await?;
+        insert_supervisor_event(
+            &mut transaction,
+            SupervisorEventKind::DeliveryUnknown,
+            Some(task_id),
+            None,
+            Some(message_id),
+            &format!("delivery:{message_id}:unknown"),
+            &diagnostic,
+            &[],
+            DeliveryIntent::FollowUp,
+            &now,
+        )
+        .await?;
         let submission_json: String =
             sqlx::query_scalar("SELECT submission_json FROM tasks WHERE id = ?")
                 .bind(task_id.to_string())
@@ -3497,6 +4288,19 @@ impl Coordinator {
                 .execute(&mut *transaction)
                 .await
                 .map_err(CoordinatorError::storage)?;
+            insert_supervisor_event(
+                &mut transaction,
+                SupervisorEventKind::WorktreeHoldCreated,
+                Some(task_id),
+                None,
+                None,
+                &format!("hold:{task_id}:delivery_unknown"),
+                "Repository Worktree Hold created after ambiguous native delivery",
+                &[],
+                DeliveryIntent::FollowUp,
+                &now,
+            )
+            .await?;
         }
         transaction
             .commit()
@@ -3840,7 +4644,7 @@ impl Coordinator {
                 "only a Worker Host may report readiness",
             ));
         }
-        let changed = sqlx::query("UPDATE harness_sessions SET presence = 'online', activity = 'idle', last_seen_at = ? WHERE id = ? AND ended_at IS NULL AND presence = 'starting'")
+        let changed = sqlx::query("UPDATE harness_sessions SET presence = 'online', activity = 'idle', native_health = CASE WHEN native_health = 'ambiguous' THEN 'healthy' ELSE native_health END, tool_policy_digest = COALESCE(tool_policy_digest, profile_digest), effective_model = COALESCE(effective_model, (SELECT model FROM harnesses WHERE id = harness_sessions.harness_id)), last_seen_at = ? WHERE id = ? AND ended_at IS NULL AND presence = 'starting'")
             .bind(timestamp())
             .bind(actor.session_id.to_string())
             .execute(&self.pool)
@@ -3872,6 +4676,7 @@ impl Coordinator {
         native_session_id: Option<String>,
         native_thread_id: Option<String>,
         effective_model: Option<String>,
+        safe_compaction: bool,
         evidence: HarnessCompatibilityEvidenceV1,
     ) -> Result<CommandOutcome, CoordinatorError> {
         if actor.tier != HarnessTier::Worker {
@@ -3903,13 +4708,14 @@ impl Coordinator {
             ));
         }
         let changed = sqlx::query(
-            "UPDATE harness_sessions SET resolved_executable = ?, observed_version = ?, native_session_id = ?, native_thread_id = ?, effective_model = ?, compatibility_evidence_json = ?, last_seen_at = ? WHERE id = ? AND ended_at IS NULL AND presence = 'starting'",
+            "UPDATE harness_sessions SET resolved_executable = ?, observed_version = ?, native_session_id = ?, native_thread_id = ?, effective_model = ?, safe_compaction = ?, compatibility_evidence_json = ?, native_health = 'healthy', tool_policy_digest = profile_digest, last_seen_at = ? WHERE id = ? AND ended_at IS NULL AND presence = 'starting'",
         )
         .bind(resolved_executable.to_string_lossy().as_ref())
         .bind(observed_version)
         .bind(native_session_id)
         .bind(native_thread_id)
         .bind(effective_model)
+        .bind(i64::from(safe_compaction))
         .bind(evidence)
         .bind(timestamp())
         .bind(actor.session_id.to_string())
@@ -3924,6 +4730,524 @@ impl Coordinator {
             ));
         }
         Ok(CommandOutcome::HostCompatibilityRecorded)
+    }
+
+    async fn record_adapter_snapshot(
+        &self,
+        actor: &AuthenticatedActor,
+        snapshot: AdapterSnapshot,
+    ) -> Result<CommandOutcome, CoordinatorError> {
+        if snapshot
+            .context_percent
+            .is_some_and(|percent| !(0.0..=100.0).contains(&percent))
+        {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidInput,
+                "context_percent must be between zero and one hundred",
+            ));
+        }
+        let now = timestamp();
+        let context_tokens = snapshot
+            .context_tokens
+            .map(i64::try_from)
+            .transpose()
+            .map_err(CoordinatorError::storage)?;
+        let context_window = snapshot
+            .context_window
+            .map(i64::try_from)
+            .transpose()
+            .map_err(CoordinatorError::storage)?;
+        let changed = sqlx::query("UPDATE harness_sessions SET native_health = ?, context_tokens = ?, context_window = ?, context_percent = ?, compaction_count = ?, adapter_snapshot_json = ?, adapter_snapshot_at = ?, last_seen_at = ? WHERE id = ? AND ended_at IS NULL")
+            .bind(native_session_health_as_str(snapshot.native_health))
+            .bind(context_tokens)
+            .bind(context_window)
+            .bind(snapshot.context_percent)
+            .bind(snapshot.compaction_count.map(i64::from))
+            .bind(serde_json::to_string(&snapshot).map_err(CoordinatorError::storage)?)
+            .bind(&now)
+            .bind(&now)
+            .bind(actor.session_id.to_string())
+            .execute(&self.pool)
+            .await
+            .map_err(CoordinatorError::storage)?
+            .rows_affected();
+        if changed != 1 {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidState,
+                "Adapter snapshot requires a live Session",
+            ));
+        }
+        Ok(CommandOutcome::AdapterSnapshotRecorded)
+    }
+
+    async fn record_supervisor_binding(
+        &self,
+        actor: &AuthenticatedActor,
+        native_session_id: Option<String>,
+        native_thread_id: Option<String>,
+    ) -> Result<CommandOutcome, CoordinatorError> {
+        if actor.tier != HarnessTier::Supervisor {
+            return Err(CoordinatorError::new(
+                ErrorCategory::Forbidden,
+                "only the managed Supervisor Host may bind a native Supervisor Session",
+            ));
+        }
+        let mut transaction = self.pool.begin().await.map_err(CoordinatorError::storage)?;
+        let now = timestamp();
+        mark_unsettled_supervisor_delivery_unknown(
+            &mut transaction,
+            "managed Supervisor reconnected before native acceptance was recorded",
+            &now,
+        )
+        .await?;
+        let changed = sqlx::query("UPDATE harness_sessions SET native_session_id = ?, native_thread_id = ?, presence = 'online', activity = 'idle', native_health = 'healthy', last_seen_at = ? WHERE id = ? AND ended_at IS NULL")
+            .bind(native_session_id)
+            .bind(native_thread_id)
+            .bind(&now)
+            .bind(actor.session_id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?
+            .rows_affected();
+        if changed != 1 {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidState,
+                "Supervisor binding requires a live Coordinator Session",
+            ));
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(CoordinatorError::storage)?;
+        Ok(CommandOutcome::SupervisorBound)
+    }
+
+    async fn record_supervisor_disconnected(
+        &self,
+        actor: &AuthenticatedActor,
+        diagnostic: Option<String>,
+    ) -> Result<CommandOutcome, CoordinatorError> {
+        if actor.tier != HarnessTier::Supervisor {
+            return Err(CoordinatorError::new(
+                ErrorCategory::Forbidden,
+                "only the managed Supervisor Host may report Supervisor disconnection",
+            ));
+        }
+        if diagnostic
+            .as_ref()
+            .is_some_and(|value| value.len() > 16_384)
+        {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidInput,
+                "Supervisor disconnection diagnostic exceeds 16 KiB",
+            ));
+        }
+        let mut transaction = self.pool.begin().await.map_err(CoordinatorError::storage)?;
+        let now = timestamp();
+        mark_unsettled_supervisor_delivery_unknown(
+            &mut transaction,
+            diagnostic
+                .as_deref()
+                .unwrap_or("managed Supervisor disconnected during native dispatch"),
+            &now,
+        )
+        .await?;
+        let changed = sqlx::query("UPDATE harness_sessions SET presence = 'offline', activity = 'idle', native_health = 'ambiguous', adapter_snapshot_json = NULL, adapter_snapshot_at = NULL, last_seen_at = ? WHERE id = ? AND ended_at IS NULL")
+            .bind(&now)
+            .bind(actor.session_id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?
+            .rows_affected();
+        if changed != 1 {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidState,
+                "Supervisor disconnection requires a live Coordinator Session",
+            ));
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(CoordinatorError::storage)?;
+        Ok(CommandOutcome::SupervisorDisconnected)
+    }
+
+    async fn supervisor_events(&self) -> Result<Vec<SupervisorEventView>, CoordinatorError> {
+        let rows = sqlx::query("SELECT id, kind, task_id, result_revision, source_message_id, summary, attachments_json, delivery_intent, state, created_at FROM supervisor_events ORDER BY created_sequence")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        rows.iter().map(supervisor_event_view).collect()
+    }
+
+    async fn claim_next_supervisor_event(
+        &self,
+        actor: &AuthenticatedActor,
+    ) -> Result<CommandOutcome, CoordinatorError> {
+        let mut transaction = self.pool.begin().await.map_err(CoordinatorError::storage)?;
+        let in_flight: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM supervisor_events WHERE state IN ('dispatching','accepted','unknown')",
+        )
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(CoordinatorError::storage)?;
+        if in_flight != 0 {
+            return Ok(CommandOutcome::SupervisorEventClaimed { event: None });
+        }
+        let row = sqlx::query("SELECT id, kind, task_id, result_revision, source_message_id, summary, attachments_json, delivery_intent, state, created_at FROM supervisor_events WHERE state = 'pending' ORDER BY created_sequence LIMIT 1")
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        let Some(row) = row else {
+            return Ok(CommandOutcome::SupervisorEventClaimed { event: None });
+        };
+        let event = supervisor_event_view(&row)?;
+        let now = timestamp();
+        sqlx::query("UPDATE supervisor_events SET state = 'dispatching', updated_at = ? WHERE id = ? AND state = 'pending'")
+            .bind(&now)
+            .bind(event.id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        let attempt_number: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(attempt_number), 0) + 1 FROM supervisor_event_attempts WHERE event_id = ?")
+            .bind(event.id.to_string())
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        sqlx::query("INSERT INTO supervisor_event_attempts (id, event_id, attempt_number, target_session_id, state, provider_bytes_may_have_been_written, acceptance_evidence_json, created_at, updated_at) VALUES (?, ?, ?, ?, 'dispatching', 0, '{}', ?, ?)")
+            .bind(DeliveryAttemptId::new().to_string())
+            .bind(event.id.to_string())
+            .bind(attempt_number)
+            .bind(actor.session_id.to_string())
+            .bind(&now)
+            .bind(&now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        transaction
+            .commit()
+            .await
+            .map_err(CoordinatorError::storage)?;
+        Ok(CommandOutcome::SupervisorEventClaimed {
+            event: Some(SupervisorEventView {
+                state: SupervisorEventDeliveryState::Dispatching,
+                ..event
+            }),
+        })
+    }
+
+    async fn accept_supervisor_event(
+        &self,
+        actor: &AuthenticatedActor,
+        event_id: SupervisorEventId,
+        native_correlation: String,
+        evidence: String,
+    ) -> Result<CommandOutcome, CoordinatorError> {
+        if native_correlation.trim().is_empty() || evidence.trim().is_empty() {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidInput,
+                "native acceptance requires correlation and evidence",
+            ));
+        }
+        let mut transaction = self.pool.begin().await.map_err(CoordinatorError::storage)?;
+        let now = timestamp();
+        let changed = sqlx::query("UPDATE supervisor_events SET state = 'accepted', updated_at = ? WHERE id = ? AND state = 'dispatching'")
+            .bind(&now)
+            .bind(event_id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?
+            .rows_affected();
+        if changed != 1 {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidState,
+                "Supervisor event must be dispatching",
+            ));
+        }
+        sqlx::query("UPDATE supervisor_event_attempts SET state = 'accepted', native_correlation = ?, acceptance_evidence_json = ?, updated_at = ? WHERE event_id = ? AND target_session_id = ? AND state = 'dispatching'")
+            .bind(native_correlation)
+            .bind(serde_json::to_string(&json_evidence(&evidence)).map_err(CoordinatorError::storage)?)
+            .bind(&now)
+            .bind(event_id.to_string())
+            .bind(actor.session_id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        transaction
+            .commit()
+            .await
+            .map_err(CoordinatorError::storage)?;
+        Ok(CommandOutcome::SupervisorEventUpdated {
+            event_id,
+            state: SupervisorEventDeliveryState::Accepted,
+        })
+    }
+
+    async fn mark_supervisor_event_unknown(
+        &self,
+        event_id: SupervisorEventId,
+        diagnostic: String,
+    ) -> Result<CommandOutcome, CoordinatorError> {
+        if diagnostic.trim().is_empty() {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidInput,
+                "ambiguous injection requires a diagnostic",
+            ));
+        }
+        let mut transaction = self.pool.begin().await.map_err(CoordinatorError::storage)?;
+        let now = timestamp();
+        let changed = sqlx::query("UPDATE supervisor_events SET state = 'unknown', updated_at = ? WHERE id = ? AND state = 'dispatching'")
+            .bind(&now)
+            .bind(event_id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?
+            .rows_affected();
+        if changed != 1 {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidState,
+                "only a dispatching Supervisor event may become Unknown",
+            ));
+        }
+        sqlx::query("UPDATE supervisor_event_attempts SET state = 'unknown', provider_bytes_may_have_been_written = 1, acceptance_evidence_json = ?, updated_at = ? WHERE event_id = ? AND state = 'dispatching'")
+            .bind(serde_json::to_string(&json_evidence(&diagnostic)).map_err(CoordinatorError::storage)?)
+            .bind(&now)
+            .bind(event_id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        transaction
+            .commit()
+            .await
+            .map_err(CoordinatorError::storage)?;
+        Ok(CommandOutcome::SupervisorEventUpdated {
+            event_id,
+            state: SupervisorEventDeliveryState::Unknown,
+        })
+    }
+
+    async fn release_supervisor_event(
+        &self,
+        event_id: SupervisorEventId,
+        diagnostic: String,
+    ) -> Result<CommandOutcome, CoordinatorError> {
+        if diagnostic.trim().is_empty() {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidInput,
+                "retry-safe release requires a diagnostic",
+            ));
+        }
+        let mut transaction = self.pool.begin().await.map_err(CoordinatorError::storage)?;
+        let now = timestamp();
+        let changed = sqlx::query("UPDATE supervisor_events SET state = 'pending', updated_at = ? WHERE id = ? AND state = 'dispatching'")
+            .bind(&now)
+            .bind(event_id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?
+            .rows_affected();
+        if changed != 1 {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidState,
+                "only a dispatching event may be released",
+            ));
+        }
+        sqlx::query("UPDATE supervisor_event_attempts SET state = 'cancelled', acceptance_evidence_json = ?, updated_at = ? WHERE event_id = ? AND state = 'dispatching' AND provider_bytes_may_have_been_written = 0")
+            .bind(serde_json::to_string(&json_evidence(&diagnostic)).map_err(CoordinatorError::storage)?)
+            .bind(&now)
+            .bind(event_id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        transaction
+            .commit()
+            .await
+            .map_err(CoordinatorError::storage)?;
+        Ok(CommandOutcome::SupervisorEventUpdated {
+            event_id,
+            state: SupervisorEventDeliveryState::Pending,
+        })
+    }
+
+    async fn acknowledge_supervisor_events(
+        &self,
+        actor: &AuthenticatedActor,
+        event_ids: Vec<SupervisorEventId>,
+    ) -> Result<CommandOutcome, CoordinatorError> {
+        if event_ids.is_empty() || event_ids.len() > 32 {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidInput,
+                "event acknowledgement requires 1 to 32 IDs",
+            ));
+        }
+        let unique = event_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        if unique.len() != event_ids.len() {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidInput,
+                "event acknowledgement contains duplicate IDs",
+            ));
+        }
+        let mut transaction = self.pool.begin().await.map_err(CoordinatorError::storage)?;
+        let now = timestamp();
+        for event_id in &event_ids {
+            let source_message_id: Option<String> = sqlx::query_scalar("SELECT source_message_id FROM supervisor_events WHERE id = ? AND state IN ('pending','accepted')")
+                .bind(event_id.to_string())
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(CoordinatorError::storage)?
+                .flatten();
+            let changed = sqlx::query("UPDATE supervisor_events SET state = 'processed', processed_at = ?, updated_at = ? WHERE id = ? AND state IN ('pending','accepted')")
+                .bind(&now)
+                .bind(&now)
+                .bind(event_id.to_string())
+                .execute(&mut *transaction)
+                .await
+                .map_err(CoordinatorError::storage)?
+                .rows_affected();
+            if changed != 1 {
+                return Err(CoordinatorError::new(
+                    ErrorCategory::InvalidState,
+                    "event is not safely acknowledgeable",
+                ));
+            }
+            if let Some(message_id) = source_message_id {
+                sqlx::query("INSERT OR IGNORE INTO inbox_reads (harness_id, message_id, read_at) VALUES (?, ?, ?)")
+                    .bind(actor.id.as_str())
+                    .bind(message_id)
+                    .bind(&now)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(CoordinatorError::storage)?;
+            }
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(CoordinatorError::storage)?;
+        let event_id = event_ids[0];
+        Ok(CommandOutcome::SupervisorEventUpdated {
+            event_id,
+            state: SupervisorEventDeliveryState::Processed,
+        })
+    }
+
+    async fn reconcile_supervisor_event(
+        &self,
+        event_id: SupervisorEventId,
+        resolution: SupervisorEventResolution,
+        audit_note: String,
+    ) -> Result<CommandOutcome, CoordinatorError> {
+        if audit_note.trim().is_empty() || audit_note.len() > 4096 {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidInput,
+                "reconciliation audit note must contain 1 to 4096 bytes",
+            ));
+        }
+        let (state, processed_at) = match resolution {
+            SupervisorEventResolution::Retry => ("pending", None),
+            SupervisorEventResolution::Processed => ("processed", Some(timestamp())),
+            SupervisorEventResolution::Cancel => ("cancelled", None),
+        };
+        let now = timestamp();
+        let evidence = serde_json::to_string(&json_evidence(&audit_note))
+            .map_err(CoordinatorError::storage)?;
+        let mut transaction = self.pool.begin().await.map_err(CoordinatorError::storage)?;
+        let changed = sqlx::query("UPDATE supervisor_events SET state = ?, processed_at = ?, summary = summary || ' [reconciled]', updated_at = ? WHERE id = ? AND state = 'unknown'")
+            .bind(state)
+            .bind(processed_at)
+            .bind(&now)
+            .bind(event_id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?
+            .rows_affected();
+        if changed != 1 {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidState,
+                "only an Unknown Supervisor event may be reconciled",
+            ));
+        }
+        sqlx::query("UPDATE supervisor_event_attempts SET acceptance_evidence_json = ?, updated_at = ? WHERE event_id = ? AND attempt_number = (SELECT MAX(attempt_number) FROM supervisor_event_attempts WHERE event_id = ?)")
+            .bind(evidence)
+            .bind(&now)
+            .bind(event_id.to_string())
+            .bind(event_id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        transaction
+            .commit()
+            .await
+            .map_err(CoordinatorError::storage)?;
+        Ok(CommandOutcome::SupervisorEventUpdated {
+            event_id,
+            state: supervisor_event_state_from_str(state)?,
+        })
+    }
+
+    async fn watch_task_graph(
+        &self,
+        actor: &AuthenticatedActor,
+        root_task_ids: Vec<TaskId>,
+        request_key: Option<String>,
+    ) -> Result<CommandOutcome, CoordinatorError> {
+        if root_task_ids.is_empty() || root_task_ids.len() > 32 {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidInput,
+                "Task graph watch requires 1 to 32 root Tasks",
+            ));
+        }
+        let unique = root_task_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        if unique.len() != root_task_ids.len() {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidInput,
+                "Task graph watch contains duplicate roots",
+            ));
+        }
+        let mut transaction = self.pool.begin().await.map_err(CoordinatorError::storage)?;
+        for task_id in &root_task_ids {
+            let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE id = ?")
+                .bind(task_id.to_string())
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(CoordinatorError::storage)?;
+            if exists != 1 {
+                return Err(CoordinatorError::new(
+                    ErrorCategory::NotFound,
+                    format!("root Task {task_id} does not exist"),
+                ));
+            }
+        }
+        let watch_id = TaskGraphWatchId::new();
+        let now = timestamp();
+        sqlx::query("INSERT INTO task_graph_watches (id, supervisor_id, request_key, created_at) VALUES (?, ?, ?, ?)")
+            .bind(watch_id.to_string())
+            .bind(actor.id.as_str())
+            .bind(request_key)
+            .bind(&now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| CoordinatorError::new(ErrorCategory::Conflict, error.to_string()))?;
+        for task_id in root_task_ids {
+            sqlx::query("INSERT INTO task_graph_watch_roots (watch_id, task_id) VALUES (?, ?)")
+                .bind(watch_id.to_string())
+                .bind(task_id.to_string())
+                .execute(&mut *transaction)
+                .await
+                .map_err(CoordinatorError::storage)?;
+        }
+        complete_task_graph_watches(&mut transaction, &now).await?;
+        transaction
+            .commit()
+            .await
+            .map_err(CoordinatorError::storage)?;
+        Ok(CommandOutcome::TaskGraphWatchRegistered { watch_id })
     }
 
     #[expect(
@@ -3947,7 +5271,7 @@ impl Coordinator {
                 "Host failure diagnostic must contain 1 to 16,384 bytes",
             ));
         }
-        let active = sqlx::query("SELECT id, state, submission_json FROM tasks WHERE worker_id = ? AND state IN ('dispatching','working','waiting','cancelling','delivery_unknown') ORDER BY created_sequence LIMIT 1")
+        let active = sqlx::query("SELECT id, state, submission_json FROM tasks WHERE worker_id = ? AND state IN ('dispatching','working','waiting','reviewing','cancelling','delivery_unknown') ORDER BY created_sequence LIMIT 1")
             .bind(actor.id.as_str())
             .fetch_optional(&self.pool)
             .await
@@ -4015,6 +5339,19 @@ impl Coordinator {
                     .execute(&mut *transaction)
                     .await
                     .map_err(CoordinatorError::storage)?;
+                insert_supervisor_event(
+                    &mut transaction,
+                    SupervisorEventKind::WorktreeHoldCreated,
+                    Some(task_id),
+                    None,
+                    None,
+                    &format!("hold:{task_id}:worker_host_failed"),
+                    "Repository Worktree Hold created after Worker Host failure",
+                    &[],
+                    DeliveryIntent::FollowUp,
+                    &now,
+                )
+                .await?;
             } else {
                 sqlx::query("UPDATE worktree_leases SET released_at = ? WHERE task_id = ? AND released_at IS NULL")
                     .bind(&now)
@@ -4119,7 +5456,7 @@ impl Coordinator {
         capability: &SessionCapability,
     ) -> Result<AuthenticatedActor, CoordinatorError> {
         let row = sqlx::query(
-            "SELECT h.id, h.tier, s.id AS session_id FROM harness_sessions s JOIN harnesses h ON h.id = s.harness_id WHERE s.capability_hash = ? AND s.ended_at IS NULL AND s.presence IN ('starting', 'online', 'disconnected')",
+            "SELECT h.id, h.tier, s.id AS session_id FROM harness_sessions s JOIN harnesses h ON h.id = s.harness_id WHERE s.capability_hash = ? AND s.ended_at IS NULL AND s.presence IN ('starting', 'online', 'disconnected', 'offline')",
         )
         .bind(capability.digest())
         .fetch_optional(&self.pool)
@@ -4204,10 +5541,7 @@ fn validate_message_route(
 ) -> Result<(), CoordinatorError> {
     let valid = match (actor.tier, submission.kind) {
         (HarnessTier::Worker, MessageKind::Question) => {
-            actor.id == *worker_id
-                && recipient_tier == "supervisor"
-                && state == TaskState::Working
-                && submission.delivery == DeliveryIntent::FollowUp
+            actor.id == *worker_id && recipient_tier == "supervisor" && state == TaskState::Working
         }
         (HarnessTier::Worker, MessageKind::Notification) => {
             actor.id == *worker_id && recipient_tier == "supervisor"
@@ -4510,7 +5844,22 @@ async fn record_transition(
         .execute(&mut **transaction)
         .await
         .map_err(CoordinatorError::storage)?;
-    Ok(())
+    if to == TaskState::Failed {
+        insert_supervisor_event(
+            transaction,
+            SupervisorEventKind::TaskFailed,
+            Some(task_id),
+            None,
+            None,
+            &format!("task:{task_id}:failed"),
+            "Worker Task failed and requires Supervisor direction",
+            &[],
+            DeliveryIntent::FollowUp,
+            now,
+        )
+        .await?;
+    }
+    complete_task_graph_watches(transaction, now).await
 }
 
 fn require_state(actual: &str, expected: TaskState) -> Result<(), CoordinatorError> {
@@ -4558,6 +5907,12 @@ impl UuidIdentity for crate::contract::AttachmentId {
     }
 }
 
+impl UuidIdentity for SupervisorEventId {
+    fn from_uuid(uuid: Uuid) -> Self {
+        Self(uuid)
+    }
+}
+
 fn parse_uuid_id<T: UuidIdentity>(value: &str) -> Result<T, CoordinatorError> {
     Uuid::parse_str(value)
         .map(T::from_uuid)
@@ -4571,6 +5926,23 @@ fn task_view_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<TaskView, Coordin
         worker_id: HarnessId::from_str(row.get("worker_id")).map_err(CoordinatorError::storage)?,
         state: TaskState::from_str(row.get("state"))?,
         result_revision: u32::try_from(revision).map_err(CoordinatorError::storage)?,
+        task_role: task_role_from_str(row.get("task_role"))?,
+        requested_session_policy: session_reuse_policy_from_str(row.get("session_reuse_policy"))?,
+        effective_session_policy: row
+            .get::<Option<&str>, _>("effective_policy")
+            .map(session_reuse_policy_from_str)
+            .transpose()?,
+        harness_session_id: row
+            .get::<Option<&str>, _>("harness_session_id")
+            .map(parse_uuid_id)
+            .transpose()?,
+        session_reused: row.get::<Option<i64>, _>("reused").map(|value| value != 0),
+        session_decision_reason: row
+            .get::<Option<&str>, _>("decision_reason")
+            .map(str::to_owned),
+        context_percent: row
+            .get::<Option<f64>, _>("context_percent")
+            .map(|value| format!("{:.0}", value.clamp(0.0, 100.0))),
     })
 }
 
@@ -4869,7 +6241,168 @@ async fn cascade_failed_dependencies(
             }
         }
     }
+    complete_task_graph_watches(transaction, now).await
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "durable event identity, source, delivery, and payload are one atomic record"
+)]
+async fn insert_supervisor_event(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    kind: SupervisorEventKind,
+    task_id: Option<TaskId>,
+    result_revision: Option<u32>,
+    source_message_id: Option<MessageId>,
+    source_key: &str,
+    summary: &str,
+    attachments: &[crate::contract::AttachmentId],
+    delivery_intent: DeliveryIntent,
+    now: &str,
+) -> Result<SupervisorEventId, CoordinatorError> {
+    let event_id = SupervisorEventId::new();
+    let sequence = next_sequence(transaction, "supervisor_event").await?;
+    sqlx::query("INSERT OR IGNORE INTO supervisor_events (id, kind, task_id, result_revision, source_message_id, source_key, summary, attachments_json, delivery_intent, state, created_sequence, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)")
+        .bind(event_id.to_string())
+        .bind(supervisor_event_kind_as_str(kind))
+        .bind(task_id.map(|id| id.to_string()))
+        .bind(result_revision.map(i64::from))
+        .bind(source_message_id.map(|id| id.to_string()))
+        .bind(source_key)
+        .bind(summary)
+        .bind(serde_json::to_string(attachments).map_err(CoordinatorError::storage)?)
+        .bind(delivery_intent_name(delivery_intent))
+        .bind(sequence)
+        .bind(now)
+        .bind(now)
+        .execute(&mut **transaction)
+        .await
+        .map_err(CoordinatorError::storage)?;
+    Ok(event_id)
+}
+
+async fn mark_unsettled_supervisor_delivery_unknown(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    diagnostic: &str,
+    now: &str,
+) -> Result<(), CoordinatorError> {
+    let evidence =
+        serde_json::to_string(&json_evidence(diagnostic)).map_err(CoordinatorError::storage)?;
+    sqlx::query("UPDATE supervisor_event_attempts SET state = 'unknown', provider_bytes_may_have_been_written = 1, acceptance_evidence_json = ?, updated_at = ? WHERE state IN ('dispatching','accepted')")
+        .bind(evidence)
+        .bind(now)
+        .execute(&mut **transaction)
+        .await
+        .map_err(CoordinatorError::storage)?;
+    sqlx::query("UPDATE supervisor_events SET state = 'unknown', updated_at = ? WHERE state IN ('dispatching','accepted')")
+        .bind(now)
+        .execute(&mut **transaction)
+        .await
+        .map_err(CoordinatorError::storage)?;
     Ok(())
+}
+
+async fn process_matching_supervisor_events(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    kind: SupervisorEventKind,
+    task_id: TaskId,
+    result_revision: Option<u32>,
+    now: &str,
+) -> Result<(), CoordinatorError> {
+    let rows = sqlx::query("SELECT id, source_message_id FROM supervisor_events WHERE kind = ? AND task_id = ? AND (? IS NULL OR result_revision = ?) AND state IN ('pending','accepted')")
+        .bind(supervisor_event_kind_as_str(kind))
+        .bind(task_id.to_string())
+        .bind(result_revision.map(i64::from))
+        .bind(result_revision.map(i64::from))
+        .fetch_all(&mut **transaction)
+        .await
+        .map_err(CoordinatorError::storage)?;
+    for row in rows {
+        sqlx::query("UPDATE supervisor_events SET state = 'processed', processed_at = ?, updated_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(now)
+            .bind(row.get::<&str, _>("id"))
+            .execute(&mut **transaction)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        if let Some(message_id) = row.get::<Option<&str>, _>("source_message_id") {
+            sqlx::query("INSERT OR IGNORE INTO inbox_reads (harness_id, message_id, read_at) SELECT recipient_id, id, ? FROM messages WHERE id = ?")
+                .bind(now)
+                .bind(message_id)
+                .execute(&mut **transaction)
+                .await
+                .map_err(CoordinatorError::storage)?;
+        }
+    }
+    Ok(())
+}
+
+async fn complete_task_graph_watches(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    now: &str,
+) -> Result<(), CoordinatorError> {
+    let watches = sqlx::query_scalar::<_, String>("SELECT w.id FROM task_graph_watches w WHERE w.completed_at IS NULL AND NOT EXISTS (SELECT 1 FROM task_graph_watch_roots r JOIN tasks t ON t.id = r.task_id WHERE r.watch_id = w.id AND t.state NOT IN ('reviewing','approved','cancelled','failed')) ORDER BY w.created_at")
+        .fetch_all(&mut **transaction)
+        .await
+        .map_err(CoordinatorError::storage)?;
+    for watch_id in watches {
+        let changed = sqlx::query(
+            "UPDATE task_graph_watches SET completed_at = ? WHERE id = ? AND completed_at IS NULL",
+        )
+        .bind(now)
+        .bind(&watch_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(CoordinatorError::storage)?
+        .rows_affected();
+        if changed == 1 {
+            insert_supervisor_event(
+                transaction,
+                SupervisorEventKind::TaskGraphCompleted,
+                None,
+                None,
+                None,
+                &format!("graph:{watch_id}:completed"),
+                "All watched root Tasks reached review or a terminal state",
+                &[],
+                DeliveryIntent::FollowUp,
+                now,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+fn supervisor_event_view(row: &SqliteRow) -> Result<SupervisorEventView, CoordinatorError> {
+    let revision = row
+        .get::<Option<i64>, _>("result_revision")
+        .map(u32::try_from)
+        .transpose()
+        .map_err(CoordinatorError::storage)?;
+    Ok(SupervisorEventView {
+        id: parse_uuid_id(row.get("id"))?,
+        kind: supervisor_event_kind_from_str(row.get("kind"))?,
+        task_id: row
+            .get::<Option<&str>, _>("task_id")
+            .map(parse_uuid_id)
+            .transpose()?,
+        result_revision: revision,
+        source_message_id: row
+            .get::<Option<&str>, _>("source_message_id")
+            .map(parse_uuid_id)
+            .transpose()?,
+        summary: row.get("summary"),
+        attachments: serde_json::from_str(row.get("attachments_json"))
+            .map_err(CoordinatorError::storage)?,
+        delivery_intent: delivery_intent_from_str(row.get("delivery_intent"))?,
+        state: supervisor_event_state_from_str(row.get("state"))?,
+        created_at: row.get("created_at"),
+    })
+}
+
+fn json_evidence(text: &str) -> Value {
+    serde_json::json!({"text": text})
 }
 
 async fn validate_acyclic_task_graph(
@@ -4934,6 +6467,134 @@ fn delivery_intent_name(intent: DeliveryIntent) -> &'static str {
     match intent {
         DeliveryIntent::FollowUp => "follow_up",
         DeliveryIntent::Steer => "steer",
+    }
+}
+
+fn delivery_intent_from_str(value: &str) -> Result<DeliveryIntent, CoordinatorError> {
+    match value {
+        "follow_up" => Ok(DeliveryIntent::FollowUp),
+        "steer" => Ok(DeliveryIntent::Steer),
+        _ => Err(CoordinatorError::new(
+            ErrorCategory::StorageFailure,
+            format!("unknown delivery intent `{value}`"),
+        )),
+    }
+}
+
+fn supervisor_event_kind_as_str(kind: SupervisorEventKind) -> &'static str {
+    match kind {
+        SupervisorEventKind::ResultReady => "result_ready",
+        SupervisorEventKind::BlockingQuestion => "blocking_question",
+        SupervisorEventKind::TaskFailed => "task_failed",
+        SupervisorEventKind::DeliveryUnknown => "delivery_unknown",
+        SupervisorEventKind::WorktreeHoldCreated => "worktree_hold_created",
+        SupervisorEventKind::TaskGraphCompleted => "task_graph_completed",
+        SupervisorEventKind::Notification => "notification",
+    }
+}
+
+fn supervisor_event_kind_from_str(value: &str) -> Result<SupervisorEventKind, CoordinatorError> {
+    match value {
+        "result_ready" => Ok(SupervisorEventKind::ResultReady),
+        "blocking_question" => Ok(SupervisorEventKind::BlockingQuestion),
+        "task_failed" => Ok(SupervisorEventKind::TaskFailed),
+        "delivery_unknown" => Ok(SupervisorEventKind::DeliveryUnknown),
+        "worktree_hold_created" => Ok(SupervisorEventKind::WorktreeHoldCreated),
+        "task_graph_completed" => Ok(SupervisorEventKind::TaskGraphCompleted),
+        "notification" => Ok(SupervisorEventKind::Notification),
+        _ => Err(CoordinatorError::new(
+            ErrorCategory::StorageFailure,
+            format!("unknown Supervisor event kind `{value}`"),
+        )),
+    }
+}
+
+fn supervisor_event_state_from_str(
+    value: &str,
+) -> Result<SupervisorEventDeliveryState, CoordinatorError> {
+    match value {
+        "pending" => Ok(SupervisorEventDeliveryState::Pending),
+        "dispatching" => Ok(SupervisorEventDeliveryState::Dispatching),
+        "accepted" => Ok(SupervisorEventDeliveryState::Accepted),
+        "processed" => Ok(SupervisorEventDeliveryState::Processed),
+        "unknown" => Ok(SupervisorEventDeliveryState::Unknown),
+        "cancelled" => Ok(SupervisorEventDeliveryState::Cancelled),
+        _ => Err(CoordinatorError::new(
+            ErrorCategory::StorageFailure,
+            format!("unknown Supervisor event state `{value}`"),
+        )),
+    }
+}
+
+fn task_role_as_str(role: TaskRole) -> &'static str {
+    match role {
+        TaskRole::Implementation => "implementation",
+        TaskRole::Investigation => "investigation",
+        TaskRole::Review => "review",
+        TaskRole::Verification => "verification",
+        TaskRole::Other => "other",
+    }
+}
+
+fn task_role_from_str(value: &str) -> Result<TaskRole, CoordinatorError> {
+    match value {
+        "implementation" => Ok(TaskRole::Implementation),
+        "investigation" => Ok(TaskRole::Investigation),
+        "review" => Ok(TaskRole::Review),
+        "verification" => Ok(TaskRole::Verification),
+        "other" => Ok(TaskRole::Other),
+        _ => Err(CoordinatorError::new(
+            ErrorCategory::StorageFailure,
+            format!("unknown Task role `{value}`"),
+        )),
+    }
+}
+
+fn session_reuse_policy_as_str(policy: SessionReusePolicy) -> &'static str {
+    match policy {
+        SessionReusePolicy::Required => "required",
+        SessionReusePolicy::Prefer => "prefer",
+        SessionReusePolicy::Fresh => "fresh",
+        SessionReusePolicy::Auto => "auto",
+    }
+}
+
+fn session_reuse_policy_from_str(value: &str) -> Result<SessionReusePolicy, CoordinatorError> {
+    match value {
+        "required" => Ok(SessionReusePolicy::Required),
+        "prefer" => Ok(SessionReusePolicy::Prefer),
+        "fresh" => Ok(SessionReusePolicy::Fresh),
+        "auto" => Ok(SessionReusePolicy::Auto),
+        _ => Err(CoordinatorError::new(
+            ErrorCategory::StorageFailure,
+            format!("unknown Session reuse policy `{value}`"),
+        )),
+    }
+}
+
+fn native_session_health_as_str(health: crate::contract::NativeSessionHealth) -> &'static str {
+    match health {
+        crate::contract::NativeSessionHealth::Healthy => "healthy",
+        crate::contract::NativeSessionHealth::ContextPressure => "context_pressure",
+        crate::contract::NativeSessionHealth::Compacted => "compacted",
+        crate::contract::NativeSessionHealth::Ambiguous => "ambiguous",
+        crate::contract::NativeSessionHealth::Failed => "failed",
+    }
+}
+
+fn native_session_health_from_str(
+    value: &str,
+) -> Result<crate::contract::NativeSessionHealth, CoordinatorError> {
+    match value {
+        "healthy" => Ok(crate::contract::NativeSessionHealth::Healthy),
+        "context_pressure" => Ok(crate::contract::NativeSessionHealth::ContextPressure),
+        "compacted" => Ok(crate::contract::NativeSessionHealth::Compacted),
+        "ambiguous" => Ok(crate::contract::NativeSessionHealth::Ambiguous),
+        "failed" => Ok(crate::contract::NativeSessionHealth::Failed),
+        _ => Err(CoordinatorError::new(
+            ErrorCategory::StorageFailure,
+            format!("unknown native Session health `{value}`"),
+        )),
     }
 }
 

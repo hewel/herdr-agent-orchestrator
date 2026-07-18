@@ -139,6 +139,14 @@ uuid_id!(
     WorktreeHoldId,
     "A durable repository scheduling block identity."
 );
+uuid_id!(
+    SupervisorEventId,
+    "A durable Supervisor-attention event identity."
+);
+uuid_id!(
+    TaskGraphWatchId,
+    "A durable set of root Tasks awaiting attention."
+);
 
 /// Native Harness implementation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -409,6 +417,36 @@ pub struct TaskDependencyV1 {
     pub failure_policy: DependencyFailurePolicy,
 }
 
+/// Semantic purpose used by conservative automatic Session selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskRole {
+    /// Product or infrastructure implementation work.
+    Implementation,
+    /// Discovery work whose context may benefit a later implementation.
+    Investigation,
+    /// Independent assessment of another Task's Result.
+    Review,
+    /// Independent execution of acceptance checks.
+    Verification,
+    /// Work without a more specific scheduling role.
+    Other,
+}
+
+/// Requested relationship between a Task and a native Worker Session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionReusePolicy {
+    /// The Task must continue in the preferred existing Session.
+    Required,
+    /// Reuse compatible healthy context when available.
+    Prefer,
+    /// Start a new native Session.
+    Fresh,
+    /// Apply conservative role- and relationship-aware defaults.
+    Auto,
+}
+
 /// Public bounded Task request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -424,6 +462,12 @@ pub struct TaskSubmissionV1 {
     /// Immutable scheduling dependencies, distinct from informational relation.
     #[serde(default)]
     pub depends_on: Vec<TaskDependencyV1>,
+    /// Semantic purpose used by conservative automatic Session reuse.
+    pub task_role: TaskRole,
+    /// Explicit native Session reuse policy.
+    pub session_reuse: SessionReusePolicy,
+    /// Preferred existing Coordinator Session; required by `required` reuse.
+    pub preferred_session_id: Option<HarnessSessionId>,
     /// Short Task title.
     pub title: String,
     /// Full bounded instructions.
@@ -450,8 +494,76 @@ impl Validate for TaskSubmissionV1 {
         if unique_dependencies.len() != self.depends_on.len() {
             return field_error("depends_on", "contains repeated upstream Tasks");
         }
+        if self.session_reuse == SessionReusePolicy::Required && self.preferred_session_id.is_none()
+        {
+            return field_error(
+                "preferred_session_id",
+                "is required when session_reuse is required",
+            );
+        }
         self.repository.validate()
     }
+}
+
+/// Durable native Session selection recorded independently from Task lifecycle.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskSessionBinding {
+    pub task_id: TaskId,
+    pub harness_session_id: HarnessSessionId,
+    pub reuse_policy: SessionReusePolicy,
+    pub reused: bool,
+    pub decision_reason: String,
+    pub bound_at: DateTime<Utc>,
+}
+
+/// Native health evidence used only after identity and policy compatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeSessionHealth {
+    Healthy,
+    ContextPressure,
+    Compacted,
+    Ambiguous,
+    Failed,
+}
+
+/// Durable event that may wake the visible Supervisor Harness.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorEvent {
+    pub id: SupervisorEventId,
+    pub kind: SupervisorEventKind,
+    pub task_id: Option<TaskId>,
+    pub result_revision: Option<u32>,
+    pub summary: String,
+    pub attachments: Vec<AttachmentId>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Events important enough to require Supervisor attention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SupervisorEventKind {
+    ResultReady,
+    BlockingQuestion,
+    TaskFailed,
+    DeliveryUnknown,
+    WorktreeHoldCreated,
+    TaskGraphCompleted,
+    Notification,
+}
+
+/// At-least-once native delivery state for a durable Supervisor event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SupervisorEventDeliveryState {
+    Pending,
+    Dispatching,
+    Accepted,
+    Processed,
+    Unknown,
+    Cancelled,
 }
 
 /// Purpose of a public Bus Message submission.
@@ -502,6 +614,8 @@ pub struct MessageSubmissionV1 {
     /// Explicit delivery intent.
     #[serde(default)]
     pub delivery: DeliveryIntent,
+    /// Required justification when native steering would interrupt active work.
+    pub steer_reason: Option<String>,
 }
 
 impl Validate for MessageSubmissionV1 {
@@ -515,6 +629,16 @@ impl Validate for MessageSubmissionV1 {
         }
         if (self.kind == MessageKind::Reply) != self.reply_to.is_some() {
             return field_error("reply_to", "is required only for Reply");
+        }
+        if self.delivery == DeliveryIntent::Steer {
+            validate_text(
+                "steer_reason",
+                self.steer_reason.as_deref().unwrap_or_default(),
+                1024,
+                usize::MAX,
+            )?;
+        } else if self.steer_reason.is_some() {
+            return field_error("steer_reason", "is valid only when delivery is steer");
         }
         Ok(())
     }

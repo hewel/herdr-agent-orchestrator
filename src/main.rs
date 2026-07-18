@@ -22,6 +22,7 @@ use herdr_harness_coordinator::{
         ActorContext, CommandOutcome, Coordinator, CoordinatorCommand, CoordinatorQuery,
         HarnessStatusView, QueryResult, SessionCapability,
     },
+    herdr::{HerdrSocketClient, PluginPaneOpenParams},
     mcp::McpServer,
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -69,6 +70,18 @@ enum Command {
         /// Opaque Session capability passed by the Herdr Worker pane launch.
         #[arg(long)]
         session_id: String,
+        /// Durable plugin state directory.
+        #[arg(long, env = "HERDR_PLUGIN_STATE_DIR")]
+        state_dir: PathBuf,
+        /// Broker Unix socket; defaults beneath the state directory.
+        #[arg(long, env = "HERDR_COORDINATOR_SOCKET")]
+        socket: Option<PathBuf>,
+    },
+    /// Run the managed visible Supervisor terminal and native Harness.
+    SupervisorHost {
+        /// Opaque capability for the sole durable Supervisor Session.
+        #[arg(long, env = "HERDR_SUPERVISOR_CAPABILITY")]
+        supervisor_capability: String,
         /// Durable plugin state directory.
         #[arg(long, env = "HERDR_PLUGIN_STATE_DIR")]
         state_dir: PathBuf,
@@ -184,6 +197,23 @@ async fn main() -> Result<()> {
             let socket = socket.unwrap_or_else(|| state_dir.join("coordinator.sock"));
             herdr_harness_coordinator::host::run_worker_host(&socket, &state_dir, session_id).await
         }
+        Command::SupervisorHost {
+            supervisor_capability,
+            state_dir,
+            socket,
+        } => {
+            let socket = socket.unwrap_or_else(|| state_dir.join("coordinator.sock"));
+            let pid_path = state_dir.join("supervisor-host.pid");
+            tokio::fs::write(&pid_path, std::process::id().to_string()).await?;
+            let result = herdr_harness_coordinator::supervisor_host::run_managed_supervisor_host(
+                &state_dir,
+                &socket,
+                supervisor_capability,
+            )
+            .await;
+            remove_file_if_present(&pid_path).await?;
+            result
+        }
         Command::Popup {
             supervisor_capability,
             state_dir,
@@ -298,6 +328,10 @@ async fn run_workspace(state_dir: PathBuf, command: WorkspaceCommand) -> Result<
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "workspace activation keeps daemon, managed Supervisor, and explicit Worker startup ordered"
+)]
 async fn activate_workspace(
     registry: &ActivationRegistry,
     identity: &WorkspaceIdentity,
@@ -354,6 +388,42 @@ async fn activate_workspace(
         let pid = child.id().context("workspace daemon has no process ID")?;
         tokio::fs::write(view.state_dir.join("coordinator.pid"), pid.to_string()).await?;
         wait_for_path(&socket, Duration::from_secs(10)).await?;
+    }
+    let supervisor_pid = view.state_dir.join("supervisor-host.pid");
+    let supervisor_live = if supervisor_pid.exists() {
+        let pid = std::fs::read_to_string(&supervisor_pid)?;
+        PathBuf::from(format!("/proc/{}", pid.trim())).exists()
+    } else {
+        false
+    };
+    if !supervisor_live {
+        remove_file_if_present(&supervisor_pid).await?;
+        let bearer = serde_json::to_value(&capability)?
+            .as_str()
+            .context("Supervisor capability did not serialize as text")?
+            .to_owned();
+        let mut pane = PluginPaneOpenParams::supervisor(
+            &bearer,
+            &view.repository_root,
+            Some(view.workspace_id.clone()),
+        );
+        pane.env.insert(
+            "HERDR_PLUGIN_STATE_DIR".to_owned(),
+            view.state_dir.to_string_lossy().into_owned(),
+        );
+        pane.env.insert(
+            "HERDR_COORDINATOR_SOCKET".to_owned(),
+            socket.to_string_lossy().into_owned(),
+        );
+        pane.env.insert(
+            "HERDR_COORDINATOR_BIN".to_owned(),
+            std::env::current_exe()?.to_string_lossy().into_owned(),
+        );
+        HerdrSocketClient::new(identity.session_socket().to_path_buf())
+            .open_worker(pane)
+            .await
+            .context("opening managed Supervisor pane")?;
+        wait_for_path(&supervisor_pid, Duration::from_secs(10)).await?;
     }
     let server = McpServer::for_workspace(socket, capability.clone(), view.state_dir.clone())
         .with_herdr_socket(identity.session_socket().to_path_buf());

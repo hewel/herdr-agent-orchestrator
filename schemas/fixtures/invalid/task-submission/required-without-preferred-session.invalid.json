@@ -2,13 +2,13 @@
   "schema_version": 1,
   "worker_id": "omp-worker",
   "task_role": "implementation",
-  "session_reuse": "auto",
-  "title": "Mutate without declared scope",
-  "instructions": "This fixture must fail scope validation.",
+  "session_reuse": "required",
+  "title": "Require a missing preferred Session",
+  "instructions": "This fixture must fail the required-reuse rule.",
   "attachments": [],
   "repository": {
     "root": "/workspace/project",
-    "access": "mutating",
+    "access": "read_only",
     "write_scopes": []
   }
 }

@@ -1,11 +1,13 @@
 use std::path::PathBuf;
 
 use herdr_harness_coordinator::{
+    adapter::{AdapterLifecycle, AdapterSnapshot},
     contract::{
         AttachmentId, DeliveryIntent, DependencyCondition, DependencyFailurePolicy,
         HarnessDefinitionV1, HarnessId, HarnessKind, HarnessTier, MessageKind, MessageSubmissionV1,
-        ObservationCheckpoint, RepositoryAccess, ResultManifestV1, SCHEMA_VERSION,
-        TaskDependencyV1, TaskId, TaskRepositoryAuthorityV1, TaskSubmissionV1,
+        NativeSessionHealth, ObservationCheckpoint, RepositoryAccess, ResultManifestV1,
+        SCHEMA_VERSION, SessionReusePolicy, SupervisorEventDeliveryState, SupervisorEventKind,
+        TaskDependencyV1, TaskId, TaskRepositoryAuthorityV1, TaskRole, TaskSubmissionV1,
         VerificationResultV1, WriteScopeV1,
     },
     core::{
@@ -44,7 +46,9 @@ async fn supervisor_registration_makes_the_harness_queryable() {
 
     let result = coordinator
         .query(
-            ActorContext::Session { capability },
+            ActorContext::Session {
+                capability: capability.clone(),
+            },
             CoordinatorQuery::ListHarnesses,
         )
         .await
@@ -57,6 +61,58 @@ async fn supervisor_registration_makes_the_harness_queryable() {
         harnesses,
         vec!["supervisor".parse().expect("ID must be valid")]
     );
+
+    assert!(matches!(
+        coordinator
+            .execute(
+                ActorContext::Session {
+                    capability: capability.clone(),
+                },
+                CoordinatorCommand::RecordSupervisorBinding {
+                    native_session_id: Some("native-supervisor".to_owned()),
+                    native_thread_id: Some("thread-1".to_owned()),
+                },
+            )
+            .await
+            .expect("managed Supervisor must bind"),
+        CommandOutcome::SupervisorBound
+    ));
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: capability.clone(),
+            },
+            CoordinatorCommand::RecordAdapterSnapshot {
+                snapshot: AdapterSnapshot {
+                    lifecycle: AdapterLifecycle::Idle,
+                    session_id: Some("native-supervisor".to_owned()),
+                    thread_id: Some("thread-1".to_owned()),
+                    active_turn_id: None,
+                    steerable: false,
+                    queued_input_count: Some(0),
+                    model: Some("gpt-5.4".to_owned()),
+                    native_health: NativeSessionHealth::Healthy,
+                    context_tokens: Some(1_024),
+                    context_window: Some(128_000),
+                    context_percent: Some(0.8),
+                    compaction_count: Some(0),
+                },
+            },
+        )
+        .await
+        .expect("Supervisor snapshot must persist");
+    assert!(matches!(
+        coordinator
+            .execute(
+                ActorContext::Session { capability },
+                CoordinatorCommand::RecordSupervisorDisconnected {
+                    diagnostic: Some("pane closed".to_owned()),
+                },
+            )
+            .await
+            .expect("Supervisor disconnection must persist"),
+        CommandOutcome::SupervisorDisconnected
+    ));
 }
 
 #[tokio::test]
@@ -69,6 +125,9 @@ async fn request_keys_replay_original_outcomes_and_reject_changed_payloads() {
         worker_id: worker_id.clone(),
         related_task_id: None,
         depends_on: Vec::new(),
+        task_role: TaskRole::Other,
+        session_reuse: SessionReusePolicy::Auto,
+        preferred_session_id: None,
         title: "Idempotent task".to_owned(),
         instructions: "Prove that task retries return the original outcome.".to_owned(),
         attachments: Vec::new(),
@@ -146,6 +205,9 @@ async fn dependent_tasks_are_persisted_blocked_and_exposed_by_the_graph_query() 
                         condition: DependencyCondition::Approved,
                         failure_policy: DependencyFailurePolicy::Cancel,
                     }],
+                    task_role: TaskRole::Implementation,
+                    session_reuse: SessionReusePolicy::Auto,
+                    preferred_session_id: None,
                     title: "Use the approved implementation".to_owned(),
                     instructions: "Run only after the upstream implementation is approved."
                         .to_owned(),
@@ -239,6 +301,9 @@ async fn missing_dependency_is_rejected_without_committing_the_task() {
                         condition: DependencyCondition::Approved,
                         failure_policy: DependencyFailurePolicy::Cancel,
                     }],
+                    task_role: TaskRole::Other,
+                    session_reuse: SessionReusePolicy::Auto,
+                    preferred_session_id: None,
                     title: "Invalid dependency".to_owned(),
                     instructions: "This Task must not be committed to durable state.".to_owned(),
                     attachments: Vec::new(),
@@ -534,6 +599,21 @@ async fn result_ready_rebinds_before_dispatch_and_dispatch_freezes_the_revision(
         )
         .await
         .expect("FIFO head must dispatch");
+    let QueryResult::Task(reused_task) = coordinator
+        .query(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorQuery::GetTask {
+                task_id: result_ready_task,
+            },
+        )
+        .await
+        .expect("related Task binding must be queryable")
+    else {
+        panic!("query must return the related Task")
+    };
+    assert_eq!(reused_task.session_reused, Some(true));
     let QueryResult::ResolvedTaskInput(input) = coordinator
         .query(
             ActorContext::Session {
@@ -564,6 +644,7 @@ async fn taskless_notifications_remain_on_the_supervisor_worker_star() {
         attachments: Vec::new(),
         reply_to: None,
         delivery: DeliveryIntent::FollowUp,
+        steer_reason: None,
     };
     let first = coordinator
         .execute(
@@ -604,6 +685,7 @@ async fn taskless_notifications_remain_on_the_supervisor_worker_star() {
                     attachments: Vec::new(),
                     reply_to: None,
                     delivery: DeliveryIntent::FollowUp,
+                    steer_reason: None,
                 },
             },
         )
@@ -957,6 +1039,121 @@ async fn question_reply_result_and_correction_follow_the_v1_lifecycle() {
         panic!("Question must become a Message")
     };
     assert_task_state(&coordinator, &supervisor, task_id, TaskState::Waiting, 0).await;
+    let QueryResult::SupervisorEvents(events) = coordinator
+        .query(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorQuery::SupervisorEvents,
+        )
+        .await
+        .expect("Supervisor event query must succeed")
+    else {
+        panic!("query must return Supervisor events")
+    };
+    assert_eq!(events[0].kind, SupervisorEventKind::BlockingQuestion);
+    assert_eq!(events[0].state, SupervisorEventDeliveryState::Pending);
+    let question_event_id = events[0].id;
+    let CommandOutcome::SupervisorEventClaimed { event: Some(event) } = coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorCommand::ClaimNextSupervisorEvent,
+        )
+        .await
+        .expect("managed Supervisor Host must claim FIFO attention")
+    else {
+        panic!("claim must return the blocking Question")
+    };
+    assert_eq!(event.id, question_event_id);
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorCommand::RecordSupervisorDisconnected {
+                diagnostic: Some("connection lost after FIFO claim".to_owned()),
+            },
+        )
+        .await
+        .expect("disconnect must conservatively strand the claim as Unknown");
+    let QueryResult::SupervisorEvents(events) = coordinator
+        .query(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorQuery::SupervisorEvents,
+        )
+        .await
+        .expect("Unknown event must remain durable")
+    else {
+        panic!("query must return Supervisor events")
+    };
+    assert_eq!(events[0].state, SupervisorEventDeliveryState::Unknown);
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorCommand::RecordSupervisorBinding {
+                native_session_id: Some("reconnected-supervisor".to_owned()),
+                native_thread_id: Some("reconnected-thread".to_owned()),
+            },
+        )
+        .await
+        .expect("Supervisor must rebind without replaying Unknown delivery");
+    assert!(matches!(
+        coordinator
+            .execute(
+                ActorContext::Session {
+                    capability: supervisor.clone(),
+                },
+                CoordinatorCommand::ClaimNextSupervisorEvent,
+            )
+            .await
+            .expect("Unknown event must block FIFO"),
+        CommandOutcome::SupervisorEventClaimed { event: None }
+    ));
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorCommand::ReconcileSupervisorEvent {
+                event_id: question_event_id,
+                resolution: herdr_harness_coordinator::core::SupervisorEventResolution::Retry,
+                audit_note: "provider confirmed no model turn started".to_owned(),
+            },
+        )
+        .await
+        .expect("explicit reconciliation may make the event retryable");
+    let CommandOutcome::SupervisorEventClaimed { event: Some(event) } = coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorCommand::ClaimNextSupervisorEvent,
+        )
+        .await
+        .expect("reconciled event must be claimable")
+    else {
+        panic!("reconciled claim must return the blocking Question")
+    };
+    assert_eq!(event.id, question_event_id);
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorCommand::AcceptSupervisorEvent {
+                event_id: question_event_id,
+                native_correlation: question_event_id.to_string(),
+                evidence: "OMP follow_up accepted".to_owned(),
+            },
+        )
+        .await
+        .expect("native acceptance must remain distinct from processing");
 
     let mut reply = message(
         "omp-worker",
@@ -980,6 +1177,19 @@ async fn question_reply_result_and_correction_follow_the_v1_lifecycle() {
     else {
         panic!("Reply must become a Message")
     };
+    let QueryResult::SupervisorEvents(events) = coordinator
+        .query(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorQuery::SupervisorEvents,
+        )
+        .await
+        .expect("Reply must update source event")
+    else {
+        panic!("query must return Supervisor events")
+    };
+    assert_eq!(events[0].state, SupervisorEventDeliveryState::Processed);
     assert_task_state(&coordinator, &supervisor, task_id, TaskState::Waiting, 0).await;
     coordinator
         .execute(
@@ -1022,6 +1232,32 @@ async fn question_reply_result_and_correction_follow_the_v1_lifecycle() {
         .await
         .expect("successful terminal evidence must make Result reviewable");
     assert_task_state(&coordinator, &supervisor, task_id, TaskState::Reviewing, 0).await;
+    let QueryResult::SupervisorEvents(events) = coordinator
+        .query(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorQuery::SupervisorEvents,
+        )
+        .await
+        .expect("Result event must be queryable")
+    else {
+        panic!("query must return Supervisor events")
+    };
+    assert_eq!(events[1].kind, SupervisorEventKind::ResultReady);
+    assert_eq!(events[1].state, SupervisorEventDeliveryState::Pending);
+    let QueryResult::Task(task_before_correction) = coordinator
+        .query(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorQuery::GetTask { task_id },
+        )
+        .await
+        .expect("Task binding must be queryable")
+    else {
+        panic!("query must return the Task")
+    };
 
     let CommandOutcome::MessageCreated {
         message_id: correction_id,
@@ -1045,6 +1281,19 @@ async fn question_reply_result_and_correction_follow_the_v1_lifecycle() {
     else {
         panic!("Correction must become a Message")
     };
+    let QueryResult::SupervisorEvents(events) = coordinator
+        .query(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorQuery::SupervisorEvents,
+        )
+        .await
+        .expect("Correction must process source Result event")
+    else {
+        panic!("query must return Supervisor events")
+    };
+    assert_eq!(events[1].state, SupervisorEventDeliveryState::Processed);
     assert_task_state(&coordinator, &supervisor, task_id, TaskState::Reviewing, 0).await;
     coordinator
         .execute(
@@ -1059,6 +1308,22 @@ async fn question_reply_result_and_correction_follow_the_v1_lifecycle() {
         .await
         .expect("accepted Correction must start the next Result revision");
     assert_task_state(&coordinator, &supervisor, task_id, TaskState::Working, 1).await;
+    let QueryResult::Task(task_after_correction) = coordinator
+        .query(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorQuery::GetTask { task_id },
+        )
+        .await
+        .expect("corrected Task binding must be queryable")
+    else {
+        panic!("query must return the Task")
+    };
+    assert_eq!(
+        task_after_correction.harness_session_id,
+        task_before_correction.harness_session_id
+    );
 
     coordinator
         .execute(
@@ -1144,6 +1409,52 @@ async fn queued_cancellation_is_terminal_without_native_dispatch() {
         0,
     )
     .await;
+}
+
+#[tokio::test]
+async fn graph_watch_emits_once_when_all_roots_become_terminal() {
+    let (_state, coordinator, supervisor, _worker, task_id) = seeded_task().await;
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorCommand::WatchTaskGraph {
+                root_task_ids: vec![task_id],
+                request_key: Some("watch-root".to_owned()),
+            },
+        )
+        .await
+        .expect("watch registration must succeed");
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorCommand::CancelTask { task_id },
+        )
+        .await
+        .expect("queued root cancellation must settle");
+    let QueryResult::SupervisorEvents(events) = coordinator
+        .query(
+            ActorContext::Session {
+                capability: supervisor,
+            },
+            CoordinatorQuery::SupervisorEvents,
+        )
+        .await
+        .expect("completion event must be queryable")
+    else {
+        panic!("query must return Supervisor events")
+    };
+
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == SupervisorEventKind::TaskGraphCompleted)
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -1479,6 +1790,9 @@ async fn supervisor_can_queue_a_mutating_task_for_an_explicit_worker() {
         worker_id,
         related_task_id: None,
         depends_on: Vec::new(),
+        task_role: TaskRole::Implementation,
+        session_reuse: SessionReusePolicy::Auto,
+        preferred_session_id: None,
         title: "Implement bounded change".to_owned(),
         instructions: "Change only src/lib.rs and report verification.".to_owned(),
         attachments: Vec::new(),
@@ -1612,6 +1926,9 @@ async fn seeded_task() -> (
                     worker_id,
                     related_task_id: None,
                     depends_on: Vec::new(),
+                    task_role: TaskRole::Other,
+                    session_reuse: SessionReusePolicy::Auto,
+                    preferred_session_id: None,
                     title: "Lifecycle proof".to_owned(),
                     instructions: "Exercise the durable lifecycle.".to_owned(),
                     attachments: Vec::new(),
@@ -1657,6 +1974,9 @@ async fn create_dependent_task(
                         condition,
                         failure_policy: DependencyFailurePolicy::Cancel,
                     }],
+                    task_role: TaskRole::Implementation,
+                    session_reuse: SessionReusePolicy::Auto,
+                    preferred_session_id: None,
                     title: title.to_owned(),
                     instructions: "Consume the immutable upstream Result snapshot.".to_owned(),
                     attachments: Vec::new(),
@@ -1723,6 +2043,7 @@ fn message(
         attachments: Vec::new(),
         reply_to,
         delivery: DeliveryIntent::FollowUp,
+        steer_reason: None,
     }
 }
 

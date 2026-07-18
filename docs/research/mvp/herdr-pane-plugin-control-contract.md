@@ -34,9 +34,11 @@ The popup receives no Harness identity from a pane. It connects as a presentatio
 
 ## Supervisor registration
 
-The user's current native Harness registers as the sole Supervisor through the Coordinator MCP proxy or CLI fallback. Registration records its durable Harness ID, current Session ID, Harness Kind, model when known, cwd, terminal ID, current pane location, and last-seen sequence.
+The Supervisor exists in two shapes. A managed Supervisor runs in a Coordinator-launched pane whose Supervisor Host binds the visible native conversation through a Supervisor Adapter and injects durable Supervisor Events as native follow-up or steer turns. A self-registered Supervisor registers through the Coordinator MCP proxy or CLI fallback as before.
 
-The Coordinator does not adopt or become parent of the Supervisor process. It cannot inject a native turn. Supervisor messages are delivered to the durable inbox and surfaced through metadata and popup state.
+Registration records its durable Harness ID, current Session ID, Harness Kind, model when known, cwd, terminal ID, current pane location, and last-seen sequence.
+
+For a self-registered Supervisor the Coordinator does not adopt or become parent of the Supervisor process and cannot inject a native turn. For both shapes, Supervisor attention is durable inbox and Supervisor Event state first; native injection by a managed Host is an at-least-once optimization, never the system of record. Undelivered events are surfaced through metadata and popup state.
 
 If the Supervisor pane moves, the Coordinator updates public pane, tab, and workspace IDs while retaining the Session and terminal binding. If the Supervisor disconnects, Workers continue and Results wait for review.
 

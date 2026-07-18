@@ -160,11 +160,13 @@ fn plugin_manifest_declares_the_resolved_mvp_entrypoints() {
         Some("./scripts/workspace")
     );
     let panes = manifest["panes"].as_array().unwrap();
-    assert_eq!(panes.len(), 2);
-    assert_eq!(panes[0]["id"].as_str(), Some("worker"));
+    assert_eq!(panes.len(), 3);
+    assert_eq!(panes[0]["id"].as_str(), Some("supervisor"));
     assert_eq!(panes[0]["placement"].as_str(), Some("tab"));
-    assert_eq!(panes[1]["id"].as_str(), Some("harness-network"));
-    assert_eq!(panes[1]["placement"].as_str(), Some("popup"));
+    assert_eq!(panes[1]["id"].as_str(), Some("worker"));
+    assert_eq!(panes[1]["placement"].as_str(), Some("tab"));
+    assert_eq!(panes[2]["id"].as_str(), Some("harness-network"));
+    assert_eq!(panes[2]["placement"].as_str(), Some("popup"));
 }
 
 #[test]

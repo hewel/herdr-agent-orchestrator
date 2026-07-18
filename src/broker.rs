@@ -42,6 +42,10 @@ pub struct BrokerRequest {
 /// Operations transported without exposing `SQLite` or provider protocols.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the versioned wire shape remains direct and serde-stable across command variants"
+)]
 pub enum BrokerOperation {
     /// Execute one state-changing Core command.
     Execute {

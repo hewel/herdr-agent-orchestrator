@@ -104,7 +104,7 @@ At `agent_end`, exactly one accepted Result for the current Task revision is req
 
 A blocking Question normally ends or pauses the active OMP turn. When the Supervisor Reply becomes eligible, the adapter delivers it in the same native session and Task conversation. A Correction after `reviewing` starts another native turn in that session and increments the Result revision.
 
-After Approval the Worker may remain idle and receive another top-level Task in the same OMP session. A failed, forcibly cancelled, or ambiguous session is stopped and cannot receive another Task.
+After Approval the Worker may remain idle and receive another top-level Task in the same OMP session only when the Task's Session reuse policy and candidate checks admit it; the coordination contract's Session reuse rules are authoritative. A failed, forcibly cancelled, or ambiguous session is stopped and cannot receive another Task.
 
 ## Cancellation and shutdown
 

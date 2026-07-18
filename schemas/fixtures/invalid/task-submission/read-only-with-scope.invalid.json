@@ -1,6 +1,8 @@
 {
   "schema_version": 1,
   "worker_id": "codex-review",
+  "task_role": "review",
+  "session_reuse": "auto",
   "title": "Review the implementation",
   "instructions": "Review without modifying files.",
   "attachments": [],

@@ -4,12 +4,28 @@
   "title": "TaskSubmissionV1",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "worker_id", "title", "instructions", "attachments", "repository"],
+  "required": [
+    "schema_version",
+    "worker_id",
+    "task_role",
+    "session_reuse",
+    "title",
+    "instructions",
+    "attachments",
+    "repository"
+  ],
   "properties": {
     "schema_version": { "const": 1 },
     "request_key": { "$ref": "common-v1.schema.json#/$defs/requestKey" },
     "worker_id": { "$ref": "common-v1.schema.json#/$defs/harnessId" },
     "related_task_id": { "$ref": "common-v1.schema.json#/$defs/uuid" },
+    "task_role": {
+      "enum": ["implementation", "investigation", "review", "verification", "other"]
+    },
+    "session_reuse": {
+      "enum": ["required", "prefer", "fresh", "auto"]
+    },
+    "preferred_session_id": { "$ref": "common-v1.schema.json#/$defs/uuid" },
     "depends_on": {
       "type": "array",
       "maxItems": 32,
@@ -65,5 +81,14 @@
         }
       ]
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": ["session_reuse"],
+        "properties": { "session_reuse": { "const": "required" } }
+      },
+      "then": { "required": ["preferred_session_id"] }
+    }
+  ]
 }

@@ -8,7 +8,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use thiserror::Error;
 
-use crate::contract::{AttachmentId, HarnessKind, HarnessSessionId, TaskId};
+use crate::contract::{
+    AttachmentId, HarnessKind, HarnessSessionId, HarnessTier, NativeSessionHealth, SupervisorEvent,
+    TaskId,
+};
 
 const MAX_VERSION_OUTPUT_BYTES: usize = 4096;
 
@@ -75,6 +78,10 @@ pub type AdapterResult<T> = Result<T, AdapterError>;
 pub type AdapterEventStream =
     Pin<Box<dyn Stream<Item = AdapterResult<AdapterEvent>> + Send + 'static>>;
 
+/// Dynamically dispatched stream of Supervisor adapter lifecycle events.
+pub type SupervisorAdapterEventStream =
+    Pin<Box<dyn Stream<Item = AdapterResult<SupervisorAdapterEvent>> + Send + 'static>>;
+
 /// Features whose native semantics have been verified for one Adapter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[expect(
@@ -90,6 +97,8 @@ pub struct AdapterCapabilities {
     pub active_turn_follow_up: bool,
     /// The provider exposes cooperative cancellation before forced shutdown.
     pub cooperative_cancellation: bool,
+    /// The provider can compact context with unambiguous completion evidence.
+    pub safe_compaction: bool,
 }
 
 /// Provider-neutral configuration needed to start one Worker Harness process.
@@ -97,6 +106,8 @@ pub struct AdapterCapabilities {
 pub struct HarnessStartSpec {
     /// Durable Coordinator Session being hosted.
     pub session_id: HarnessSessionId,
+    /// Worker execution or managed Supervisor responsibility.
+    pub tier: HarnessTier,
     /// Absolute executable resolved for this Harness Session.
     pub executable: PathBuf,
     /// Registered live worktree used by the native Harness.
@@ -196,7 +207,7 @@ pub enum AdapterLifecycle {
 }
 
 /// Provider-neutral live state captured on demand.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AdapterSnapshot {
     /// Current coarse lifecycle.
     pub lifecycle: AdapterLifecycle,
@@ -212,6 +223,16 @@ pub struct AdapterSnapshot {
     pub queued_input_count: Option<u32>,
     /// Effective model, when reported.
     pub model: Option<String>,
+    /// Provider-neutral native health classification.
+    pub native_health: NativeSessionHealth,
+    /// Estimated tokens currently retained by native context.
+    pub context_tokens: Option<u64>,
+    /// Native context-window capacity.
+    pub context_window: Option<u64>,
+    /// Context utilization in the inclusive range zero through one hundred.
+    pub context_percent: Option<f64>,
+    /// Number of successful native compactions observed in this Session.
+    pub compaction_count: Option<u32>,
 }
 
 /// Terminal status of one top-level native turn.
@@ -317,8 +338,103 @@ pub trait HarnessAdapter: Send {
     /// Returns [`AdapterError`] when the snapshot request fails.
     async fn snapshot(&mut self) -> AdapterResult<AdapterSnapshot>;
 
+    /// Requests provider-native safe context compaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdapterError`] when compaction is unsupported or ambiguous.
+    async fn compact(&mut self) -> AdapterResult<()> {
+        Err(AdapterError::Operation {
+            kind: self.kind(),
+            message: "safe native compaction is unsupported".to_owned(),
+        })
+    }
+
     /// Borrows the ordered stream of normalized top-level provider events.
     fn events(&mut self) -> AdapterEventStream;
+}
+
+/// Binding information for a visible managed Supervisor Harness.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SupervisorBindSpec {
+    pub coordinator_session_id: HarnessSessionId,
+    pub executable: PathBuf,
+    pub cwd: PathBuf,
+    pub provider_state_dir: PathBuf,
+    pub model: Option<String>,
+    pub provider_profile: Option<String>,
+    pub config_overlays: Vec<PathBuf>,
+    pub environment: BTreeMap<String, String>,
+}
+
+/// Native identity of the visible Supervisor conversation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeSupervisorSession {
+    pub coordinator_session_id: HarnessSessionId,
+    pub native_session_id: Option<String>,
+    pub thread_id: Option<String>,
+}
+
+/// Provider evidence that determines follow-up versus idle-turn delivery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SupervisorSnapshot {
+    pub lifecycle: AdapterLifecycle,
+    pub native_session_id: Option<String>,
+    pub thread_id: Option<String>,
+    pub active_turn_id: Option<String>,
+    pub steerable: bool,
+    pub native_health: NativeSessionHealth,
+}
+
+/// Normalized lifecycle evidence emitted by a Supervisor adapter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum SupervisorAdapterEvent {
+    Bound(NativeSupervisorSession),
+    Acceptance(NativeAcceptance),
+    Transcript {
+        text: String,
+    },
+    Activity {
+        summary: String,
+    },
+    TurnStarted {
+        turn_id: Option<String>,
+    },
+    TurnCompleted {
+        turn_id: Option<String>,
+        status: NativeTurnStatus,
+    },
+    Failed {
+        message: String,
+    },
+    Exited {
+        exit_code: Option<i32>,
+    },
+}
+
+/// Provider boundary used only by the managed visible Supervisor Host.
+#[async_trait]
+pub trait SupervisorAdapter: Send {
+    fn kind(&self) -> HarnessKind;
+
+    async fn bind(&mut self, spec: &SupervisorBindSpec) -> AdapterResult<NativeSupervisorSession>;
+
+    async fn inject_follow_up(
+        &mut self,
+        session: &NativeSupervisorSession,
+        event: &SupervisorEvent,
+    ) -> AdapterResult<NativeAcceptance>;
+
+    async fn inject_steer(
+        &mut self,
+        session: &NativeSupervisorSession,
+        event: &SupervisorEvent,
+    ) -> AdapterResult<NativeAcceptance>;
+
+    async fn snapshot(&mut self) -> AdapterResult<SupervisorSnapshot>;
+
+    fn events(&mut self) -> SupervisorAdapterEventStream;
 }
 
 /// Correlation identifier accepted by the provider JSONL protocols.

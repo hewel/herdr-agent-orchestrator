@@ -24,6 +24,7 @@ fn executable(directory: &Path, name: &str, source: &str) -> std::path::PathBuf 
 fn spec(temp: &TempDir, executable: std::path::PathBuf) -> HarnessStartSpec {
     HarnessStartSpec {
         session_id: HarnessSessionId::new(),
+        tier: herdr_harness_coordinator::contract::HarnessTier::Worker,
         executable,
         cwd: temp.path().to_path_buf(),
         provider_state_dir: temp.path().join("state"),

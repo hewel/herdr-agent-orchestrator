@@ -16,7 +16,8 @@ use crate::{
     attachment::AttachmentStore,
     broker::{BrokerOperation, BrokerRequest, call},
     contract::{
-        DeliveryIntent, HarnessKind, MessageSubmissionV1, SCHEMA_VERSION, TaskSubmissionV1,
+        DeliveryIntent, HarnessKind, HarnessTier, MessageSubmissionV1, SCHEMA_VERSION,
+        TaskSubmissionV1,
     },
     core::{
         ActorContext, CommandOutcome, CoordinatorCommand, CoordinatorQuery,
@@ -37,19 +38,24 @@ const PRE_WRITE_RETRIES: usize = 3;
 /// Returns an error when Session bootstrap, profile validation, broker delivery, or the
 /// provider lifecycle fails.
 pub async fn run_worker_host(socket: &Path, state_dir: &Path, bearer: String) -> Result<()> {
-    let capability = SessionCapability::from_bearer(bearer)?;
-    let result = run_worker_host_inner(socket, state_dir, capability.clone()).await;
-    if let Err(error) = &result {
-        let _ = broker_execute(
-            socket,
-            capability,
-            CoordinatorCommand::RecordHostFailed {
-                diagnostic: format!("{error:#}"),
-            },
-        )
-        .await;
+    let mut capability = SessionCapability::from_bearer(bearer)?;
+    loop {
+        match run_worker_host_inner(socket, state_dir, capability.clone()).await {
+            Ok(Some(rotated)) => capability = rotated,
+            Ok(None) => return Ok(()),
+            Err(error) => {
+                let _ = broker_execute(
+                    socket,
+                    capability,
+                    CoordinatorCommand::RecordHostFailed {
+                        diagnostic: format!("{error:#}"),
+                    },
+                )
+                .await;
+                return Err(error);
+            }
+        }
     }
-    result
 }
 
 #[expect(
@@ -60,7 +66,7 @@ async fn run_worker_host_inner(
     socket: &Path,
     state_dir: &Path,
     capability: SessionCapability,
-) -> Result<()> {
+) -> Result<Option<SessionCapability>> {
     let session = broker_query(socket, capability.clone(), CoordinatorQuery::SessionSelf).await?;
     let QueryResult::Session(session) = session else {
         bail!("broker returned the wrong Session bootstrap projection");
@@ -110,6 +116,7 @@ async fn run_worker_host_inner(
     );
     let spec = HarnessStartSpec {
         session_id: session.session_id,
+        tier: HarnessTier::Worker,
         executable,
         cwd: session.definition.cwd,
         provider_state_dir: state_dir
@@ -144,6 +151,7 @@ async fn run_worker_host_inner(
             native_session_id: native.session_id,
             native_thread_id: native.thread_id,
             effective_model: native.model,
+            safe_compaction: capabilities.safe_compaction,
             evidence: HarnessCompatibilityEvidenceV1 {
                 schema_version: SCHEMA_VERSION,
                 kind: profile.kind,
@@ -172,6 +180,16 @@ async fn run_worker_host_inner(
         CoordinatorCommand::RecordHostReady,
     )
     .await?;
+    let snapshot = adapter
+        .snapshot()
+        .await
+        .context("snapshotting native Harness")?;
+    broker_execute(
+        socket,
+        capability.clone(),
+        CoordinatorCommand::RecordAdapterSnapshot { snapshot },
+    )
+    .await?;
     let mut events = adapter.events();
     let mut current_task = None;
     let mut cancellation_requested = None;
@@ -181,11 +199,41 @@ async fn run_worker_host_inner(
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                broker_execute(
+                if current_task.is_none() {
+                    let snapshot = adapter.snapshot().await.context("refreshing native Harness snapshot")?;
+                    broker_execute(
+                        socket,
+                        capability.clone(),
+                        CoordinatorCommand::RecordAdapterSnapshot { snapshot },
+                    ).await?;
+                }
+                let claim = broker_execute(
                     socket,
                     capability.clone(),
                     CoordinatorCommand::ClaimNextTask,
                 ).await?;
+                if let CommandOutcome::SessionCompactionRequired { .. } = claim {
+                    adapter.compact().await.context("compacting required OMP Session")?;
+                    let snapshot = adapter.snapshot().await.context("snapshotting compacted OMP Session")?;
+                    broker_execute(
+                        socket,
+                        capability.clone(),
+                        CoordinatorCommand::RecordAdapterSnapshot { snapshot },
+                    ).await?;
+                    continue;
+                }
+                if let CommandOutcome::SessionRotationRequired { .. } = claim {
+                    adapter.stop().await.context("stopping Session before same-pane rotation")?;
+                    let rotated = broker_execute(
+                        socket,
+                        capability.clone(),
+                        CoordinatorCommand::RotateWorkerSession,
+                    ).await?;
+                    let CommandOutcome::WorkerSessionRotated { capability, .. } = rotated else {
+                        bail!("Coordinator returned the wrong Session rotation outcome")
+                    };
+                    return Ok(Some(capability));
+                }
                 let inbox = broker_query(socket, capability.clone(), CoordinatorQuery::Inbox).await?;
                 let QueryResult::Inbox(messages) = inbox else { bail!("broker returned the wrong inbox projection") };
                 if let Some(message) = messages.first() {
@@ -265,7 +313,7 @@ async fn run_worker_host_inner(
                     if !active {
                         adapter.stop().await.context("stopping native Harness")?;
                         broker_execute(socket, capability.clone(), CoordinatorCommand::RecordHostStopped { clean: true }).await?;
-                        return Ok(());
+                        return Ok(None);
                     }
                 }
             }
@@ -314,7 +362,7 @@ async fn run_worker_host_inner(
             signal = tokio::signal::ctrl_c() => {
                 signal.context("waiting for Worker Host shutdown signal")?;
                 adapter.stop().await.context("stopping native Harness")?;
-                return Ok(());
+                return Ok(None);
             }
         }
     }
@@ -337,6 +385,12 @@ pub async fn render_popup(socket: &Path, bearer: String) -> Result<String> {
     let tasks = broker_query(socket, capability.clone(), CoordinatorQuery::ListTasks).await?;
     let graph = broker_query(socket, capability.clone(), CoordinatorQuery::TaskGraph).await?;
     let inbox = broker_query(socket, capability.clone(), CoordinatorQuery::Inbox).await?;
+    let supervisor_events = broker_query(
+        socket,
+        capability.clone(),
+        CoordinatorQuery::SupervisorEvents,
+    )
+    .await?;
     let holds = broker_query(socket, capability, CoordinatorQuery::ActiveHolds).await?;
     let QueryResult::HarnessStatus(status) = status else {
         bail!("invalid Harness status response")
@@ -352,6 +406,9 @@ pub async fn render_popup(socket: &Path, bearer: String) -> Result<String> {
     };
     let QueryResult::Holds(holds) = holds else {
         bail!("invalid Hold list response")
+    };
+    let QueryResult::SupervisorEvents(supervisor_events) = supervisor_events else {
+        bail!("invalid Supervisor event response")
     };
     let mut output = String::from("Harness Network\n\n");
     for harness in status {
@@ -373,9 +430,31 @@ pub async fn render_popup(socket: &Path, bearer: String) -> Result<String> {
     for task in tasks {
         let _ = writeln!(
             output,
-            "{} · {} · {:?} · revision {}",
-            task.id, task.worker_id, task.state, task.result_revision
+            "{} · {} · {:?} · revision {} · {:?}/{:?}",
+            task.id,
+            task.worker_id,
+            task.state,
+            task.result_revision,
+            task.task_role,
+            task.requested_session_policy,
         );
+        if let Some(session_id) = task.harness_session_id {
+            let _ = writeln!(
+                output,
+                "  Session {} · {} · {}{}",
+                session_id,
+                if task.session_reused == Some(true) {
+                    "Reused"
+                } else {
+                    "Fresh"
+                },
+                task.session_decision_reason
+                    .as_deref()
+                    .unwrap_or("decision unavailable"),
+                task.context_percent
+                    .map_or_else(String::new, |percent| format!(" · context {percent}%")),
+            );
+        }
     }
     output.push_str("\nScheduling\n");
     for entry in graph {
@@ -404,6 +483,9 @@ pub async fn render_popup(socket: &Path, bearer: String) -> Result<String> {
                 ""
             },
         );
+        if entry.waiting_for_session {
+            output.push_str("  waiting Session selection or rotation\n");
+        }
         for dependency in entry.dependencies {
             let status = dependency.satisfied_by_result_revision.map_or_else(
                 || "awaiting".to_owned(),
@@ -437,6 +519,14 @@ pub async fn render_popup(socket: &Path, bearer: String) -> Result<String> {
             message.sender_id,
             message.kind,
             message.delivery_state.as_deref().unwrap_or("pending")
+        );
+    }
+    output.push_str("\nSupervisor events\n");
+    for event in supervisor_events {
+        let _ = writeln!(
+            output,
+            "{} · {:?} · {:?} · {}",
+            event.id, event.kind, event.state, event.summary
         );
     }
     if !holds.is_empty() {

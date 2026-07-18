@@ -14,6 +14,13 @@ contexts = ["workspace"]
 command = ["./scripts/workspace"]
 
 [[panes]]
+id = "supervisor"
+title = "Harness Supervisor"
+description = "Own the visible managed Supervisor Harness and inject durable attention events."
+placement = "tab"
+command = ["./scripts/supervisor"]
+
+[[panes]]
 id = "worker"
 title = "Harness Worker"
 description = "Own one Coordinator Harness Host and its native OMP or Codex process."

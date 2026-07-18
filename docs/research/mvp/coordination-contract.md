@@ -68,8 +68,11 @@ The Coordinator launches Workers. `register` cannot adopt an arbitrary Worker pr
 | `schema_version` | exactly `1` |
 | `request_key` | optional 1-128 Unicode scalar idempotency key, additionally limited to 512 UTF-8 bytes by typed validation |
 | `worker_id` | existing Worker Harness |
-| `related_task_id` | optional existing Task used only for UI grouping, audit context, and the related-review repository rule; it does not control scheduling |
+| `related_task_id` | optional existing Task used only for UI grouping, audit context, related-review repository rules, and Session reuse preference; it does not control scheduling |
 | `depends_on` | at most 32 immutable scheduling dependencies; omitted by legacy v1 payloads as an empty array |
+| `task_role` | required `implementation`, `investigation`, `review`, `verification`, or `other`; semantic purpose used by conservative automatic Session selection |
+| `session_reuse` | required `required`, `prefer`, `fresh`, or `auto`; requested relationship between the Task and a native Worker Session |
+| `preferred_session_id` | optional existing Coordinator Harness Session; mandatory when `session_reuse` is `required` |
 | `title` | 1-160 Unicode scalar values |
 | `instructions` | 1-16,384 Unicode scalar values, additionally limited to 65,536 UTF-8 bytes by typed validation |
 | `attachments` | at most 32 admitted Attachment IDs |
@@ -111,6 +114,24 @@ The Coordinator reevaluates affected Tasks when Tasks and Results change state, 
 Ready Tasks for one Worker retain Task creation order. A later Task cannot bypass the earliest Ready Task if that earlier Task is waiting for Worker or repository admission. Ready Tasks assigned to separate idle Workers may dispatch concurrently. A Blocked Task never acquires a repository lease.
 
 For every satisfied dependency, the Coordinator creates or reuses an immutable Result snapshot Attachment and records the satisfying Result revision. When the dependent dispatches, its dependency inputs are frozen to those revisions. A pre-dispatch Correction or new Worktree Hold revokes provisional `result_ready` satisfaction and reblocks the dependent; a later revision may satisfy it again. Once dispatched, a newer upstream revision never mutates or replays downstream work automatically.
+
+## Task Session reuse and binding
+
+Every Task declares `task_role` and `session_reuse`. Session selection runs after dependency readiness and per-Worker FIFO admission and before dispatch. Dependency edges never encode reuse, and reuse never reorders the graph or bypasses repository admission.
+
+`auto` resolves deterministically from `task_role` and declared relationships before any candidate is inspected:
+
+- `review` and `verification` resolve to `fresh`;
+- `implementation` with a `related_task_id` or at least one `depends_on` edge resolves to `prefer`;
+- every other combination resolves to `fresh`.
+
+Candidate preference order is the `preferred_session_id` Session, then the Session last bound to `related_task_id`, then the most recent live Session of the assigned Worker. A candidate is reusable only when every identity and safety check passes: same Worker definition, Harness Kind, launch-profile snapshot digest, canonical repository, effective tool policy, and compatible effective model; Session online and idle; and no active Task, unresolved Question, ambiguous delivery, unresolved cancellation, or unresolved Worktree Hold attributable to that Session.
+
+Native health is consulted only after identity and policy compatibility. `failed`, `ambiguous`, and `context_pressure` reject the candidate. `compacted` rejects automatic reuse (`auto` starts fresh) but satisfies an explicit `required` or `prefer` request. `healthy` accepts.
+
+`fresh` accepts a live Session that has never been bound to another Task; a previously bound Session is never reused under `fresh`. A rejected candidate blocks dispatch: `invalid_state` for `required`, otherwise `target_offline`, and the Task remains queued until a compatible Session exists. The Coordinator never silently binds an incompatible Session.
+
+The decision persists as a durable Task Session Binding recording the Task, Harness Session, requested and effective policy, whether native context was reused, a stable machine-readable reason code, a human-readable reason, the Adapter snapshot and context evidence at decision time, and the binding time. At most one current binding exists per Task. Bindings survive restart and are revalidated at dispatch against live Session state.
 
 ## Task state contract
 
@@ -171,7 +192,7 @@ The route matrix is enforced before persistence:
 - a Result is created only by `CompleteTask`; and
 - a Task message is created only by `CreateTask`.
 
-`steer` is accepted only for a Supervisor Correction or Notification addressed to the Worker actively executing that Task while the adapter reports a steerable turn. All other messages use `follow_up`.
+`steer` is accepted for a Supervisor Correction or Notification addressed to the Worker actively executing that Task while the adapter reports a steerable turn. A Worker blocking Question may request Supervisor steering only when it supplies a bounded `steer_reason` explaining why the answer invalidates active Supervisor work; ordinary Questions and all Results use `follow_up`.
 
 A Question is always blocking in v1 and moves the Task to `waiting` after message persistence. A nonblocking inquiry must use Notification and does not reserve Reply correlation.
 
@@ -221,6 +242,31 @@ An attempt records generated attempt ID and number, target Harness and Session, 
 Offline delivery stays `pending`. A definitive failure before provider bytes were written may become `retryable_failed` and retry with bounded exponential backoff. Any loss after bytes may have been accepted becomes `unknown`. `unknown` never retries automatically.
 
 Reading an inbox records `read_at` independently of native delivery state.
+
+## Supervisor events and the managed Supervisor Host
+
+The exact durable-Inbox rule: every Supervisor-attention fact is persisted as a durable Supervisor Event in the same transaction as the fact that raised it, before any native injection is attempted. The durable event store, not the native Supervisor conversation, is the system of record. An event raised by an inbox Message records that `source_message_id`; acknowledging the event marks the source Message read in the same transaction.
+
+Event kinds are `result_ready`, `blocking_question`, `task_failed`, `delivery_unknown`, `worktree_hold_created`, `task_graph_completed`, and `notification`. Each event carries a unique `source_key`; re-emission of the same fact inserts nothing, so retry and reevaluation never duplicate attention.
+
+Event delivery states are:
+
+```text
+pending
+dispatching
+accepted
+processed
+unknown
+cancelled
+```
+
+The Supervisor Host claims the oldest `pending` event first and never holds more than one event in `dispatching` or `accepted`. Each claim appends an immutable attempt recording the target Session, whether provider bytes may have been written, native correlation, and acceptance evidence. `accepted` means the provider accepted the injection; it is not model processing. `processed` means the Supervisor explicitly acknowledged the event (one to thirty-two IDs per acknowledgement) or a superseding durable fact settled it. A lost acknowledgement after bytes may have been written becomes `unknown`; `unknown` is never retried automatically and settles only through explicit Supervisor reconciliation (`retry`, `processed`, or `cancel`) with a nonempty audit note.
+
+When the Supervisor runs as a managed Harness in a Coordinator-launched pane, a Supervisor Host owns one Supervisor Adapter that binds the visible native conversation, records its native session and thread identity, injects events as follow-up or steer according to their delivery intent, and snapshots lifecycle and native health. A self-registered unmanaged Supervisor keeps the pull model: events remain durable inbox state surfaced through Herdr metadata and the popup, and the Coordinator injects nothing.
+
+Offline recovery is durable by construction. Pending events survive broker, Host, and Supervisor restarts and are claimed in creation order once a Supervisor Host binds again. A cold Herdr restart never replays uncertain injections: events stay `pending` or `unknown` until the Supervisor reconciles them.
+
+`WatchTaskGraph` registers a durable, idempotent completion watch on an explicit root Task set. When every watched root reaches `reviewing` or a terminal state, the Coordinator completes the watch once and emits one `task_graph_completed` event.
 
 ## Attachments
 
@@ -277,3 +323,5 @@ Errors contain a concise message and optional durable evidence reference. Native
 ## Compatibility
 
 Version 1 schemas never loosen or change meaning in place. Adding fields, enum values, defaults, identity rules, or state semantics creates a new public schema version. Persisted internal tables may migrate independently when public v1 behavior is preserved.
+
+The accepted Session Reuse and Managed Supervisor Host plan made one deliberate exception: `TaskSubmissionV1` was replaced in place, adding required `task_role` and `session_reuse` plus optional `preferred_session_id`. Persisted pre-plan Tasks were migrated with the conservative defaults `other` and `auto`. This exception is settled history and sets no precedent for further in-place v1 changes.

@@ -124,7 +124,7 @@ pub enum HarnessActivity {
 }
 ```
 
-An idle Worker Session may execute multiple Tasks sequentially in the same native conversation. Failure, forced cancellation, or an ambiguous native state ends the Session; reuse then requires an explicit new activation under the same Harness identity.
+An idle Worker Session may execute multiple Tasks sequentially in the same native conversation when the Task Session reuse rules allow it. Failure, forced cancellation, or an ambiguous native state ends the Session; reuse then requires an explicit new activation under the same Harness identity. Each Session records provider-neutral native health (`healthy`, `context_pressure`, `compacted`, `ambiguous`, `failed`) and context evidence from Adapter snapshots; reuse decisions consult this evidence only after identity and policy compatibility.
 
 The current Herdr harness registers as the Supervisor. Worker Sessions are launched by the Coordinator in plugin-owned panes. Adopting arbitrary existing Worker panes is deferred.
 
@@ -139,10 +139,28 @@ pub struct TaskSubmissionV1 {
     pub worker_id: HarnessId,
     pub related_task_id: Option<TaskId>,
     pub depends_on: Vec<TaskDependencyV1>,
+    pub task_role: TaskRole,
+    pub session_reuse: SessionReusePolicy,
+    pub preferred_session_id: Option<HarnessSessionId>,
     pub title: String,
     pub instructions: String,
     pub attachments: Vec<AttachmentId>,
     pub repository: TaskRepositoryAuthorityV1,
+}
+
+pub enum TaskRole {
+    Implementation,
+    Investigation,
+    Review,
+    Verification,
+    Other,
+}
+
+pub enum SessionReusePolicy {
+    Required,
+    Prefer,
+    Fresh,
+    Auto,
 }
 
 pub struct TaskDependencyV1 {
@@ -206,6 +224,16 @@ Ready Tasks targeting different idle Workers may dispatch concurrently. For one 
 If a Correction is accepted before a dependent dispatches, provisional `ResultReady` satisfaction is revoked and the dependent is blocked until a new reviewable revision is available. A Correction never silently changes an already-dispatched dependent and never causes automatic downstream replay. The Supervisor may create, cancel, or replace stale downstream work explicitly.
 
 Each edge has a simple failure policy. `Cancel`, the default, cancels an undispatched dependent when its upstream Task fails or is cancelled. `KeepBlocked` leaves it for explicit Supervisor reconciliation. Delivery uncertainty, Worktree Holds, and an unapproved `Approved` dependency keep dependents Blocked; the Coordinator does not infer success.
+
+### Task Session reuse
+
+An idle Worker Session may execute several Tasks sequentially in one native conversation, but reuse is a declared, auditable decision rather than an accident of timing. Session selection runs after dependency readiness and per-Worker FIFO admission and before dispatch; the DAG orders work, and reuse never reorders it.
+
+`Required` binds the Task to its `preferred_session_id` or fails. `Prefer` reuses a compatible healthy Session when one exists. `Fresh` requires a Session that has never run another Task. `Auto` resolves conservatively from `task_role`: `review` and `verification` start fresh, `implementation` related to or dependent on earlier work prefers reuse, and everything else starts fresh.
+
+A candidate Session must match the Worker definition, Harness Kind, launch-profile snapshot, canonical repository, tool policy, and effective model; be online and idle; and carry no active Task, unresolved Question, ambiguous delivery, unresolved cancellation, or unresolved Worktree Hold. Native health is consulted last: `failed`, `ambiguous`, and `context_pressure` reject; `compacted` satisfies only an explicit reuse request, never `auto`. Sessions record native health and context evidence (tokens, window, percent, compaction count) from Adapter snapshots for exactly this gate.
+
+Every decision persists as a durable Task Session Binding with the requested and effective policy, a reuse flag, a stable reason code, and the Adapter snapshot at decision time. One current binding per Task; it survives restart and is revalidated at dispatch. A rejected candidate blocks dispatch rather than silently binding an incompatible Session.
 
 ### Task lifecycle
 
@@ -308,7 +336,7 @@ Allowed routes are closed:
 
 Task creation and Result completion use dedicated operations because they carry structured contracts. `harness_send` cannot forge them.
 
-`FollowUp` is the default. The Coordinator retains FollowUp messages until the target can safely begin the next native turn. `Steer` is allowed only from the Supervisor to the Worker currently executing the referenced Task and maps directly to the adapter's verified steering operation. There is no `Auto` intent.
+`FollowUp` is the default. The Coordinator retains FollowUp messages until the target can safely begin the next native turn. `Steer` is allowed for a Supervisor message to the Worker currently executing the referenced Task and, for native Supervisor injection only, an explicitly urgent blocking Question with a bounded `steer_reason` explaining why the answer invalidates active Supervisor work. It maps directly to the adapter's verified steering operation. There is no `Auto` intent.
 
 ### Durable delivery
 
@@ -340,9 +368,39 @@ Task files, diffs, verification logs, transcripts, and reports remain ordinary f
 
 ### Supervisor delivery
 
-Worker Sessions are adapter-owned, so delivery to them is push-based. The registered Supervisor Session is not protocol-owned by the Coordinator. A Worker Result therefore becomes durable Supervisor inbox state plus Herdr metadata and popup notification; it cannot automatically create a new model turn in an already-running Supervisor harness.
+Worker Sessions are adapter-owned, so delivery to them is push-based. The Supervisor has two supported shapes.
 
-The Supervisor reads its inbox through MCP, CLI, or a bounded inbox wait. Supervisor disconnection does not stop a Worker. Completed Results remain pending for review, and mutating leases remain held until the Supervisor returns and approves or reconciles them.
+> Worker Results always become durable Supervisor Inbox state. When a healthy Coordinator-managed Supervisor Session is bound, important events are additionally injected as safe native follow-up turns. Durable state remains authoritative.
+
+A managed Supervisor runs in a Coordinator-launched pane whose Supervisor Host owns one Supervisor Adapter. The Host binds the visible native conversation, records its native session and thread identity, and injects durable Supervisor Events as follow-up or steer turns:
+
+```rust
+pub struct SupervisorEvent {
+    pub id: SupervisorEventId,
+    pub kind: SupervisorEventKind,
+    pub task_id: Option<TaskId>,
+    pub result_revision: Option<u32>,
+    pub summary: String,
+    pub attachments: Vec<AttachmentId>,
+    pub created_at: DateTime<Utc>,
+}
+
+pub enum SupervisorEventKind {
+    ResultReady,
+    BlockingQuestion,
+    TaskFailed,
+    DeliveryUnknown,
+    WorktreeHoldCreated,
+    TaskGraphCompleted,
+    Notification,
+}
+```
+
+The durable-Inbox rule is exact: every Supervisor-attention fact persists as a Supervisor Event in the same transaction as its source fact, before any native injection. Events deduplicate on a unique source key, deliver oldest-first with at most one in flight, and record immutable attempts. `accepted` is provider acceptance, not model processing; `processed` is explicit Supervisor acknowledgement, which also marks the source inbox Message read. Ambiguous injection becomes `unknown` and settles only through explicit reconciliation with an audit note. Pending events survive every restart and are claimed after the next bind; nothing is replayed blindly.
+
+A self-registered unmanaged Supervisor keeps the pull model. A Worker Result becomes durable Supervisor inbox state plus Herdr metadata and popup notification; the Coordinator cannot inject a new turn into an already-running Supervisor process it does not own.
+
+The Supervisor reads its inbox through MCP, CLI, or a bounded inbox wait. Supervisor disconnection does not stop a Worker. Completed Results remain pending for review, mutating leases remain held, and Supervisor Events accumulate durably until the Supervisor returns and approves, reconciles, or acknowledges them.
 
 ## Advisory repository coordination
 
@@ -408,6 +466,8 @@ pub trait HarnessAdapter: Send {
 
 `dispatch` reports only native acceptance. The Coordinator constructs durable receipts and Task transitions from acceptance plus adapter events. Provider protocol types never cross the adapter seam.
 
+A managed Supervisor pane runs a Supervisor Host with the narrower `SupervisorAdapter` seam: `bind` attaches to the visible native conversation, `inject_follow_up` and `inject_steer` deliver one durable Supervisor Event, `snapshot` reports lifecycle and native health, and `events` streams bound, acceptance, failure, and exit evidence. The Host claims events oldest-first, records acceptance separately from acknowledgement, and never re-injects an `unknown` event on its own.
+
 ### Herdr integration
 
 Herdr owns terminal topology. The plugin owns Worker launch definitions, Harness Host lifecycle, focus, and forced pane closure. Official native integrations remain the semantic status authority for directly running OMP and Codex; the Coordinator uses Herdr metadata only for title, Task, inbox, and presentation fields.
@@ -425,8 +485,9 @@ Dependency edges, satisfied Result revisions, and frozen dependency inputs survi
 SQLite stores:
 
 - Harness definitions and Harness Sessions;
-- Tasks, immutable dependency edges, scheduling transitions, Result revision bindings, Result revisions, and Task transitions;
+- Tasks, immutable dependency edges, scheduling transitions, Task Session Bindings, Result revision bindings, Result revisions, and Task transitions;
 - messages, delivery attempts, receipts, and inbox read state;
+- Supervisor Events, their delivery attempts, and Task graph watches;
 - attachment metadata;
 - Repository Observations, Advisory Worktree Leases, and Worktree Holds;
 - Herdr terminal and pane bindings; and

@@ -2,6 +2,8 @@
   "schema_version": 1,
   "request_key": "download-queue-v1",
   "worker_id": "omp-worker",
+  "task_role": "implementation",
+  "session_reuse": "auto",
   "title": "Fix duplicate queue insertion",
   "instructions": "Use the existing queue lock and preserve the public API.",
   "attachments": [

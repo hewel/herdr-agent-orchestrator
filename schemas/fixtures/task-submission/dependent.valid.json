@@ -2,6 +2,8 @@
   "schema_version": 1,
   "request_key": "review-implementation-v1",
   "worker_id": "codex-review",
+  "task_role": "review",
+  "session_reuse": "auto",
   "related_task_id": "019f7000-0000-7000-8000-000000000010",
   "depends_on": [
     {

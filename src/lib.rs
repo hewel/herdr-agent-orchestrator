@@ -12,3 +12,5 @@ pub mod mcp;
 pub mod process_adapter;
 pub mod profile;
 pub mod repository;
+pub mod session_reuse;
+pub mod supervisor_host;

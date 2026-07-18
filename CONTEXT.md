@@ -50,6 +50,30 @@ _Avoid_: Final completion, universal artifact
 The Supervisor Harness's acceptance of a Result and the associated repository state.
 _Avoid_: Worker completion, delivery acknowledgement
 
+**Task Role**:
+The declared semantic purpose of a Task (implementation, investigation, review, verification, other) used by conservative automatic Session selection.
+_Avoid_: Workflow type, model tier
+
+**Session Reuse Policy**:
+The declared relationship between a Task and a native Worker Session: required, prefer, fresh, or auto.
+_Avoid_: Auto mode, adapter decision
+
+**Task Session Binding**:
+The durable, auditable record of which Harness Session a Task was bound to, with the requested and effective reuse policy and decision evidence.
+_Avoid_: Routing decision, queue assignment
+
+**Native Session Health**:
+Provider-neutral evidence about a native conversation (healthy, context pressure, compacted, ambiguous, failed) consulted only after identity and policy compatibility.
+_Avoid_: Harness presence, Task state
+
+**Supervisor Event**:
+A durable, deduplicated attention record that may wake the visible Supervisor Harness.
+_Avoid_: Notification queue entry, Bus Message
+
+**Supervisor Host**:
+The pane-resident process that binds a managed Supervisor's visible native conversation and injects Supervisor Events through its Supervisor Adapter.
+_Avoid_: Orchestrator, popup
+
 ## Communication
 
 **Bus Message**:
