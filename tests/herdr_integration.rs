@@ -188,13 +188,14 @@ fn workspace_action_opens_the_setup_popup_in_the_invoking_workspace() {
         std::process::Command::new(root.join("plugin/herdr-harness-coordinator/scripts/workspace"))
             .env("HERDR_BIN", "/bin/echo")
             .env("HERDR_WORKSPACE_ID", "wF")
+            .env("HERDR_PANE_ID", "wF:p7")
             .output()
             .unwrap();
 
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
-        "plugin pane open --plugin herdr-harness-coordinator --entrypoint harness-network --workspace wF --focus\n"
+        "plugin pane open --plugin herdr-harness-coordinator --entrypoint harness-network --workspace wF --target-pane wF:p7 --focus\n"
     );
 }
 

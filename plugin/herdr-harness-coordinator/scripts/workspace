@@ -2,10 +2,12 @@
 set -eu
 
 : "${HERDR_WORKSPACE_ID:?Herdr workspace action context is required}"
+: "${HERDR_PANE_ID:?Herdr active pane context is required}"
 HERDR_BIN="${HERDR_BIN:-herdr}"
 
 exec "$HERDR_BIN" plugin pane open \
   --plugin herdr-harness-coordinator \
   --entrypoint harness-network \
   --workspace "$HERDR_WORKSPACE_ID" \
+  --target-pane "$HERDR_PANE_ID" \
   --focus
