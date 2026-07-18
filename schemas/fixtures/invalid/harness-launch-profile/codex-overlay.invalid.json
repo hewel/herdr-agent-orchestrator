@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "id": "codex-worker",
+  "kind": "codex",
+  "executable": "/usr/bin/codex",
+  "provider_profile": "work",
+  "inherit_env": [],
+  "config_overlays": ["/home/user/.codex/config.toml"]
+}

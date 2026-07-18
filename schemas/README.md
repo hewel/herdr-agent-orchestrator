@@ -3,6 +3,7 @@
 These Draft 2020-12 schemas are the checked-in wire and persistence boundary for the Harness Coordinator MVP:
 
 - `harness-definition-v1.schema.json` defines durable Harness registration and launch identity;
+- `harness-launch-profile-v1.schema.json` resolves an explicit profile ID into a pinned provider launch;
 - `task-submission-v1.schema.json` defines bounded Task and repository authority input;
 - `message-submission-v1.schema.json` defines Question, Reply, Correction, and Notification input;
 - `result-manifest-v1.schema.json` defines the consolidated Worker Result;

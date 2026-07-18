@@ -13,6 +13,7 @@ const schemaCache = new Map();
 const fixtureSchemas = new Map([
   ["delivery-receipt", "delivery-receipt-v1.schema.json"],
   ["harness-definition", "harness-definition-v1.schema.json"],
+  ["harness-launch-profile", "harness-launch-profile-v1.schema.json"],
   ["message-submission", "message-submission-v1.schema.json"],
   ["repository-observation", "repository-observation-v1.schema.json"],
   ["result-manifest", "result-manifest-v1.schema.json"],
