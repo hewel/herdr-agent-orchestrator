@@ -8,6 +8,6 @@ pub mod core;
 pub mod herdr;
 pub mod host;
 pub mod mcp;
-pub mod profile;
 pub mod process_adapter;
+pub mod profile;
 pub mod repository;
