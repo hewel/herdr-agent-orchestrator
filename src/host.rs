@@ -1,0 +1,361 @@
+//! Pane-resident Worker Host and terminal popup entrypoint behavior.
+
+use std::{collections::BTreeMap, path::Path, time::Duration};
+
+use anyhow::{Context, Result, anyhow, bail};
+use futures::StreamExt;
+use sha2::{Digest, Sha256};
+
+use crate::{
+    adapter::{
+        AdapterEvent, HarnessAdapter, HarnessStartSpec, NativeDeliveryKind, NativeTurnStatus,
+        ResolvedDelivery,
+    },
+    attachment::AttachmentStore,
+    broker::{BrokerOperation, BrokerRequest, call},
+    contract::{
+        DeliveryIntent, HarnessKind, HarnessLaunchProfileV1, MessageSubmissionV1, SCHEMA_VERSION,
+        TaskSubmissionV1, Validate,
+    },
+    core::{
+        ActorContext, CommandOutcome, CoordinatorCommand, CoordinatorQuery, InboxMessageView,
+        QueryResult, SessionCapability, TaskState,
+    },
+    process_adapter::{CodexProcessAdapter, OmpProcessAdapter},
+};
+
+const POLL_INTERVAL: Duration = Duration::from_millis(500);
+const PRE_WRITE_RETRIES: usize = 3;
+
+/// Runs one Worker pane's provider process until it exits or the Host is stopped.
+///
+/// # Errors
+///
+/// Returns an error when Session bootstrap, profile validation, broker delivery, or the
+/// provider lifecycle fails.
+pub async fn run_worker_host(socket: &Path, state_dir: &Path, bearer: String) -> Result<()> {
+    let capability = SessionCapability::from_bearer(bearer)?;
+    let session = broker_query(socket, capability.clone(), CoordinatorQuery::SessionSelf).await?;
+    let QueryResult::Session(session) = session else {
+        bail!("broker returned the wrong Session bootstrap projection");
+    };
+    let snapshot = session
+        .profile_snapshot
+        .context("Worker Session has no launch profile snapshot")?;
+    let expected_digest = session
+        .profile_digest
+        .context("Worker Session has no launch profile digest")?;
+    let actual_digest = hex::encode(Sha256::digest(snapshot.as_bytes()));
+    if actual_digest != expected_digest {
+        bail!("Worker launch profile snapshot digest does not match durable Session state");
+    }
+    let profile: HarnessLaunchProfileV1 =
+        toml::from_str(&snapshot).context("decoding durable Worker launch profile snapshot")?;
+    profile
+        .validate()
+        .context("validating durable Worker launch profile")?;
+    if profile.kind != session.definition.kind {
+        bail!("Worker Harness Kind differs from its durable launch profile");
+    }
+    let environment = profile
+        .inherit_env
+        .iter()
+        .filter_map(|name| std::env::var(name).ok().map(|value| (name.clone(), value)))
+        .collect::<BTreeMap<_, _>>();
+    let spec = HarnessStartSpec {
+        session_id: session.session_id,
+        executable: profile.executable,
+        cwd: session.definition.cwd,
+        provider_state_dir: state_dir
+            .join("sessions")
+            .join(session.session_id.to_string()),
+        provider_profile: profile.provider_profile,
+        model: profile.model,
+        config_overlays: profile.config_overlays,
+        environment,
+    };
+    tokio::fs::create_dir_all(&spec.provider_state_dir)
+        .await
+        .context("creating provider Session state directory")?;
+    let mut adapter: Box<dyn HarnessAdapter> = match profile.kind {
+        HarnessKind::Omp => Box::new(OmpProcessAdapter::new()),
+        HarnessKind::Codex => Box::new(CodexProcessAdapter::new()),
+    };
+    adapter
+        .start(&spec)
+        .await
+        .context("starting native Harness")?;
+    let mut events = adapter.events();
+    let mut current_task = None;
+    let mut ticker = tokio::time::interval(POLL_INTERVAL);
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                let inbox = broker_query(socket, capability.clone(), CoordinatorQuery::Inbox).await?;
+                let QueryResult::Inbox(messages) = inbox else { bail!("broker returned the wrong inbox projection") };
+                if let Some(message) = messages.first() {
+                    let task_id = message.task_id.context("Worker inbox contained a network Message")?;
+                    let Some(delivery) = resolve_delivery(
+                        adapter.as_mut(),
+                        socket,
+                        state_dir,
+                        capability.clone(),
+                        message,
+                        task_id,
+                    ).await? else {
+                        continue;
+                    };
+                    match dispatch_with_safe_retries(adapter.as_mut(), delivery).await {
+                        Ok(acceptance) => {
+                            broker_execute(socket, capability.clone(), CoordinatorCommand::AcceptDelivery {
+                                message_id: message.id,
+                                native_correlation: acceptance.correlation,
+                            }).await?;
+                            broker_execute(socket, capability.clone(), CoordinatorCommand::MarkInboxRead {
+                                message_ids: vec![message.id],
+                            }).await?;
+                            current_task = Some(task_id);
+                        }
+                        Err(error) if error.to_string().contains("unknown") || error.to_string().contains("after write") => {
+                            broker_execute(socket, capability.clone(), CoordinatorCommand::MarkDeliveryUnknown {
+                                message_id: message.id,
+                                diagnostic: error.to_string(),
+                            }).await?;
+                            adapter.stop().await.ok();
+                            return Err(error).context("native delivery acceptance became ambiguous");
+                        }
+                        Err(error) => return Err(error).context("native delivery failed before acceptance"),
+                    }
+                }
+                let tasks = broker_query(socket, capability.clone(), CoordinatorQuery::ListTasks).await?;
+                if let QueryResult::Tasks(tasks) = tasks
+                    && let Some(task) = tasks.iter().find(|task| task.worker_id == session.definition.id && task.state == TaskState::Cancelling)
+                {
+                    adapter.cancel_active().await.context("cooperatively cancelling native turn")?;
+                    broker_execute(socket, capability.clone(), CoordinatorCommand::RecordCancellationCompleted {
+                        task_id: task.id,
+                        succeeded: true,
+                    }).await?;
+                    current_task = None;
+                }
+            }
+            event = events.next() => {
+                match event {
+                    Some(Ok(AdapterEvent::TurnCompleted { turn_id, status })) => {
+                        if let Some(task_id) = current_task.take() {
+                            broker_execute(socket, capability.clone(), CoordinatorCommand::RecordTurnCompleted {
+                                task_id,
+                                native_turn_id: turn_id.unwrap_or_else(|| "provider-turn".to_owned()),
+                                succeeded: status == NativeTurnStatus::Completed,
+                            }).await?;
+                        }
+                    }
+                    Some(Ok(AdapterEvent::Failed { message })) => return Err(anyhow!(message)),
+                    Some(Ok(AdapterEvent::Exited { exit_code })) => {
+                        bail!("native Harness exited with status {exit_code:?}");
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => return Err(error).context("reading native Harness event"),
+                    None => bail!("native Harness event stream closed"),
+                }
+            }
+            signal = tokio::signal::ctrl_c() => {
+                signal.context("waiting for Worker Host shutdown signal")?;
+                adapter.stop().await.context("stopping native Harness")?;
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Renders one durable text snapshot for the Herdr popup entrypoint.
+///
+/// Mutating popup actions use the same broker command frames through the `call` CLI.
+pub async fn render_popup(socket: &Path, bearer: String) -> Result<String> {
+    let capability = SessionCapability::from_bearer(bearer)?;
+    let status = broker_query(socket, capability.clone(), CoordinatorQuery::HarnessStatus).await?;
+    let tasks = broker_query(socket, capability.clone(), CoordinatorQuery::ListTasks).await?;
+    let holds = broker_query(socket, capability, CoordinatorQuery::ActiveHolds).await?;
+    let QueryResult::HarnessStatus(status) = status else {
+        bail!("invalid Harness status response")
+    };
+    let QueryResult::Tasks(tasks) = tasks else {
+        bail!("invalid Task list response")
+    };
+    let QueryResult::Holds(holds) = holds else {
+        bail!("invalid Hold list response")
+    };
+    let mut output = String::from("Harness Network\n\n");
+    for harness in status {
+        output.push_str(&format!(
+            "{} {} · {:?} · {} · inbox {}\n",
+            if harness.presence == "online" {
+                "●"
+            } else {
+                "○"
+            },
+            harness.id,
+            harness.tier,
+            harness.activity,
+            harness.unread_messages
+        ));
+    }
+    output.push_str("\nTasks\n");
+    for task in tasks {
+        output.push_str(&format!(
+            "{} · {} · {:?} · revision {}\n",
+            task.id, task.worker_id, task.state, task.result_revision
+        ));
+    }
+    if !holds.is_empty() {
+        output.push_str("\nWorktree Holds\n");
+        for hold in holds {
+            output.push_str(&format!(
+                "{} · {} · {}\n",
+                hold.task_id, hold.repository_key, hold.reason
+            ));
+        }
+    }
+    Ok(output)
+}
+
+async fn resolve_delivery(
+    adapter: &mut dyn HarnessAdapter,
+    socket: &Path,
+    state_dir: &Path,
+    capability: SessionCapability,
+    message: &InboxMessageView,
+    task_id: crate::contract::TaskId,
+) -> Result<Option<ResolvedDelivery>> {
+    let (text, intent, attachment_ids) = if message.kind == "task" {
+        let task: TaskSubmissionV1 =
+            serde_json::from_value(message.body.clone()).context("decoding root Task Message")?;
+        (
+            task.instructions,
+            DeliveryIntent::FollowUp,
+            task.attachments,
+        )
+    } else {
+        let message: MessageSubmissionV1 =
+            serde_json::from_value(message.body.clone()).context("decoding Bus Message")?;
+        (message.text, message.delivery, message.attachments)
+    };
+    let snapshot = adapter
+        .snapshot()
+        .await
+        .context("capturing Adapter state before delivery")?;
+    if intent == DeliveryIntent::FollowUp
+        && snapshot.lifecycle == crate::adapter::AdapterLifecycle::Working
+        && !adapter.capabilities().active_turn_follow_up
+    {
+        return Ok(None);
+    }
+    let kind = match intent {
+        DeliveryIntent::Steer => NativeDeliveryKind::Steer,
+        DeliveryIntent::FollowUp
+            if snapshot.lifecycle == crate::adapter::AdapterLifecycle::Working =>
+        {
+            NativeDeliveryKind::FollowUp
+        }
+        DeliveryIntent::FollowUp => NativeDeliveryKind::StartTurn,
+    };
+    let mut attachments = Vec::with_capacity(attachment_ids.len());
+    let store = AttachmentStore::new(state_dir);
+    for attachment_id in attachment_ids {
+        let result = broker_query(
+            socket,
+            capability.clone(),
+            CoordinatorQuery::GetAttachment { attachment_id },
+        )
+        .await?;
+        let QueryResult::Attachment(metadata) = result else {
+            bail!("broker returned the wrong Attachment projection");
+        };
+        store
+            .verify(&metadata)
+            .await
+            .context("verifying immutable Attachment before provider delivery")?;
+        attachments.push(crate::adapter::ResolvedAttachment {
+            id: metadata.id,
+            path: state_dir.join(metadata.storage_path),
+            media_type: metadata.media_type,
+        });
+    }
+    Ok(Some(ResolvedDelivery {
+        correlation: message.id.to_string(),
+        task_id,
+        kind,
+        text,
+        attachments,
+    }))
+}
+
+async fn dispatch_with_safe_retries(
+    adapter: &mut dyn HarnessAdapter,
+    delivery: ResolvedDelivery,
+) -> crate::adapter::AdapterResult<crate::adapter::NativeAcceptance> {
+    let mut last = None;
+    for _ in 0..PRE_WRITE_RETRIES {
+        match adapter.dispatch(delivery.clone()).await {
+            Ok(acceptance) => return Ok(acceptance),
+            Err(error)
+                if error.to_string().contains("unknown")
+                    || error.to_string().contains("after write") =>
+            {
+                return Err(error);
+            }
+            Err(error) => last = Some(error),
+        }
+    }
+    Err(last.expect("at least one retry attempt"))
+}
+
+async fn broker_query(
+    socket: &Path,
+    capability: SessionCapability,
+    query: CoordinatorQuery,
+) -> Result<QueryResult> {
+    let response = call(
+        socket,
+        &BrokerRequest {
+            schema_version: SCHEMA_VERSION,
+            request_id: uuid::Uuid::now_v7().to_string(),
+            operation: BrokerOperation::Query {
+                actor: ActorContext::Session { capability },
+                query,
+            },
+        },
+    )
+    .await?;
+    decode_result(response)
+}
+
+async fn broker_execute(
+    socket: &Path,
+    capability: SessionCapability,
+    command: CoordinatorCommand,
+) -> Result<CommandOutcome> {
+    let response = call(
+        socket,
+        &BrokerRequest {
+            schema_version: SCHEMA_VERSION,
+            request_id: uuid::Uuid::now_v7().to_string(),
+            operation: BrokerOperation::Execute {
+                actor: ActorContext::Session { capability },
+                command,
+            },
+        },
+    )
+    .await?;
+    decode_result(response)
+}
+
+fn decode_result<T: serde::de::DeserializeOwned>(
+    response: crate::broker::BrokerResponse,
+) -> Result<T> {
+    if let Some(error) = response.error {
+        bail!("broker {:?}: {}", error.category, error.message);
+    }
+    serde_json::from_value(response.result.context("broker response omitted result")?)
+        .context("decoding typed broker result")
+}

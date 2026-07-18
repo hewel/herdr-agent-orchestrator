@@ -14,6 +14,7 @@ use herdr_harness_coordinator::{
         DeliveryUnknownResolution, QueryResult, SessionCapability, TaskState,
     },
 };
+use sha2::{Digest, Sha256};
 
 #[tokio::test]
 async fn supervisor_registration_makes_the_harness_queryable() {
@@ -442,6 +443,7 @@ async fn supervisor_can_queue_a_mutating_task_for_an_explicit_worker() {
         launch_profile: Some("omp-worker".to_owned()),
         model: Some("anthropic/claude-sonnet-4".to_owned()),
     };
+    let (profile_snapshot, profile_digest) = worker_profile(Some("anthropic/claude-sonnet-4"));
     coordinator
         .execute(
             ActorContext::Session {
@@ -449,8 +451,8 @@ async fn supervisor_can_queue_a_mutating_task_for_an_explicit_worker() {
             },
             CoordinatorCommand::StartWorker {
                 definition: worker,
-                profile_snapshot: "profile-v1".to_owned(),
-                profile_digest: "0".repeat(64),
+                profile_snapshot,
+                profile_digest,
             },
         )
         .await
@@ -537,6 +539,7 @@ async fn seeded_task() -> (
         panic!("Supervisor registration must return a capability")
     };
     let worker_id: HarnessId = "omp-worker".parse().expect("ID must be valid");
+    let (profile_snapshot, profile_digest) = worker_profile(None);
     let CommandOutcome::WorkerStarted {
         capability: worker, ..
     } = coordinator
@@ -554,8 +557,8 @@ async fn seeded_task() -> (
                     launch_profile: Some("omp-worker".to_owned()),
                     model: None,
                 },
-                profile_snapshot: "profile-v1".to_owned(),
-                profile_digest: "0".repeat(64),
+                profile_snapshot,
+                profile_digest,
             },
         )
         .await
@@ -683,4 +686,15 @@ async fn assert_task_state(
     };
     assert_eq!(task.state, expected_state);
     assert_eq!(task.result_revision, expected_revision);
+}
+
+fn worker_profile(model: Option<&str>) -> (String, String) {
+    let executable = std::env::current_exe().expect("test executable path");
+    let model = model.map_or_else(String::new, |model| format!("model = {model:?}\n"));
+    let snapshot = format!(
+        "schema_version = 1\nid = \"omp-worker\"\nkind = \"omp\"\nexecutable = {:?}\nprovider_profile = \"test-worker\"\n{model}",
+        executable
+    );
+    let digest = hex::encode(Sha256::digest(snapshot.as_bytes()));
+    (snapshot, digest)
 }

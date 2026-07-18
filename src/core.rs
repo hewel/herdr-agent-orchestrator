@@ -19,8 +19,8 @@ use uuid::Uuid;
 
 use crate::attachment::{AttachmentMetadata, AttachmentStore};
 use crate::contract::{
-    DeliveryAttemptId, DeliveryIntent, HarnessDefinitionV1, HarnessId, HarnessSessionId,
-    HarnessTier, MessageId, MessageKind, MessageSubmissionV1, RepositoryAccess,
+    DeliveryAttemptId, DeliveryIntent, HarnessDefinitionV1, HarnessId, HarnessLaunchProfileV1,
+    HarnessSessionId, HarnessTier, MessageId, MessageKind, MessageSubmissionV1, RepositoryAccess,
     RepositoryObservationV1, ResultManifestV1, TaskId, TaskSubmissionV1, Validate, WorktreeHoldId,
 };
 
@@ -98,6 +98,27 @@ impl SessionCapability {
 
     fn digest(&self) -> String {
         hex::encode(Sha256::digest(self.0.as_bytes()))
+    }
+
+    /// Parses the opaque bearer passed to a pane-resident Host.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoordinatorError`] when the bearer does not have the generated v1 shape.
+    pub fn from_bearer(value: impl Into<String>) -> Result<Self, CoordinatorError> {
+        let value = value.into();
+        let valid = value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase());
+        if valid {
+            Ok(Self(value))
+        } else {
+            Err(CoordinatorError::new(
+                ErrorCategory::Unauthenticated,
+                "Session capability has an invalid shape",
+            ))
+        }
     }
 }
 
@@ -216,6 +237,12 @@ pub enum CoordinatorQuery {
     HarnessStatus,
     /// Return unresolved Worktree Holds (Supervisor only).
     ActiveHolds,
+    /// Return launch context for the authenticated Harness Host.
+    SessionSelf,
+    /// Return immutable Attachment metadata for authorized local delivery.
+    GetAttachment {
+        attachment_id: crate::contract::AttachmentId,
+    },
 }
 
 /// Durable Task lifecycle state.
@@ -344,6 +371,19 @@ pub struct HoldView {
     pub reason: String,
 }
 
+/// Session-bound launch context returned only to its capability holder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSelfView {
+    /// Live Coordinator Session identity.
+    pub session_id: HarnessSessionId,
+    /// Durable Harness definition.
+    pub definition: HarnessDefinitionV1,
+    /// Exact selected launch profile source for Workers.
+    pub profile_snapshot: Option<String>,
+    /// SHA-256 of the selected profile source.
+    pub profile_digest: Option<String>,
+}
+
 /// Successful command outcome.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -412,6 +452,10 @@ pub enum QueryResult {
     HarnessStatus(Vec<HarnessStatusView>),
     /// Active advisory Holds.
     Holds(Vec<HoldView>),
+    /// Authenticated Session launch context.
+    Session(SessionSelfView),
+    /// Immutable Attachment metadata.
+    Attachment(AttachmentMetadata),
 }
 
 /// One Coordinator daemon's deep transactional state module.
@@ -682,6 +726,10 @@ impl Coordinator {
                 self.require_supervisor(&actor)?;
                 self.active_holds().await
             }
+            CoordinatorQuery::SessionSelf => self.session_self(&actor).await,
+            CoordinatorQuery::GetAttachment { attachment_id } => {
+                self.get_attachment(attachment_id).await
+            }
         }
     }
 
@@ -870,6 +918,50 @@ impl Coordinator {
         Ok(QueryResult::Holds(holds))
     }
 
+    async fn session_self(
+        &self,
+        actor: &AuthenticatedActor,
+    ) -> Result<QueryResult, CoordinatorError> {
+        let row = sqlx::query("SELECT h.definition_json, s.profile_snapshot_json, s.profile_digest FROM harness_sessions s JOIN harnesses h ON h.id = s.harness_id WHERE s.id = ? AND s.ended_at IS NULL")
+            .bind(actor.session_id.to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(CoordinatorError::storage)?
+            .ok_or_else(|| CoordinatorError::new(ErrorCategory::NotFound, "Session is no longer active"))?;
+        Ok(QueryResult::Session(SessionSelfView {
+            session_id: actor.session_id,
+            definition: serde_json::from_str(row.get("definition_json"))
+                .map_err(CoordinatorError::storage)?,
+            profile_snapshot: row
+                .get::<Option<&str>, _>("profile_snapshot_json")
+                .map(str::to_owned),
+            profile_digest: row
+                .get::<Option<&str>, _>("profile_digest")
+                .map(str::to_owned),
+        }))
+    }
+
+    async fn get_attachment(
+        &self,
+        attachment_id: crate::contract::AttachmentId,
+    ) -> Result<QueryResult, CoordinatorError> {
+        let row = sqlx::query("SELECT digest, byte_size, media_type, original_name, storage_path FROM attachments WHERE id = ?")
+            .bind(attachment_id.to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(CoordinatorError::storage)?
+            .ok_or_else(|| CoordinatorError::new(ErrorCategory::NotFound, "Attachment does not exist"))?;
+        let size: i64 = row.get("byte_size");
+        Ok(QueryResult::Attachment(AttachmentMetadata {
+            id: attachment_id,
+            digest: row.get::<&str, _>("digest").to_owned(),
+            size_bytes: u64::try_from(size).map_err(CoordinatorError::storage)?,
+            media_type: row.get::<&str, _>("media_type").to_owned(),
+            original_name: row.get::<&str, _>("original_name").to_owned(),
+            storage_path: PathBuf::from(row.get::<&str, _>("storage_path")),
+        }))
+    }
+
     async fn register_supervisor(
         &self,
         definition: HarnessDefinitionV1,
@@ -953,6 +1045,32 @@ impl Coordinator {
             ));
         }
         validate_digest(&profile_digest)?;
+        let actual_digest = hex::encode(Sha256::digest(profile_snapshot.as_bytes()));
+        if actual_digest != profile_digest {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidInput,
+                "launch profile snapshot digest does not match",
+            ));
+        }
+        let profile: HarnessLaunchProfileV1 =
+            toml::from_str(&profile_snapshot).map_err(|error| {
+                CoordinatorError::new(
+                    ErrorCategory::InvalidInput,
+                    format!("launch profile snapshot is invalid TOML: {error}"),
+                )
+            })?;
+        profile.validate().map_err(|error| {
+            CoordinatorError::new(ErrorCategory::InvalidInput, error.to_string())
+        })?;
+        if profile.kind != definition.kind
+            || definition.launch_profile.as_deref() != Some(profile.id.as_str())
+            || definition.model != profile.model
+        {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidInput,
+                "Worker definition does not match the resolved launch profile",
+            ));
+        }
         let mut transaction = self.pool.begin().await.map_err(CoordinatorError::storage)?;
         let definition_json =
             serde_json::to_string(&definition).map_err(CoordinatorError::storage)?;
@@ -2050,7 +2168,6 @@ impl Coordinator {
 struct AuthenticatedActor {
     id: HarnessId,
     tier: HarnessTier,
-    #[expect(dead_code, reason = "retained for Session-bound command authorization")]
     session_id: HarnessSessionId,
 }
 

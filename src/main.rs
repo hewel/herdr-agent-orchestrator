@@ -38,6 +38,30 @@ enum Command {
         #[arg(long, env = "HERDR_COORDINATOR_SOCKET")]
         socket: PathBuf,
     },
+    /// Run one pane-resident Worker Host and its persistent native Harness.
+    WorkerHost {
+        /// Opaque Session capability passed by the Herdr Worker pane launch.
+        #[arg(long)]
+        session_id: String,
+        /// Durable plugin state directory.
+        #[arg(long, env = "HERDR_PLUGIN_STATE_DIR")]
+        state_dir: PathBuf,
+        /// Broker Unix socket; defaults beneath the state directory.
+        #[arg(long, env = "HERDR_COORDINATOR_SOCKET")]
+        socket: Option<PathBuf>,
+    },
+    /// Render the durable Harness Network popup snapshot.
+    Popup {
+        /// Active Supervisor capability used for authorized popup queries.
+        #[arg(long, env = "HERDR_SUPERVISOR_CAPABILITY")]
+        supervisor_capability: String,
+        /// Durable plugin state directory.
+        #[arg(long, env = "HERDR_PLUGIN_STATE_DIR")]
+        state_dir: PathBuf,
+        /// Broker Unix socket; defaults beneath the state directory.
+        #[arg(long, env = "HERDR_COORDINATOR_SOCKET")]
+        socket: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -51,6 +75,28 @@ async fn main() -> Result<()> {
         Command::Daemon { state_dir, socket } => run_daemon(state_dir, socket).await,
         Command::Call { socket } => run_call(socket).await,
         Command::StdioProxy { socket } => run_proxy(socket).await,
+        Command::WorkerHost {
+            session_id,
+            state_dir,
+            socket,
+        } => {
+            let socket = socket.unwrap_or_else(|| state_dir.join("coordinator.sock"));
+            herdr_harness_coordinator::host::run_worker_host(&socket, &state_dir, session_id).await
+        }
+        Command::Popup {
+            supervisor_capability,
+            state_dir,
+            socket,
+        } => {
+            let socket = socket.unwrap_or_else(|| state_dir.join("coordinator.sock"));
+            let output =
+                herdr_harness_coordinator::host::render_popup(&socket, supervisor_capability)
+                    .await?;
+            tokio::io::stdout()
+                .write_all(output.as_bytes())
+                .await
+                .context("writing popup snapshot")
+        }
     }
 }
 
