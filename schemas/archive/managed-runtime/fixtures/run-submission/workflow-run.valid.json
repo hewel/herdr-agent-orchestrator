@@ -2,7 +2,7 @@
   "schema_version": 1,
   "kind": "workflow_run",
   "request_key": "download-race-workflow-v1",
-  "worktree_path": "/workspace/herdr-agent-orchestrator",
+  "worktree_path": "/workspace/herdr-harness-coordinator",
   "timeout_seconds": 3600,
   "assignments": {
     "implementer": {

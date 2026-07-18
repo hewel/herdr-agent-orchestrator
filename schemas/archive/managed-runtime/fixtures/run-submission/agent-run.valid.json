@@ -2,7 +2,7 @@
   "schema_version": 1,
   "kind": "agent_run",
   "request_key": "download-race-v1",
-  "worktree_path": "/workspace/herdr-agent-orchestrator",
+  "worktree_path": "/workspace/herdr-harness-coordinator",
   "timeout_seconds": 1800,
   "assignment": {
     "provider": "omp",

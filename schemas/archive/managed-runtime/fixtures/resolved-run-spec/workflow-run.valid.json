@@ -9,23 +9,23 @@
     "deadline_at": "2026-07-18T09:00:00Z",
     "delegation_mode": "managed",
     "repository": {
-      "submitted_worktree_path": "/workspace/herdr-agent-orchestrator",
+      "submitted_worktree_path": "/workspace/herdr-harness-coordinator",
       "worktree": {
-        "canonical_path": "/workspace/herdr-agent-orchestrator",
+        "canonical_path": "/workspace/herdr-harness-coordinator",
         "mount_id": 41,
         "device_major": 8,
         "device_minor": 1,
         "inode": 1001
       },
       "git_directory": {
-        "canonical_path": "/workspace/herdr-agent-orchestrator/.git",
+        "canonical_path": "/workspace/herdr-harness-coordinator/.git",
         "mount_id": 41,
         "device_major": 8,
         "device_minor": 1,
         "inode": 1002
       },
       "git_common_directory": {
-        "canonical_path": "/workspace/herdr-agent-orchestrator/.git",
+        "canonical_path": "/workspace/herdr-harness-coordinator/.git",
         "mount_id": 41,
         "device_major": 8,
         "device_minor": 1,
