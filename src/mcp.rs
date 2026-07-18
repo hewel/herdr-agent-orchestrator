@@ -9,7 +9,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::{
     broker::{BrokerOperation, BrokerRequest, BrokerResponse, call},
-    contract::{MessageSubmissionV1, ResultManifestV1, SCHEMA_VERSION, TaskId},
+    contract::{HarnessId, MessageSubmissionV1, ResultManifestV1, SCHEMA_VERSION, TaskId},
     core::{ActorContext, CoordinatorCommand, CoordinatorQuery, SessionCapability},
 };
 
@@ -162,6 +162,13 @@ impl McpServer {
                     audit_note: args.audit_note,
                 })
             }
+            "harness_stop" => {
+                let args: StopArgs =
+                    serde_json::from_value(arguments).context("invalid Worker stop arguments")?;
+                execute(CoordinatorCommand::StopWorker {
+                    worker_id: args.worker_id,
+                })
+            }
             _ => bail!("unknown Coordinator tool `{name}`"),
         };
         let response = call(
@@ -226,6 +233,11 @@ struct HoldClearArgs {
     task_id: TaskId,
     observation_digest: String,
     audit_note: String,
+}
+
+#[derive(Deserialize)]
+struct StopArgs {
+    worker_id: HarnessId,
 }
 
 fn tool_result(response: BrokerResponse) -> Result<Value> {
@@ -295,6 +307,11 @@ fn tools() -> Vec<Value> {
             "harness_hold_clear",
             "Clear a digest-confirmed Worktree Hold without editing files.",
             passthrough,
+        ),
+        tool(
+            "harness_stop",
+            "Stop one explicit Worker Host after settling active cancellation.",
+            json!({"type":"object","required":["worker_id"],"properties":{"worker_id":{"type":"string"}},"additionalProperties":false}),
         ),
     ]
 }

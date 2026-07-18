@@ -87,6 +87,7 @@ pub async fn run_worker_host(socket: &Path, state_dir: &Path, bearer: String) ->
         .context("starting native Harness")?;
     let mut events = adapter.events();
     let mut current_task = None;
+    let mut event_sequence = session.event_sequence;
     let mut ticker = tokio::time::interval(POLL_INTERVAL);
     loop {
         tokio::select! {
@@ -138,23 +139,51 @@ pub async fn run_worker_host(socket: &Path, state_dir: &Path, bearer: String) ->
                     }).await?;
                     current_task = None;
                 }
+                let session_state = broker_query(socket, capability.clone(), CoordinatorQuery::SessionSelf).await?;
+                let QueryResult::Session(session_state) = session_state else {
+                    bail!("broker returned the wrong Session projection");
+                };
+                if session_state.activity == "stopping" {
+                    let tasks = broker_query(socket, capability.clone(), CoordinatorQuery::ListTasks).await?;
+                    let QueryResult::Tasks(tasks) = tasks else {
+                        bail!("broker returned the wrong Task projection");
+                    };
+                    let active = tasks.iter().any(|task| {
+                        task.worker_id == session.definition.id
+                            && matches!(task.state, TaskState::Dispatching | TaskState::Working | TaskState::Waiting | TaskState::Reviewing | TaskState::Cancelling | TaskState::DeliveryUnknown)
+                    });
+                    if !active {
+                        adapter.stop().await.context("stopping native Harness")?;
+                        broker_execute(socket, capability.clone(), CoordinatorCommand::RecordHostStopped { clean: true }).await?;
+                        return Ok(());
+                    }
+                }
             }
             event = events.next() => {
                 match event {
-                    Some(Ok(AdapterEvent::TurnCompleted { turn_id, status })) => {
-                        if let Some(task_id) = current_task.take() {
-                            broker_execute(socket, capability.clone(), CoordinatorCommand::RecordTurnCompleted {
-                                task_id,
-                                native_turn_id: turn_id.unwrap_or_else(|| "provider-turn".to_owned()),
-                                succeeded: status == NativeTurnStatus::Completed,
-                            }).await?;
+                    Some(Ok(event)) => {
+                        event_sequence = event_sequence.saturating_add(1);
+                        broker_execute(socket, capability.clone(), CoordinatorCommand::RecordHostEvent {
+                            sequence: event_sequence,
+                            event: serde_json::to_value(&event).context("serializing normalized Host event")?,
+                        }).await?;
+                        match event {
+                            AdapterEvent::TurnCompleted { turn_id, status } => {
+                                if let Some(task_id) = current_task.take() {
+                                    broker_execute(socket, capability.clone(), CoordinatorCommand::RecordTurnCompleted {
+                                        task_id,
+                                        native_turn_id: turn_id.unwrap_or_else(|| "provider-turn".to_owned()),
+                                        succeeded: status == NativeTurnStatus::Completed,
+                                    }).await?;
+                                }
+                            }
+                            AdapterEvent::Failed { message } => return Err(anyhow!(message)),
+                            AdapterEvent::Exited { exit_code } => {
+                                bail!("native Harness exited with status {exit_code:?}");
+                            }
+                            _ => {}
                         }
                     }
-                    Some(Ok(AdapterEvent::Failed { message })) => return Err(anyhow!(message)),
-                    Some(Ok(AdapterEvent::Exited { exit_code })) => {
-                        bail!("native Harness exited with status {exit_code:?}");
-                    }
-                    Some(Ok(_)) => {}
                     Some(Err(error)) => return Err(error).context("reading native Harness event"),
                     None => bail!("native Harness event stream closed"),
                 }

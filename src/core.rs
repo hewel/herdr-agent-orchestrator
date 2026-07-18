@@ -212,6 +212,12 @@ pub enum CoordinatorCommand {
         observation_digest: String,
         audit_note: String,
     },
+    /// Request a Worker Host and provider process to stop.
+    StopWorker { worker_id: HarnessId },
+    /// Confirm Worker Host process shutdown.
+    RecordHostStopped { clean: bool },
+    /// Persist one monotonic pane-resident Host event for reconnect replay.
+    RecordHostEvent { sequence: u64, event: Value },
 }
 
 /// Explicit Supervisor resolution after ambiguous native acceptance.
@@ -388,6 +394,12 @@ pub struct SessionSelfView {
     pub profile_snapshot: Option<String>,
     /// SHA-256 of the selected profile source.
     pub profile_digest: Option<String>,
+    /// Current Coordinator presence projection.
+    pub presence: String,
+    /// Current Coordinator activity projection.
+    pub activity: String,
+    /// Latest durable pane-resident Host event sequence.
+    pub event_sequence: u64,
 }
 
 /// Successful command outcome.
@@ -442,6 +454,12 @@ pub enum CommandOutcome {
     DeliveryUnknownUpdated { task_id: TaskId, state: TaskState },
     /// A digest-confirmed Worktree Hold was cleared.
     HoldCleared { task_id: TaskId },
+    /// Worker Session was asked to stop.
+    WorkerStopping { worker_id: HarnessId },
+    /// Worker Host shutdown was durably settled.
+    HostStopped { clean: bool },
+    /// Monotonic Host event was persisted or replayed idempotently.
+    HostEventRecorded { sequence: u64 },
 }
 
 /// Successful query result.
@@ -677,6 +695,28 @@ impl Coordinator {
                 self.require_supervisor(&actor)?;
                 self.clear_worktree_hold(task_id, observation_digest, audit_note)
                     .await
+            }
+            (
+                ActorContext::Session { capability },
+                CoordinatorCommand::StopWorker { worker_id },
+            ) => {
+                let actor = self.authenticate(&capability).await?;
+                self.require_supervisor(&actor)?;
+                self.stop_worker(worker_id).await
+            }
+            (
+                ActorContext::Session { capability },
+                CoordinatorCommand::RecordHostStopped { clean },
+            ) => {
+                let actor = self.authenticate(&capability).await?;
+                self.record_host_stopped(&actor, clean).await
+            }
+            (
+                ActorContext::Session { capability },
+                CoordinatorCommand::RecordHostEvent { sequence, event },
+            ) => {
+                let actor = self.authenticate(&capability).await?;
+                self.record_host_event(&actor, sequence, event).await
             }
             _ => Err(CoordinatorError::new(
                 ErrorCategory::Forbidden,
@@ -943,7 +983,7 @@ impl Coordinator {
         &self,
         actor: &AuthenticatedActor,
     ) -> Result<QueryResult, CoordinatorError> {
-        let row = sqlx::query("SELECT h.definition_json, s.profile_snapshot_json, s.profile_digest FROM harness_sessions s JOIN harnesses h ON h.id = s.harness_id WHERE s.id = ? AND s.ended_at IS NULL")
+        let row = sqlx::query("SELECT h.definition_json, s.profile_snapshot_json, s.profile_digest, s.presence, s.activity, s.event_sequence FROM harness_sessions s JOIN harnesses h ON h.id = s.harness_id WHERE s.id = ? AND s.ended_at IS NULL")
             .bind(actor.session_id.to_string())
             .fetch_optional(&self.pool)
             .await
@@ -959,6 +999,10 @@ impl Coordinator {
             profile_digest: row
                 .get::<Option<&str>, _>("profile_digest")
                 .map(str::to_owned),
+            presence: row.get::<&str, _>("presence").to_owned(),
+            activity: row.get::<&str, _>("activity").to_owned(),
+            event_sequence: u64::try_from(row.get::<i64, _>("event_sequence"))
+                .map_err(CoordinatorError::storage)?,
         }))
     }
 
@@ -2212,6 +2256,163 @@ impl Coordinator {
             .await
             .map_err(CoordinatorError::storage)?;
         Ok(CommandOutcome::HoldCleared { task_id })
+    }
+
+    async fn stop_worker(&self, worker_id: HarnessId) -> Result<CommandOutcome, CoordinatorError> {
+        let mut transaction = self.pool.begin().await.map_err(CoordinatorError::storage)?;
+        let session_id: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM harness_sessions WHERE harness_id = ? AND harness_tier = 'worker' AND ended_at IS NULL ORDER BY started_at DESC LIMIT 1",
+        )
+        .bind(worker_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(CoordinatorError::storage)?;
+        let session_id = session_id.ok_or_else(|| {
+            CoordinatorError::new(ErrorCategory::TargetOffline, "Worker has no live Session")
+        })?;
+        if let Some(row) = sqlx::query("SELECT id, state FROM tasks WHERE worker_id = ? AND state IN ('dispatching','working','waiting','reviewing') ORDER BY created_sequence LIMIT 1")
+            .bind(worker_id.as_str())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?
+        {
+            let task_id = parse_uuid_id(row.get("id"))?;
+            let state = TaskState::from_str(row.get("state"))?;
+            transition_exact(&mut transaction, task_id, state, TaskState::Cancelling, false, &timestamp()).await?;
+        }
+        sqlx::query(
+            "UPDATE harness_sessions SET activity = 'stopping', last_seen_at = ? WHERE id = ?",
+        )
+        .bind(timestamp())
+        .bind(session_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(CoordinatorError::storage)?;
+        transaction
+            .commit()
+            .await
+            .map_err(CoordinatorError::storage)?;
+        Ok(CommandOutcome::WorkerStopping { worker_id })
+    }
+
+    async fn record_host_stopped(
+        &self,
+        actor: &AuthenticatedActor,
+        clean: bool,
+    ) -> Result<CommandOutcome, CoordinatorError> {
+        if actor.tier != HarnessTier::Worker {
+            return Err(CoordinatorError::new(
+                ErrorCategory::Forbidden,
+                "only a Worker Host may report its shutdown",
+            ));
+        }
+        let mut transaction = self.pool.begin().await.map_err(CoordinatorError::storage)?;
+        if clean {
+            let active: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM tasks WHERE worker_id = ? AND state IN ('dispatching','working','waiting','reviewing','cancelling','delivery_unknown')",
+            )
+            .bind(actor.id.as_str())
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?;
+            if active != 0 {
+                return Err(CoordinatorError::new(
+                    ErrorCategory::InvalidState,
+                    "clean Host stop requires active Task cancellation to settle first",
+                ));
+            }
+        }
+        let now = timestamp();
+        sqlx::query("UPDATE harness_sessions SET presence = ?, activity = ?, ended_at = ?, last_seen_at = ? WHERE id = ? AND ended_at IS NULL")
+            .bind(if clean { "stopped" } else { "failed" })
+            .bind(if clean { "idle" } else { "failed" })
+            .bind(&now)
+            .bind(&now)
+            .bind(actor.session_id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        transaction
+            .commit()
+            .await
+            .map_err(CoordinatorError::storage)?;
+        Ok(CommandOutcome::HostStopped { clean })
+    }
+
+    async fn record_host_event(
+        &self,
+        actor: &AuthenticatedActor,
+        sequence: u64,
+        event: Value,
+    ) -> Result<CommandOutcome, CoordinatorError> {
+        if actor.tier != HarnessTier::Worker || sequence == 0 {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidInput,
+                "Worker Host event sequence must start at one",
+            ));
+        }
+        let sequence = i64::try_from(sequence).map_err(CoordinatorError::storage)?;
+        let event_json = serde_json::to_string(&event).map_err(CoordinatorError::storage)?;
+        if event_json.len() > 65_536 {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidInput,
+                "Host event exceeds 65,536 bytes",
+            ));
+        }
+        let mut transaction = self.pool.begin().await.map_err(CoordinatorError::storage)?;
+        let current: i64 = sqlx::query_scalar(
+            "SELECT event_sequence FROM harness_sessions WHERE id = ? AND ended_at IS NULL",
+        )
+        .bind(actor.session_id.to_string())
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(CoordinatorError::storage)?;
+        if sequence <= current {
+            let existing: Option<String> = sqlx::query_scalar(
+                "SELECT event_json FROM host_events WHERE session_id = ? AND sequence = ?",
+            )
+            .bind(actor.session_id.to_string())
+            .bind(sequence)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?;
+            if existing.as_deref() != Some(&event_json) {
+                return Err(CoordinatorError::new(
+                    ErrorCategory::Conflict,
+                    "replayed Host event differs from durable event",
+                ));
+            }
+        } else if sequence == current + 1 {
+            sqlx::query("INSERT INTO host_events (session_id, sequence, event_json, received_at) VALUES (?, ?, ?, ?)")
+                .bind(actor.session_id.to_string())
+                .bind(sequence)
+                .bind(event_json)
+                .bind(timestamp())
+                .execute(&mut *transaction)
+                .await
+                .map_err(CoordinatorError::storage)?;
+            sqlx::query(
+                "UPDATE harness_sessions SET event_sequence = ?, last_seen_at = ? WHERE id = ?",
+            )
+            .bind(sequence)
+            .bind(timestamp())
+            .bind(actor.session_id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        } else {
+            return Err(CoordinatorError::new(
+                ErrorCategory::Conflict,
+                "Host event sequence has a gap",
+            ));
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(CoordinatorError::storage)?;
+        Ok(CommandOutcome::HostEventRecorded {
+            sequence: u64::try_from(sequence).map_err(CoordinatorError::storage)?,
+        })
     }
 
     async fn authenticate(

@@ -503,6 +503,65 @@ async fn inbox_and_popup_projections_follow_durable_read_markers() {
 }
 
 #[tokio::test]
+async fn host_events_replay_idempotently_and_supervisor_can_stop_an_idle_worker() {
+    let (_state, coordinator, supervisor, worker, _task_id) = seeded_task().await;
+    let event = serde_json::json!({"kind":"activity","summary":"started"});
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: worker.clone(),
+            },
+            CoordinatorCommand::RecordHostEvent {
+                sequence: 1,
+                event: event.clone(),
+            },
+        )
+        .await
+        .expect("first Host event");
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: worker.clone(),
+            },
+            CoordinatorCommand::RecordHostEvent { sequence: 1, event },
+        )
+        .await
+        .expect("identical replay must be idempotent");
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor,
+            },
+            CoordinatorCommand::StopWorker {
+                worker_id: "omp-worker".parse().expect("valid ID"),
+            },
+        )
+        .await
+        .expect("Supervisor stop intent");
+    let QueryResult::Session(session) = coordinator
+        .query(
+            ActorContext::Session {
+                capability: worker.clone(),
+            },
+            CoordinatorQuery::SessionSelf,
+        )
+        .await
+        .expect("Host launch state")
+    else {
+        panic!("Session projection")
+    };
+    assert_eq!(session.activity, "stopping");
+    assert_eq!(session.event_sequence, 1);
+    coordinator
+        .execute(
+            ActorContext::Session { capability: worker },
+            CoordinatorCommand::RecordHostStopped { clean: true },
+        )
+        .await
+        .expect("idle Host stop completion");
+}
+
+#[tokio::test]
 async fn supervisor_can_queue_a_mutating_task_for_an_explicit_worker() {
     let state = tempfile::tempdir().expect("state directory must exist");
     let coordinator = Coordinator::open(state.path())
