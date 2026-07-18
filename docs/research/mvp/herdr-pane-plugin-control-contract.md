@@ -1,241 +1,135 @@
-# Herdr pane and plugin control contract
+# Herdr Harness pane and plugin contract
 
-Status: resolved for the Managed Runtime MVP.
+Status: resolved for the Harness Coordinator MVP.
 
-This note defines the boundary between Herdr and Herdr Agent Orchestrator for
-provider launch, pane identity, focus, cancellation, status, popups, and restart
-reconciliation. It targets the locally verified `herdr 0.7.4` socket protocol
-`16` and deliberately separates Herdr guarantees from project decisions.
-
-Durable run identity is allocated at acceptance according to the
-[public run contract](public-run-contract.md); caller-supplied IDs never become
-Herdr or orchestrator authority.
+This contract defines Worker pane launch, Supervisor registration, live terminal identity, focus, metadata, cancellation, popup behavior, reconnect, and cold-restart handling. It targets the locally verified Herdr `0.7.4` socket protocol `16`.
 
 ## Confirmed Herdr facts
 
-### Plugins and panes
+- A plugin is an out-of-process package with manifest-declared actions and pane entrypoints.
+- `plugin.pane.open` launches a declared entrypoint. Normal tab panes receive Herdr workspace, tab, pane, socket, and plugin environment.
+- A popup is session-modal, has no pane ID, is not present in pane APIs, and cannot own a Harness lifecycle.
+- `session.snapshot` bootstraps workspace, tab, pane, terminal, focus, and agent state. Event subscriptions are required afterward, and reconnect requires a fresh snapshot.
+- A pane has a public mutable `pane_id` and a live `terminal_id`. Moving a live terminal changes pane location while retaining terminal identity.
+- `pane.report_agent` has one semantic status authority. `pane.report_metadata` changes presentation without owning lifecycle state.
+- Detach and reattach preserve live processes. A cold Herdr server restart restores layout but loses the original processes.
 
-- A plugin is an out-of-process package whose `herdr-plugin.toml` declares its
-  actions and terminal-pane entrypoints. Runtime action registration and
-  arbitrary runtime pane commands are not part of the v1 plugin API. Linked
-  plugins persist across restarts, but plugins own the files and migrations
-  beneath their configuration and state directories. See the official
-  [plugin API reference](https://herdr.dev/docs/socket-api/#plugin-apis).
-- `plugin.pane.open` launches a manifest-declared pane entrypoint. A `tab`
-  placement is a normal managed Herdr pane; `plugin.pane.focus` and
-  `plugin.pane.close` can later focus or close it. Herdr injects plugin,
-  socket, workspace, tab, and pane context through `HERDR_*` variables. See
-  [plugin pane launch and environment](https://herdr.dev/docs/socket-api/#plugin-apis).
-- A `popup` is session-modal, does not alter tab layout, has no pane ID, is
-  absent from pane and agent APIs, emits no pane lifecycle events, and does not
-  receive `HERDR_PANE_ID`. `popup.close` closes only the popup. See
-  [popup behavior](https://herdr.dev/docs/socket-api/#plugin-apis).
+The implementation targets the [Herdr socket API](https://herdr.dev/docs/socket-api/).
 
-### Identity and observation
+## Plugin entrypoints
 
-- `session.snapshot` is the bootstrap operation for a client-maintained cache.
-  It returns protocol metadata, focused resource IDs, workspace, tab, pane and
-  agent records, and layout snapshots. It is not a subscription; clients must
-  subscribe to resource events afterward and fetch another snapshot after a
-  reconnect or suspected stale cache. See
-  [`session.snapshot`](https://herdr.dev/docs/socket-api/#raw-methods) and
-  [event subscriptions](https://herdr.dev/docs/socket-api/#event-subscriptions).
-- Pane records contain both a public `pane_id` and an internal `terminal_id`,
-  plus the current workspace and tab IDs. Moving a pane across workspaces keeps
-  its terminal alive but assigns a new public pane ID and emits `pane.moved`
-  rather than synthetic close/create events. See
-  [`pane.move`](https://herdr.dev/docs/socket-api/#raw-methods).
-- The CLI wrappers and raw socket expose the same control surface. Herdr
-  recommends CLI wrappers for simple automation and debugging, and the raw
-  socket for protocol clients and long-lived subscriptions. See
-  [choosing an integration layer](https://herdr.dev/docs/socket-api/#choose-an-integration-layer).
+The manifest requires Herdr `0.7.4` and declares:
 
-### Agent state and restoration
+```text
+worker          placement = "tab", focus = false
+harness-network placement = "popup"
+```
 
-- `pane.report_agent` supplies semantic state used by waits, notifications, and
-  rollups. `pane.report_metadata` changes presentation such as titles, visible
-  state labels, and tokens without taking lifecycle authority. Metadata tokens
-  are not restored after a server restart. See
-  [agent state reporting](https://herdr.dev/docs/socket-api/#agent-state-reporting).
-- Herdr maintains one status authority for a pane. OMP's official integration
-  reports lifecycle state and native session identity; Codex's official
-  integration reports session identity while screen detection supplies its
-  state. See [status authority](https://herdr.dev/docs/agents/#status-authority)
-  and the [integration reference](https://herdr.dev/docs/integrations/#how-herdr-uses-integrations).
-- Detach/reattach preserves live processes, but a cold Herdr server restart
-  does not. Snapshot restore recreates workspaces, tabs, panes, cwd, layout,
-  and focus, while original shells and processes are gone. Herdr can relaunch
-  supported agents only from native session references reported by current
-  official integrations. See
-  [session state and restore](https://herdr.dev/docs/session-state/).
+The Worker entrypoint receives a Coordinator Harness Session ID, connects to the local broker, validates the Session, and becomes the Harness Host that starts and owns OMP or Codex.
 
-## Managed Runtime MVP decisions
+The popup receives no Harness identity from a pane. It connects as a presentation client and receives the selected durable Harness or Task ID through plugin-owned context.
 
-### Ownership
+## Supervisor registration
 
-Herdr owns terminal topology: opening, placing, moving, focusing, and forcibly
-closing panes. Herdr Agent Orchestrator remains the top-level authority for the
-run, including the provider subprocess, native provider protocol, cancellation
-handshake, normalized events, repository policy, verification, and durable
-state.
+The user's current native Harness registers as the sole Supervisor through the Coordinator MCP proxy or CLI fallback. Registration records its durable Harness ID, current Session ID, Harness Kind, model when known, cwd, terminal ID, current pane location, and last-seen sequence.
 
-Each managed run starts through a manifest-declared `worker` pane entrypoint:
+The Coordinator does not adopt or become parent of the Supervisor process. It cannot inject a native turn. Supervisor messages are delivered to the durable inbox and surfaced through metadata and popup state.
 
-- `placement = "tab"`
-- `focus = false`
-- the worker pane is a normal Herdr pane
-- the plugin passes only the orchestrator `run_id` as run-specific input
-- the worker launches and supervises `omp --mode rpc` or `codex app-server`
+If the Supervisor pane moves, the Coordinator updates public pane, tab, and workspace IDs while retaining the Session and terminal binding. If the Supervisor disconnects, Workers continue and Results wait for review.
 
-The plugin manifest must require `min_herdr_version = "0.7.4"`. The runtime
-must check socket protocol `16` before depending on this contract.
+## Worker ownership
 
-### Identity contract
+The plugin opens one normal pane per Worker Session. The Harness Host is the pane's real process owner and launches one native harness child. The native harness manages its own tools and child agents.
 
-| Identity | Meaning | Persistence rule |
-| --- | --- | --- |
-| `run_id` | Orchestrator run identity | The only durable identity; stored by the orchestrator. |
-| Provider session ID | Native OMP or Codex identity | Stored only in orchestrator state, never published as a Herdr native session reference. |
-| `terminal_id` | Binding to one live Herdr terminal | Stable across a live pane move; not assumed to survive a cold server restart. |
-| `pane_id` | Current public pane location | Mutable and refreshed after moves or reconciliation. |
-| `tab_id`, `workspace_id` | Current UI location | Mutable and never used as run identity. |
+The official OMP or Codex integration may remain semantic status authority. The Coordinator does not call `pane.report_agent` for competing state; it records durable Task state in SQLite and publishes only presentation metadata.
 
-The runtime bootstraps from `session.snapshot`, then tracks pane lifecycle
-events. It matches active runs using the persisted live `terminal_id`, refreshes
-the mutable pane, tab, and workspace IDs, and resnapshots after reconnect. A
-`pane.moved` event updates location without changing run state.
+Identity lifetimes are distinct:
 
-### Managed-provider integration boundary
-
-The worker is the sole semantic status authority for a managed run. To prevent
-an official provider integration from becoming a competing authority or
-publishing a native restore reference that bypasses the worker:
-
-1. The worker retains the `HERDR_*` environment it needs.
-2. It removes **all** `HERDR_*` variables from the managed provider child's
-   environment before spawning OMP or Codex.
-3. It never reports `agent_session_id` or `agent_session_path` to Herdr.
-4. It stores provider-native identity only in orchestrator durable state.
-5. It derives Herdr semantic state from normalized provider events.
-
-This rule applies only to orchestrator-managed provider subprocesses. OMP and
-Codex launched directly by users remain governed by official Herdr integrations.
-
-Environment sanitization is an architectural requirement, not yet a proven
-provider guarantee. The OMP and Codex provider-contract tickets must verify in
-real panes that removing `HERDR_*` prevents their current integrations from
-reporting state or a native restore reference.
-
-### Status and presentation
-
-The worker publishes semantic state through `pane.report_agent` with a
-monotonic sequence and uses `pane.report_metadata` only for display fields such
-as title, provider, role, current phase, and terminal outcome.
-
-| Orchestrator state | Herdr semantic state |
+| Identity | Meaning |
 | --- | --- |
-| Preparing, starting, working, editing, verifying, collecting artifacts, repository checking, publishing, reconciling | `working` |
-| Waiting for input or approval | `blocked` |
-| Completed, invalid (including repository quarantine), failed, or cancelled | `idle` |
-| Live state cannot be reconciled | `unknown` |
+| Harness ID | durable mailbox and launch definition |
+| Harness Session ID | one live Coordinator activation |
+| native session/thread ID | provider conversation identity |
+| `terminal_id` | stable binding to one live Herdr terminal |
+| `pane_id` | current public pane location |
+| workspace/tab IDs | mutable UI location |
 
-SQLite and artifact files remain authoritative. Herdr metadata is a projection,
-not a source for workflow state or restart recovery. The exact terminal outcome
-is retained in durable state and displayed through metadata rather than encoded
-as a new Herdr lifecycle state.
+## Status and metadata
 
-### Focus and cancellation
+The Harness Host emits monotonic Session events to the broker. SQLite is authoritative for Task and mailbox state. Herdr metadata is a projection rebuilt after reconnect.
 
-- Focus resolves the persisted `terminal_id` against the current snapshot,
-  updates stale location IDs, and calls `plugin.pane.focus` for the current
-  plugin-owned worker pane.
-- While the repository-safety cancellation gate is open, cancellation first
-  persists cancellation intent, then asks the provider adapter to cancel
-  cooperatively through its native protocol. Once publication reaches its point
-  of no return, the command returns `too late` and does not interrupt the
-  publisher.
-- If the provider does not stop within the lifecycle-policy grace period, the
-  runtime escalates with `plugin.pane.close`. Forced termination is recorded
-  separately from cooperative cancellation.
-- Closing the details popup calls only `popup.close`; it never cancels the run
-  or closes the worker pane.
+Suggested metadata:
 
-The grace duration and non-publication cancellation race precedence belong to
-the lifecycle contract. This note fixes the cooperative-then-forced ordering
-and the publication gate only.
+```text
+title: OMP Worker
+state: working
+detail: download queue fix
+inbox: 0
+```
 
-### Popup contract
+The popup derives its list and detail views from Coordinator queries, not screen scraping or metadata tokens.
 
-The manifest declares a `run-details` entrypoint with `placement = "popup"`.
-It is an observer/controller over durable orchestrator state and may request
-focus or cancellation through orchestrator commands. It does not own or
-supervise either the worker or provider process, cannot infer a run from
-`HERDR_PANE_ID`, and must receive the selected `run_id` through plugin context
-or an explicit plugin-owned environment value.
+## Focus
 
-### Reconciliation
+Focus resolves the stored `terminal_id` through a fresh or current snapshot, updates stale pane location, and calls `plugin.pane.focus` for the current plugin-owned Worker pane. A missing terminal marks the Session disconnected or failed before returning an error.
 
-On a socket reconnect or control-client restart, the runtime:
+Supervisor focus uses its registered current pane but is not required to be plugin-owned.
 
-1. verifies the Herdr protocol version;
-2. reads `session.snapshot`;
-3. matches active bindings by `terminal_id`;
-4. refreshes pane, tab, and workspace IDs;
-5. subscribes to pane lifecycle and status events; and
-6. republishes semantic state and metadata from durable state.
+## Cancellation and stop
 
-If the terminal still exists, the run continues without a lifecycle transition.
-If an active worker pane exits or closes, the runtime completes an already
-requested cancellation or otherwise fails the run with a host-pane-loss reason.
-In both cases it reconciles the phase under the
-[Managed repository safety contract](repository-safety-contract.md): a
-pre-publication loss preserves the Run Overlay and may release the Worktree
-Lease only after proving the host still matches the baseline, while an uncertain
-or partial publication enters Repository Quarantine and continues to block
-editing.
+Task cancellation and Harness stop are distinct:
 
-After a cold Herdr server restart, the original worker and provider processes
-are gone. The MVP therefore:
+- **Cancel Task** persists cancellation intent and asks the Harness Adapter to abort the active native turn. The durable Harness remains available.
+- **Stop Harness** cancels active work when needed, stops the adapter and Harness Host, and closes the Worker pane. The durable Harness and mailbox remain.
 
-1. observes that the persisted terminal binding is absent;
-2. fails the active run with a cold-host-restart reason;
-3. clears the live Herdr binding;
-4. preserves an unpublished overlay or reconciles the Publish Journal and
-   quarantines uncertain publication for parent inspection; and
-5. requires the parent to submit a new run.
+Cancellation waits for the provider-specific cooperative sequence. If it exceeds the configured grace period, the Coordinator calls `plugin.pane.close`. Forced closure is recorded separately and creates Worktree Hold for a possibly mutating Task.
 
-It never automatically adopts, resumes, or retries the old provider session.
+Closing the popup calls only `popup.close` and never cancels work.
 
-## Downstream verification obligations
+## Broker reconnect
 
-- **OMP provider contract:** prove that a managed `omp --mode rpc` child with
-  all `HERDR_*` variables removed emits neither official Herdr lifecycle reports
-  nor a native restore reference.
-- **Codex provider contract:** prove the same for `codex app-server`, including
-  the installed Codex hook behavior.
-- **Lifecycle and recovery contract:** define the cooperative-cancel grace
-  duration, event ordering, repeated cancellation behavior, and terminal-state
-  precedence for cancel/exit/verification races.
-- **Repository safety contract:** implement the linked phase-aware reconciliation
-  boundary, including safe Worktree Lease release and Repository Quarantine.
-- **Popup prototype:** validate focus, cancel, and close behavior through a real
-  Herdr popup without transferring process ownership to the popup.
-- **Herdr transport implementation:** generate or pin request/event types from
-  the installed protocol schema, reject incompatible protocols clearly, and
-  test `terminal_id` continuity across `pane.moved` in a real session.
+After broker restart, a live Harness Host reconnects with Session capability, terminal identity, and its latest monotonic event sequence. The broker:
+
+1. loads durable Session and Task state;
+2. takes a fresh `session.snapshot`;
+3. proves the `terminal_id` still exists;
+4. refreshes pane, tab, and workspace locations;
+5. replays any missing sequenced host events;
+6. resubscribes to Herdr events; and
+7. republishes metadata.
+
+The broker never infers message acceptance from pane presence. Adapter correlation and durable attempts remain authoritative.
+
+## Pane loss and cold restart
+
+Unexpected Worker pane loss fails the live Harness Session. A queued Task remains queued for a future Session. A dispatched Task becomes failed; a mutating Task enters Worktree Hold.
+
+After a cold Herdr restart, original Supervisor and Worker processes are gone even if layout is restored. The Coordinator marks their Sessions disconnected or failed, preserves mail and evidence, and requires explicit Supervisor and Worker reactivation. It never adopts, resumes, or replays uncertain native work automatically.
+
+## Popup
+
+The popup is a viewer/controller over durable state. It supports:
+
+- Harness and presence list;
+- current and queued Tasks;
+- inbox and message details;
+- Result revisions and Attachments;
+- Repository Observations and Worktree Holds;
+- focus;
+- send Reply, Correction, or Notification;
+- approve or cancel Task;
+- clear Hold with digest and note; and
+- stop Worker Harness.
+
+Controls are authorized through the active Supervisor capability. Worker or unauthenticated popup commands are rejected.
 
 ## Acceptance scenarios
 
-- Opening a run creates an unfocused tab containing the manifest worker and
-  persists its run and live Herdr bindings.
-- Moving the worker across tabs or workspaces changes public location IDs
-  without losing the run binding.
-- Focus succeeds after resolving a stale pane ID through the terminal binding.
-- Cooperative cancellation uses the provider protocol; timeout escalation
-  closes the worker pane.
-- Closing the popup leaves the worker and provider running.
-- Presentation metadata never changes semantic waits or durable workflow state.
-- Socket reconnect reconstructs live mappings from a fresh snapshot and events.
-- Worker loss and cold restart fail the run, preserve an unpublished Run
-  Overlay or quarantine uncertain publication, and do not automatically retry,
-  resume, adopt, or roll back a provider session.
+- A Worker opens unfocused in a normal tab and publishes native status plus Coordinator metadata.
+- Moving the pane changes public location without changing Harness Session identity.
+- Focus works after resolving a stale pane ID through terminal identity.
+- Broker restart reconnects a live Worker without replaying accepted messages.
+- Cooperative cancellation uses the adapter; timeout escalation closes the pane and records a Hold.
+- Closing the popup leaves every Harness running.
+- Supervisor disconnection leaves Workers running and Results durable.
+- Cold restart fails active Sessions, preserves mail, and performs no automatic native resume.

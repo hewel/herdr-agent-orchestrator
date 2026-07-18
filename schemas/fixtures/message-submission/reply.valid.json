@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "request_key": "reply-api-priority",
+  "to": "omp-worker",
+  "task_id": "019f7000-0000-7000-8000-000000000010",
+  "kind": "reply",
+  "text": "Preserve the public API and put strict behavior behind the existing internal helper.",
+  "attachments": [],
+  "reply_to": "019f7000-0000-7000-8000-000000000011",
+  "delivery": "follow_up"
+}

@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://herdr.dev/schemas/harness-coordinator/harness-definition-v1.schema.json",
+  "title": "HarnessDefinitionV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "id", "kind", "tier", "cwd"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "id": { "$ref": "common-v1.schema.json#/$defs/harnessId" },
+    "kind": { "enum": ["omp", "codex"] },
+    "tier": { "enum": ["supervisor", "worker"] },
+    "cwd": { "$ref": "common-v1.schema.json#/$defs/absolutePath" },
+    "launch_profile": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "model": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "tier": { "const": "worker" } } },
+      "then": { "required": ["launch_profile"] }
+    }
+  ]
+}

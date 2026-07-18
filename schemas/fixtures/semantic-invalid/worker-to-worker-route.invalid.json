@@ -1,0 +1,17 @@
+{
+  "authenticated_sender": {
+    "id": "omp-worker",
+    "tier": "worker"
+  },
+  "recipient": {
+    "id": "codex-review",
+    "tier": "worker"
+  },
+  "submission": {
+    "schema_version": 1,
+    "to": "codex-review",
+    "kind": "notification",
+    "text": "Review this directly without the Supervisor.",
+    "attachments": []
+  }
+}

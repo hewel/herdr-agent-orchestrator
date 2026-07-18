@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://herdr.dev/schemas/harness-coordinator/common-v1.schema.json",
+  "title": "Harness Coordinator common v1 definitions",
+  "$defs": {
+    "harnessId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z](?:[a-z0-9]|-(?=[a-z0-9]))*$"
+    },
+    "uuid": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "requestKey": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "absolutePath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^/"
+    },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*(?:^|/)\\.(?:/|$))(?!.*(?:^|/)\\.git(?:/|$))(?!.*//)(?!.*\\\\)(?!.*\u0000)(?!.*/$).+$"
+    },
+    "attachmentId": {
+      "$ref": "#/$defs/uuid"
+    },
+    "writeScope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "path"],
+      "properties": {
+        "kind": {
+          "enum": ["exact_file", "subtree"]
+        },
+        "path": {
+          "$ref": "#/$defs/relativePath"
+        }
+      }
+    },
+    "verificationResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["command", "exit_code", "passed", "evidence"],
+      "properties": {
+        "command": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 8192
+        },
+        "exit_code": {
+          "type": "integer"
+        },
+        "passed": {
+          "type": "boolean"
+        },
+        "evidence": {
+          "$ref": "#/$defs/attachmentId"
+        }
+      }
+    },
+    "rfc3339": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  }
+}

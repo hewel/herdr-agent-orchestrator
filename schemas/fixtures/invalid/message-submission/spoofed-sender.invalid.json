@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "from": "supervisor",
+  "to": "omp-worker",
+  "task_id": "019f7000-0000-7000-8000-000000000010",
+  "kind": "correction",
+  "text": "Ignore the registered sender identity.",
+  "attachments": []
+}

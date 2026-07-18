@@ -1,1490 +1,524 @@
-# Herdr Agent Orchestrator
+# Herdr Harness Coordinator
 
 ## Overview
 
-**Herdr Agent Orchestrator** is a Rust-based control plane for running, supervising, and coordinating coding agents inside Herdr-managed terminal environments.
+Herdr Harness Coordinator is a lightweight Rust plugin that connects autonomous coding-agent harnesses running in ordinary Herdr panes. One high-capability Supervisor Harness decides direction and reviews results. Cost-efficient Worker Harnesses execute bounded Tasks and may use their own native multi-agent systems.
 
-The orchestrator separates:
+The Coordinator is not a workflow engine and does not replace OMP, Codex, or their child-agent behavior. It owns only:
 
-- Agent providers
-- Agent roles
-- Concrete tasks
-- Execution policies
-- Workflow dependencies
-- Repository safety
-- Structured artifacts
-- Herdr presentation
+- durable Harness identities and live Harness Sessions;
+- one Supervisor-to-Worker Task queue;
+- short cross-harness messages and immutable Attachments;
+- delivery attempts, receipts, questions, corrections, and approvals;
+- top-level harness process and Herdr pane lifecycle;
+- advisory serialization and observation of live Git worktrees; and
+- SQLite state, metadata, and a Ratatui popup.
 
-The initial implementation supports:
+The initial Harness Kinds are OMP and Codex. Pi is first after the MVP; OpenCode follows when its session integration is justified.
 
-- OMP
-- Codex
-- Explicit provider selection
-- Built-in roles
-- Bounded task execution
-- Repository write-scope enforcement
-- Verification commands
-- Persistent run state
-- Herdr status metadata
-- Popup task inspection
-- Cancellation and pane focusing
+## Authority
 
-Planned provider expansion:
+The Supervisor Harness is the single semantic authority. It owns:
 
-- Pi
-- OpenCode
-- Additional CLI or RPC-based coding agents
+- user intent and technical direction;
+- architecture and product decisions;
+- Task decomposition and Worker selection;
+- acceptance criteria and verification expectations;
+- review of Results, diffs, and evidence;
+- corrections, cancellation, and Worktree Hold reconciliation; and
+- final approval and the user-facing response.
 
-The parent agent remains responsible for intent, architecture decisions, task decomposition, acceptance criteria, verification design, final diff review, and the user-facing response. Child agents receive only bounded, reversible, and objectively verifiable tasks.
+Worker Harnesses own bounded execution. A Worker may search, edit, test, and use native children, but it must return unresolved decisions to the Supervisor and produce one consolidated Result.
 
-## Final Architectural Decision
-
-Herdr Agent Orchestrator is the **single top-level authority**.
-
-OMP, Codex, Pi, and OpenCode are providers. They are not allowed to independently own the top-level workflow.
+The Coordinator owns transport and lifecycle authority. It never invents a technical decision, decomposes a Task, selects a Worker or model automatically, interprets native child trees, or treats Worker completion as Supervisor approval.
 
 ```mermaid
 flowchart TD
-    User["User or Parent Agent"] --> Orchestrator["Herdr Agent Orchestrator<br/>Rust Control Plane"]
-
-    subgraph ControlPlane["Orchestrator Control Plane"]
-        Workflow["Workflow Engine"]
-        Roles["Role Registry"]
-        Policy["Policy Engine"]
-        Scheduler["Scheduler"]
-        Registry["Agent Run Registry"]
-        Artifacts["Artifact Store"]
-        Messaging["Message and Handoff Bus"]
-        Guard["Repository Guard"]
-        Verification["Verification Engine"]
-    end
-
-    Orchestrator --> Workflow
-    Workflow --> Scheduler
-    Roles --> Scheduler
-    Policy --> Scheduler
-
-    Scheduler --> Providers["Provider Adapter Layer"]
-
-    Providers --> OMP["OMP Provider"]
-    Providers --> Codex["Codex Provider"]
-    Providers --> Pi["Pi Provider"]
-    Providers -. future .-> OpenCode["OpenCode Provider"]
-
-    OMP --> OmpSession["OMP RPC Session"]
-    Codex --> CodexSession["Codex Thread"]
-    Pi --> PiSession["Pi RPC Session"]
-    OpenCode --> OpenCodeSession["OpenCode Session"]
-
-    OmpSession -. optional hybrid mode .-> OmpChildren["OMP Native Subagents"]
-    OpenCodeSession -. optional hybrid mode .-> OpenCodeChildren["OpenCode Child Sessions"]
-
-    OmpSession --> Registry
-    CodexSession --> Registry
-    PiSession --> Registry
-    OpenCodeSession --> Registry
-
-    Registry --> Artifacts
-    Registry --> Messaging
-    Registry --> Guard
-    Guard --> Verification
-
-    Registry --> HerdrUI["Herdr Panes, Metadata, and Popup"]
+    User --> Supervisor["Supervisor Harness"]
+    Supervisor <--> Coordinator["Herdr Harness Coordinator"]
+    Coordinator <--> OMP["OMP Worker Harness"]
+    Coordinator <--> Codex["Codex Worker Harness"]
+    OMP --> OMPChildren["OMP-native agents"]
+    Codex --> CodexChildren["Codex-native agents"]
+    Supervisor --> Final["Review, approval, final response"]
 ```
 
-This avoids having several competing orchestration systems:
+Only one active Supervisor Harness is allowed for one Coordinator state directory. Worker-to-Worker communication is rejected in the MVP.
 
-- Herdr pane and workspace management
-- OMP native multi-agent coordination
-- OpenCode child-session coordination
-- A custom workflow runtime
+## Core domain model
 
-Only Herdr Agent Orchestrator manages the top-level workflow. Provider-native multi-agent features may later be exposed as controlled nested capabilities.
+### Harness
 
-## Design Principles
-
-### Separate Provider, Role, Task, and Policy
-
-```mermaid
-flowchart LR
-    Provider["Provider<br/>OMP, Codex, Pi, OpenCode"] --> Assignment["Agent Assignment"]
-    Role["Role<br/>Implementer, Reviewer, Verifier"] --> Assignment
-    Task["Task<br/>Concrete objective"] --> Assignment
-    Policy["Policy<br/>Tools, writes, delegation"] --> Assignment
-
-    Assignment --> Run["Agent Run"]
-    Run --> Artifact["Structured Artifact"]
-```
-
-Each concept answers a different question:
-
-| Concept | Question |
-| --- | --- |
-| Provider | Which execution engine runs the task? |
-| Role | What responsibility does the agent have? |
-| Task | What concrete outcome must be produced? |
-| Policy | What is the agent permitted to do? |
-
-A role must not be permanently tied to a provider.
-
-Valid combinations include:
-
-```text
-OMP + Implementer
-OMP + Reviewer
-Codex + Implementer
-Codex + Reviewer
-Pi + Implementer
-Pi + Verifier
-OpenCode + Reviewer
-```
-
-### Prompts Describe; Policies Enforce
-
-A prompt may tell a reviewer not to modify files.
-
-The runtime must additionally:
-
-- Remove editing tools where possible
-- Use an empty write scope
-- Capture a [Repository Snapshot](research/mvp/repository-safety-contract.md)
-- Detect unexpected changes
-- Reject the run if repository boundaries are violated
-
-Prompts describe expected behavior. Policies enforce hard constraints.
-
-### Structured Artifacts Over Shared Conversation History
-
-Cross-provider collaboration uses structured artifacts rather than native chat history.
-
-Recommended artifact types:
-
-- `ImplementationReport`
-- `ReviewReport`
-- `VerificationReport`
-- `ResearchReport`
-- `HandoffPacket`
-- `DecisionRequest`
-- `CorrectionPacket`
-
-This allows an OMP implementation result to be reviewed by Codex or Pi without converting provider-native sessions.
-
-## Delegation Modes
-
-The runtime supports three conceptual modes.
+A Harness is a durable mailbox address and launch definition. Its `id` is a user-selected immutable slug such as `supervisor`, `omp-worker`, or `codex-review`. For a Worker, `cwd` is the canonical Git worktree root and therefore the registered repository identity used by Task admission.
 
 ```rust
-pub enum DelegationMode {
-    Managed,
-    Native,
-    Hybrid,
+pub struct HarnessDefinitionV1 {
+    pub schema_version: u32,
+    pub id: HarnessId,
+    pub kind: HarnessKind,
+    pub tier: HarnessTier,
+    pub cwd: PathBuf,
+    pub launch_profile: Option<String>,
+    pub model: Option<String>,
+}
+
+pub enum HarnessKind {
+    Omp,
+    Codex,
+}
+
+pub enum HarnessTier {
+    Supervisor,
+    Worker,
 }
 ```
 
-### Managed Mode
+Harness IDs are unique within one Coordinator state directory and are never reused for a different Harness definition. Stopping a Harness makes it offline; it does not delete its mailbox or identity.
 
-All workflow nodes are created and controlled by Herdr Agent Orchestrator.
+The Coordinator records model and launch profile explicitly but does not infer cost, capability, or routing from them.
 
-```mermaid
-flowchart TD
-    Orchestrator --> Implementer["OMP · Implementer"]
-    Orchestrator --> Reviewer["Codex · Reviewer"]
-    Orchestrator --> Verifier["Pi · Verifier"]
-```
+### Harness Session
 
-Managed mode provides:
-
-- Uniform status
-- Uniform policy enforcement
-- Cross-provider workflows
-- Centralized repository safety
-- Predictable cancellation
-- Provider replacement
-- Simple debugging
-
-This is the default and the only mode supported by the MVP.
-
-### Native Mode
-
-A provider uses its own multi-agent implementation.
-
-Examples:
-
-- OMP `task + hub`
-- OpenCode child sessions
-
-Native mode is not initially exposed as an unrestricted user option.
-
-### Hybrid Mode
-
-The top-level workflow remains managed by the orchestrator, but an individual provider run may create controlled native children.
-
-```mermaid
-flowchart TD
-    Workflow["Orchestrator Workflow"]
-
-    Workflow --> Implementation["OMP · Implementer"]
-    Workflow --> Review["Codex · Reviewer"]
-    Workflow --> Verification["Pi · Verifier"]
-
-    Implementation --> Scout["OMP Native Scout"]
-    Implementation --> TestHelper["OMP Native Test Helper"]
-```
-
-Recommended Hybrid restrictions:
-
-- Native depth limited to one
-- Native children belong to their parent `AgentRun`
-- Native children cannot create top-level workflow nodes
-- Native edits count against the parent write scope
-- Native token, timeout, and concurrency usage count against the parent
-- Only providers with observable native children may enable Hybrid mode
-
-## Core Domain Model
-
-### Caller assignment
+A Harness Session is one live activation of a Harness.
 
 ```rust
-pub struct AssignmentInputV1 {
-    pub provider: ProviderKind,
-    pub profile_id: String,
-    pub role: BuiltInRole,
+pub struct HarnessSession {
+    pub id: HarnessSessionId,
+    pub harness_id: HarnessId,
+    pub native_session_id: Option<String>,
+    pub terminal_id: Option<String>,
+    pub pane_id: Option<String>,
+    pub presence: HarnessPresence,
+    pub activity: HarnessActivity,
+    pub event_sequence: u64,
+    pub started_at: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+    pub ended_at: Option<DateTime<Utc>>,
 }
 ```
 
-The caller selects every provider, profile, and role explicitly. It does not
-select delegation mode, model, tools, prompts, environment, output schema, or
-effective policy. Managed mode and runtime authority are resolved internally.
-
-### Run Submission
+`HarnessSessionId` is Coordinator-generated UUIDv7. Native session identity, Herdr `terminal_id`, and mutable `pane_id` are separate because they have different lifetimes.
 
 ```rust
-pub enum RunSubmissionV1 {
-    AgentRun {
-        request_key: Option<String>,
-        worktree_path: AbsoluteWorktreePath,
-        timeout_seconds: u32,
-        assignment: AssignmentInputV1,
-        task: TaskInputV1,
-    },
-    WorkflowRun {
-        request_key: Option<String>,
-        worktree_path: AbsoluteWorktreePath,
-        timeout_seconds: u32,
-        assignments: FixedWorkflowAssignmentsV1,
-        task: TaskInputV1,
-    },
+pub enum HarnessPresence {
+    Starting,
+    Online,
+    Disconnected,
+    Stopped,
+    Failed,
+}
+
+pub enum HarnessActivity {
+    Idle,
+    Working,
+    Waiting,
+    Cancelling,
 }
 ```
 
-The public contract is a strict, versioned tagged union. An individual
-submission creates one `AgentRun`; a workflow submission creates the fixed
-implementer → reviewer → verifier workflow and preallocates all three child
-run IDs. Callers never provide run IDs. Every repository scope has an explicit
-`exact_file` or `subtree` kind; path spelling never implies scope semantics.
+An idle Worker Session may execute multiple Tasks sequentially in the same native conversation. Failure, forced cancellation, or an ambiguous native state ends the Session; reuse then requires an explicit new activation under the same Harness identity.
 
-Example individual submission:
+The current Herdr harness registers as the Supervisor. Worker Sessions are launched by the Coordinator in plugin-owned panes. Adopting arbitrary existing Worker panes is deferred.
 
-```json
-{
-  "schema_version": 1,
-  "kind": "agent_run",
-  "request_key": "download-race-v1",
-  "worktree_path": "/workspace/herdr-agent-orchestrator",
-  "timeout_seconds": 1800,
-  "assignment": {
-    "provider": "omp",
-    "profile_id": "omp-managed-default",
-    "role": "implementer"
-  },
-  "task": {
-    "title": "Fix download queue race",
-    "objective": "Prevent duplicate queue insertion",
-    "context_paths": ["src/download/queue.rs"],
-    "requirements": ["Preserve the existing public API"],
-    "acceptance_criteria": ["Concurrent insertions produce one queue entry"],
-    "repository": {
-      "write_scopes": [
-        { "kind": "exact_file", "path": "src/download/queue.rs" },
-        { "kind": "subtree", "path": "tests/download" }
-      ],
-      "scratch_scopes": [],
-      "ignored_publish_paths": [],
-      "destructive_authorizations": []
-    },
-    "verification": [
-      {
-        "id": "download-queue-tests",
-        "command": "cargo test download_queue",
-        "expected": "Exit 0 with focused tests passing"
-      }
-    ]
-  }
-}
-```
+### Task
 
-### Resolved Run Spec
-
-After durable acceptance the orchestrator generates IDs and freezes the
-selected configuration into digest-addressed snapshots. A sealed
-`ResolvedTopLevelRunSpecV1` records the canonical submission digest, root
-deadline, resolved repository identity and authority, Repository Snapshot,
-Managed mode, and immutable profile, role, policy, task, and orchestrator
-snapshot references. Mutable sessions, panes, progress, and publication state
-remain outside it.
-
-Each provider invocation receives a separately sealed
-`ResolvedAgentRunSpecV1`. For a workflow child it links the immutable root,
-preallocated child ID, fixed node assignment, late-bound input Artifact
-references, node budget, and repository/safety snapshots without mutating the
-workflow root.
-
-The complete public input, idempotency, dirty-confirmation, deadline, snapshot,
-and compatibility rules are normative in the
-[public run contract](research/mvp/public-run-contract.md). Checked-in Draft
-2020-12 schemas and golden fixtures live under [`schemas/`](../schemas/).
-
-## Provider Adapter Layer
-
-All provider-specific behavior is hidden behind one Rust interface.
+A Task is a first-class bounded assignment to one Worker Harness.
 
 ```rust
-#[async_trait]
-pub trait AgentProvider: Send + Sync {
-    fn kind(&self) -> ProviderKind;
+pub struct TaskSubmissionV1 {
+    pub schema_version: u32,
+    pub request_key: Option<String>,
+    pub worker_id: HarnessId,
+    pub related_task_id: Option<TaskId>,
+    pub title: String,
+    pub instructions: String,
+    pub attachments: Vec<AttachmentId>,
+    pub repository: TaskRepositoryAuthorityV1,
+}
 
-    fn capabilities(&self) -> ProviderCapabilities;
+pub struct TaskRepositoryAuthorityV1 {
+    pub root: PathBuf,
+    pub access: RepositoryAccess,
+    pub write_scopes: Vec<WriteScopeV1>,
+}
 
-    async fn start(
-        &self,
-        spec: &ResolvedAgentRunSpecV1,
-        context: &RunContext,
-    ) -> Result<ProviderSession>;
+pub enum RepositoryAccess {
+    ReadOnly,
+    Mutating,
+}
 
-    async fn send(
-        &self,
-        session: &ProviderSession,
-        input: AgentInput,
-    ) -> Result<()>;
-
-    async fn resume(
-        &self,
-        session: &ProviderSession,
-        input: AgentInput,
-    ) -> Result<()>;
-
-    async fn cancel(
-        &self,
-        session: &ProviderSession,
-    ) -> Result<()>;
-
-    async fn subscribe(
-        &self,
-        session: &ProviderSession,
-    ) -> Result<AgentEventStream>;
-
-    async fn read_transcript(
-        &self,
-        session: &ProviderSession,
-    ) -> Result<Transcript>;
-
-    async fn list_children(
-        &self,
-        session: &ProviderSession,
-    ) -> Result<Vec<ProviderChildSession>>;
+pub enum WriteScopeV1 {
+    ExactFile { path: PathBuf },
+    Subtree { path: PathBuf },
 }
 ```
 
-### Provider Capabilities
+All MVP Tasks target a Git worktree. The canonical worktree root must match the selected Worker's registered repository. A mutating Task requires at least one write scope; a read-only Task requires none. Paths are normalized repository-relative UTF-8 paths and may not be absolute, traverse parents, enter `.git`, or escape through symlinks.
 
-```rust
-pub struct ProviderCapabilities {
-    pub persistent_session: bool;
-    pub resumable: bool;
-    pub cancellable: bool;
-    pub structured_events: bool;
-    pub background_execution: bool;
+`related_task_id` records review or verification context but creates no automatic dependency or workflow. The Supervisor remains responsible for sequencing related Tasks.
 
-    pub native_subagents: bool;
-    pub child_session_tree: bool;
-    pub peer_messaging: bool;
-}
-```
-
-Capability negotiation prevents the shared runtime from assuming that every provider supports the same native behavior.
-
-## Provider Capability Matrix
-
-| Capability | OMP | Codex | Pi | OpenCode |
-| --- | ---: | ---: | ---: | ---: |
-| Persistent session | Yes | Yes | Yes | Yes |
-| Structured event stream | Yes | Yes | Yes | Yes |
-| Cancellation | Yes | Yes | Yes | Yes |
-| Steering or follow-up | Yes | Yes | Yes | Yes |
-| Native subagents | Yes | Not required initially | No built-in system | Yes |
-| Child-session tree | Agent registry | Thread and turn | Session branches, not role children | Yes |
-| Peer messaging | `hub` | No shared peer bus | No built-in peer bus | No built-in peer bus |
-| Provider-native resume | Session and messaging | Thread continuation | Session continuation | `task_id` continuation |
-| Recommended initial mode | Managed | Managed | Managed | Managed |
-
-## OMP Provider
-
-Run OMP through:
-
-```bash
-omp --mode rpc
-```
-
-The Rust adapter communicates through JSONL over stdin and stdout.
-
-OMP provides:
-
-- Agent lifecycle events
-- Tool lifecycle events
-- Cancellation
-- Session control
-- Host-owned tools
-- Native subagent subscriptions
-- Subagent transcript access
-- Native peer messaging through `hub`
-
-OMP core multi-agent execution creates independent subagent sessions. It supports synchronous and asynchronous tasks, artifacts, transcripts, bounded concurrency, and follow-up messaging.
-
-OMP RPC can expose:
-
-```text
-subagent_lifecycle
-subagent_progress
-subagent_event
-```
-
-The host can also use:
-
-```text
-set_subagent_subscription
-get_subagents
-get_subagent_messages
-```
-
-### Initial OMP Policy
-
-For MVP:
-
-- Disable or omit native task delegation
-- Run OMP as a single managed worker
-- Register host-owned structured completion tools
-- Let the orchestrator own verification and repository validation
-
-### Later Hybrid OMP Policy
-
-After the managed runtime is stable:
-
-- Enable OMP native read-only children
-- Subscribe to child events
-- Display children in the Herdr popup
-- Limit native depth to one
-- Keep editing children disabled by default
-- Map OMP `hub` messages into the orchestrator message model
-
-## Codex Provider
-
-Run Codex through:
-
-```bash
-codex app-server
-```
-
-The adapter uses the App Server protocol and manages:
-
-```text
-initialize
-thread/start
-turn/start
-turn/interrupt
-```
-
-The adapter preserves:
-
-- Thread ID
-- Current turn
-- Streaming items
-- Completion status
-- Interruption state
-- Transcript references
-
-Codex is initially treated as a managed single-agent provider. Native multi-agent behavior is not required for the first architecture. The orchestrator can create several independent Codex runs when multiple roles are needed.
-
-```mermaid
-sequenceDiagram
-    participant Orchestrator
-    participant Codex as Codex App Server
-
-    Orchestrator->>Codex: initialize
-    Codex-->>Orchestrator: capabilities
-
-    Orchestrator->>Codex: thread/start
-    Codex-->>Orchestrator: thread ID
-
-    Orchestrator->>Codex: turn/start
-    Codex-->>Orchestrator: turn events
-
-    Codex-->>Orchestrator: turn/completed
-    Orchestrator->>Orchestrator: Build artifact
-```
-
-## Pi Provider
-
-Pi is integrated as a managed single-agent provider.
-
-Pi is an Agent Harness composed of:
-
-```text
-Model
-+ System Prompt
-+ Tools
-+ Message History
-+ Agent Loop
-+ Session Runtime
-```
-
-The repository separates its implementation into:
-
-- `pi-ai`: provider-independent model access
-- `pi-agent-core`: Agent Loop, state, tools, and events
-- `pi-coding-agent`: coding tools, sessions, extensions, and terminal modes
-
-Pi deliberately does not ship a built-in role or subagent system. Its default coding agent exposes `read`, `bash`, `edit`, and `write`, while extensions and the SDK can add new tools and workflows.
-
-Run Pi through:
-
-```bash
-pi --mode rpc
-```
-
-The Rust provider can use:
-
-```text
-prompt
-steer
-follow_up
-abort
-new_session
-get_state
-get_messages
-set_model
-set_thinking_level
-```
-
-Pi RPC exposes JSONL commands, responses, and streaming events over stdin and stdout.
-
-### Pi Provider Mapping
-
-| Orchestrator concept | Pi capability |
-| --- | --- |
-| Provider session | `AgentSession` |
-| Session identity | Pi session ID |
-| Start task | `prompt` |
-| Steering | `steer` |
-| Follow-up | `follow_up` |
-| Cancel | `abort` |
-| State | `get_state` |
-| Transcript | `get_messages` or Session JSONL |
-| Role behavior | System prompt |
-| Tool policy | Tool allowlist and custom tools |
-| Persistence | `SessionManager` |
-| Events | AgentSession event stream |
-
-Pi's Agent Loop repeatedly:
-
-1. Sends system prompt, messages, and tools to the model
-2. Streams the assistant response
-3. Executes tool calls
-4. Adds tool results to context
-5. Calls the model again
-6. Stops when no more work remains
-
-### Pi Role Construction
-
-The orchestrator can create distinct Pi role instances by changing:
-
-- System prompt
-- Tool allowlist
-- Model
-- Thinking level
-- Skills
-- Session manager
-- Workspace
-
-Example:
-
-```text
-Pi + Implementer
-  tools: read, bash, edit, write
-
-Pi + Reviewer
-  tools: read, bash
-  write scope: empty
-
-Pi + Verifier
-  tools: read, bash
-  verification-only policy
-```
-
-Pi does not own the top-level workflow or create role agents itself. The orchestrator creates one Pi session per managed role.
-
-## Future OpenCode Provider
-
-OpenCode uses a Primary Agent and Child Session model.
-
-A subagent invocation creates a real child session with:
-
-- Session ID
-- Parent session ID
-- Agent type
-- Model
-- Permission rules
-- Persistent messages
-- Token and cost data
-
-A later instruction can continue that child session by passing its existing `task_id`.
-
-The OpenCode provider maps:
-
-| Orchestrator concept | OpenCode capability |
-| --- | --- |
-| Provider session | OpenCode Session |
-| Child identity | Child Session ID |
-| Continue work | `task_id` |
-| Role definition | OpenCode Agent configuration |
-| Tool policy | Permission rules |
-| Parent-child relation | Session `parentID` |
-| Background work | Background Job, currently experimental |
-
-OpenCode background subagents currently depend on an experimental feature flag, so they are not required by the initial provider implementation.
-
-## Role System
-
-Built-in MVP roles:
-
-```text
-implementer
-reviewer
-verifier
-```
-
-Future roles:
-
-```text
-planner
-researcher
-debugger
-test-writer
-documentation-writer
-security-reviewer
-frontend-specialist
-release-manager
-coordinator
-```
-
-### Role Definition
-
-```rust
-pub struct RoleDefinition {
-    pub id: String,
-    pub display_name: String,
-    pub description: String,
-
-    pub system_prompt: String,
-    pub allowed_providers: Vec<ProviderKind>,
-    pub preferred_provider: Option<ProviderKind>,
-
-    pub policy: RolePolicy,
-    pub output_schema: String,
-    pub skills: Vec<String>,
-}
-```
-
-### Role Policy
-
-```rust
-pub struct RolePolicy {
-    pub can_modify_files: bool,
-    pub can_delegate: bool,
-
-    pub requires_write_scope: bool,
-    pub requires_verification: bool,
-
-    pub allowed_tools: Vec<String>,
-    pub denied_tools: Vec<String>,
-
-    pub allowed_child_roles: Vec<String>,
-    pub max_delegation_depth: u8,
-    pub max_child_agents: usize,
-}
-```
-
-### Configuration
-
-```text
-$HERDR_PLUGIN_CONFIG_DIR/
-├── roles/
-│   ├── implementer.toml
-│   ├── reviewer.toml
-│   ├── verifier.toml
-│   └── frontend-specialist.toml
-└── workflows/
-    └── implement-review-verify.toml
-```
-
-Example:
-
-```toml
-id = "code-reviewer"
-display_name = "Code Reviewer"
-description = "Reviews an implementation without modifying files."
-
-system_prompt = """
-Review the supplied implementation for correctness, regressions,
-security risks, maintainability issues, and missing verification.
-Do not edit repository files.
-"""
-
-allowed_providers = ["omp", "codex", "pi"]
-preferred_provider = "codex"
-
-can_modify_files = false
-can_delegate = false
-requires_write_scope = false
-requires_verification = false
-
-allowed_tools = ["read", "search", "shell"]
-output_schema = "review-report-v1"
-```
-
-## Future Workflow Engine
-
-The MVP exposes only the fixed implementer → reviewer → verifier workflow.
-The general DAG model below is a future extension and is not accepted by the
-v1 public run contract.
-
-Use a DAG with topological scheduling.
-
-```mermaid
-flowchart TD
-    Planner --> API
-    Planner --> UI
-    Planner --> Tests
-
-    API --> Integrator
-    UI --> Integrator
-    Tests --> Integrator
-
-    Integrator --> Reviewer
-    Reviewer --> Verifier
-```
-
-Execution waves:
-
-```text
-Wave 1: Planner
-Wave 2: API, UI, Tests
-Wave 3: Integrator
-Wave 4: Reviewer
-Wave 5: Verifier
-```
-
-A workflow node declares:
-
-```rust
-pub struct WorkflowNode {
-    pub id: WorkflowNodeId,
-    pub role_id: String,
-    pub provider: ProviderSelector,
-    pub depends_on: Vec<WorkflowNodeId>,
-    pub input_artifacts: Vec<ArtifactSelector>,
-    pub output_schema: String,
-}
-```
-
-The first implementation does not need a general DAG editor. Start with:
-
-```text
-implementer → reviewer → verifier
-```
-
-Then introduce parallel waves.
-
-## Agent Run Lifecycle
+### Task lifecycle
 
 ```mermaid
 stateDiagram-v2
     [*] --> Queued
-    Queued --> Preparing
-    Preparing --> Starting
-    Starting --> Working
-
-    Working --> Thinking
-    Thinking --> Working
-
-    Working --> RunningCommand
-    RunningCommand --> Working
-
-    Working --> Editing
-    Editing --> Working
-
-    Working --> Verifying
-    Verifying --> Working
-
-    Working --> Blocked
-    Blocked --> Working: Resume or message
-    Blocked --> Cancelled: Cancel
-
-    Working --> CollectingArtifact
-    CollectingArtifact --> RepositoryCheck
-    RepositoryCheck --> Completed: Valid
-    RepositoryCheck --> Invalid: Scope violation
-
+    Queued --> Dispatching
+    Dispatching --> Working: native acceptance
+    Dispatching --> DeliveryUnknown: ambiguous dispatch
+    Working --> Waiting: blocking Question
+    Waiting --> Working: Reply accepted
+    Working --> Reviewing: Result and native turn complete
+    Reviewing --> Working: Correction accepted
+    Reviewing --> Approved: Supervisor Approval
+    Queued --> Cancelled
+    Dispatching --> Cancelling
+    Working --> Cancelling
+    Waiting --> Cancelling
+    Reviewing --> Cancelling
+    Cancelling --> Cancelled
+    Cancelling --> Failed
     Working --> Failed
-    Starting --> Failed
-
-    Completed --> [*]
-    Invalid --> [*]
-    Failed --> [*]
-    Cancelled --> [*]
 ```
 
-Normalized events:
+A Result means ready for review, not complete. Approval is the normal terminal state and is the only normal event that releases a mutating Task's Advisory Worktree Lease.
+
+A blocking Question moves the Task to `Waiting`; the lease remains held. A Reply resumes the same Task. A Correction also remains inside the same Task and produces a new Result revision.
+
+Queued cancellation cannot have changed the repository and needs no Worktree Hold. Failure, cancellation, or delivery uncertainty after native dispatch of a mutating Task creates a Worktree Hold until the Supervisor reconciles the live repository.
+
+### Result
+
+Worker completion uses a small, versioned Result contract instead of a universal artifact hierarchy.
 
 ```rust
-pub enum AgentEvent {
-    Starting,
-    Ready,
-    Thinking,
+pub struct ResultManifestV1 {
+    pub schema_version: u32,
+    pub task_id: TaskId,
+    pub summary: String,
+    pub changed_files: Vec<PathBuf>,
+    pub verification: Vec<VerificationResultV1>,
+    pub deviations: Vec<String>,
+    pub risks: Vec<String>,
+    pub attachments: Vec<AttachmentId>,
+}
 
-    RunningCommand {
-        command: String,
-    },
+pub struct VerificationResultV1 {
+    pub command: String,
+    pub exit_code: i32,
+    pub passed: bool,
+    pub evidence: AttachmentId,
+}
+```
 
-    EditingFile {
-        path: PathBuf,
-    },
+The Worker submits exactly one accepted Result per native turn through the Coordinator tool surface. The Task enters `Reviewing` only after the Result validates and the top-level native turn settles. Natural-language output is retained as transcript evidence but is not parsed as the Result.
 
-    Verifying {
-        command: String,
-        index: usize,
-        total: usize,
-    },
+Native children are never assigned Coordinator identities. Any tool call by a native descendant is attributed to its containing Worker Harness; the cooperative MVP relies on the top-level harness to consolidate its final Result.
 
-    WaitingForInput {
-        question: String,
-    },
+## Communication
 
-    ChildStarted {
-        child: ProviderChildSession,
-    },
+### Message model
 
-    Progress {
-        message: String,
-    },
+```rust
+pub struct BusMessage {
+    pub id: MessageId,
+    pub task_id: Option<TaskId>,
+    pub from: HarnessId,
+    pub to: HarnessId,
+    pub kind: MessageKind,
+    pub text: String,
+    pub attachments: Vec<AttachmentId>,
+    pub reply_to: Option<MessageId>,
+    pub delivery: DeliveryIntent,
+    pub created_at: DateTime<Utc>,
+}
 
-    Completed,
-    Failed {
-        message: String,
-    },
+pub enum MessageKind {
+    Task,
+    Result,
+    Question,
+    Reply,
+    Correction,
+    Notification,
+}
+
+pub enum DeliveryIntent {
+    FollowUp,
+    Steer,
+}
+```
+
+The broker derives `from` from the authenticated Harness Session. Caller input never controls authoritative sender identity.
+
+Allowed routes are closed:
+
+| Sender | Recipient | Allowed purpose |
+| --- | --- | --- |
+| Supervisor | Worker | Task, Reply, Correction, Notification |
+| Worker | Supervisor | Question, Result, Notification |
+
+Task creation and Result completion use dedicated operations because they carry structured contracts. `harness_send` cannot forge them.
+
+`FollowUp` is the default. The Coordinator retains FollowUp messages until the target can safely begin the next native turn. `Steer` is allowed only from the Supervisor to the Worker currently executing the referenced Task and maps directly to the adapter's verified steering operation. There is no `Auto` intent.
+
+### Durable delivery
+
+Messages are persisted before native dispatch. Each attempt is append-only and records whether provider bytes may have been accepted, the native correlation identifier, timestamps, and error evidence.
+
+```rust
+pub enum DeliveryState {
+    Pending,
+    Dispatching,
+    Accepted,
+    RetryableFailed,
+    PermanentFailed,
+    Unknown,
     Cancelled,
 }
 ```
 
-## Structured Artifact Protocol
+Native acceptance is not Task processing or completion. OMP prompt acknowledgement and Codex turn creation are only acceptance evidence.
 
-```mermaid
-flowchart LR
-    Implementer -->|ImplementationReport| Store["Artifact Store"]
-    Store -->|Task + Diff + Report| Reviewer
+The Coordinator retries automatically only while it can prove no provider bytes were accepted, including while a Harness is offline. If dispatch might have succeeded but acknowledgement is lost, the attempt becomes `Unknown`; Tasks, Corrections, Replies, and cancellation are never blindly replayed. The Supervisor must inspect and explicitly retry, cancel, or reconcile.
 
-    Reviewer -->|ReviewReport| Store
-    Store -->|Findings| Coordinator
+FollowUp ordering is FIFO per Worker. One active Task is permitted per Worker Session. A Task acquires repository authority only when it reaches the head of the queue and the Worker and worktree are eligible.
 
-    Coordinator -->|CorrectionPacket| Implementer
-    Store -->|Implementation + Review| Verifier
+### Attachments
 
-    Verifier -->|VerificationReport| Store
-```
+Raw paths are admission input, not durable references. The Coordinator atomically copies an accepted file into `$HERDR_PLUGIN_STATE_DIR/attachments`, records its digest, size, original name, and media type, and stores only the Attachment identity in messages and Results.
 
-Every artifact contains:
+Task files, diffs, verification logs, transcripts, and reports remain ordinary files. The Coordinator does not impose a universal semantic artifact schema and does not garbage-collect Attachments in the MVP.
+
+### Supervisor delivery
+
+Worker Sessions are adapter-owned, so delivery to them is push-based. The registered Supervisor Session is not protocol-owned by the Coordinator. A Worker Result therefore becomes durable Supervisor inbox state plus Herdr metadata and popup notification; it cannot automatically create a new model turn in an already-running Supervisor harness.
+
+The Supervisor reads its inbox through MCP, CLI, or a bounded inbox wait. Supervisor disconnection does not stop a Worker. Completed Results remain pending for review, and mutating leases remain held until the Supervisor returns and approves or reconciles them.
+
+## Advisory repository coordination
+
+The [advisory worktree contract](research/mvp/advisory-worktree-contract.md) is normative.
+
+The Coordinator does not sandbox Worker Harnesses and cannot attribute a same-scope external edit to a particular process. Its safety promise is deliberately limited to coordination:
+
+- only one mutating Task may own one canonical worktree;
+- existing staged, unstaged, and untracked user state is accepted and recorded;
+- Git evidence is captured before dispatch and at Result, cancellation, and Approval;
+- changed paths are compared with declared write scopes;
+- no file is automatically reverted, merged, published, or discarded; and
+- uncertain or out-of-scope repository state creates a Worktree Hold.
+
+A related read-only review may run while its mutating Task is in the stable `Reviewing` state. Corrections wait until related read-only Tasks finish so the reviewer sees one stable checkpoint. Unrelated same-worktree Tasks wait until the mutating Task is approved.
+
+Clearing a Worktree Hold requires the current Repository Observation digest and an audit note. A stale clearance request fails. Clearing a hold acknowledges reconciliation; it does not modify the worktree.
+
+## Deep modules and seams
+
+### Coordinator Core
+
+The Coordinator Core is one deep transactional module. Its external interface is command/query oriented:
 
 ```rust
-pub struct ArtifactEnvelope<T> {
-    pub schema_version: u32,
-    pub artifact_id: ArtifactId,
+impl Coordinator {
+    pub async fn execute(
+        &self,
+        actor: ActorContext,
+        command: CoordinatorCommand,
+    ) -> Result<CommandOutcome, CoordinatorError>;
 
-    pub workflow_run_id: Option<WorkflowRunId>,
-    pub producer_run_id: AgentRunId,
-
-    pub role_id: String,
-    pub provider: ProviderKind,
-
-    pub created_at: DateTime<Utc>,
-    pub payload: T,
+    pub async fn query(
+        &self,
+        actor: ActorContext,
+        query: CoordinatorQuery,
+    ) -> Result<QueryResult, CoordinatorError>;
 }
 ```
 
-Large outputs are referenced rather than embedded.
+Commands cover Supervisor registration, Worker start/stop, Task creation, Question, Reply, Correction, Notification, Result completion, Approval, cancellation, Worktree Hold clearance, and session events. Queries cover Harnesses, Sessions, Tasks, inboxes, receipts, worktree state, and popup views.
 
-Examples:
+Routing, authorization, idempotency, Task transitions, queue eligibility, SQLite transactions, leases, receipts, and attachment admission stay behind this interface. Callers do not manipulate tables or state transitions directly.
 
-```text
-artifact://implementation/run-0194
-artifact://review/run-0195
-artifact://verification/run-0196
-patch://run-0194
-transcript://run-0195
-```
+### Harness Host and Adapter seam
 
-## Message and Handoff Bus
-
-Messages carry short instructions and artifact references.
+Every Worker pane runs a Harness Host that owns the native process and one adapter. OMP and Codex justify a real adapter seam:
 
 ```rust
-pub struct AgentMessage {
-    pub id: MessageId,
-    pub from: AgentRunId,
-    pub to: AgentRunId,
+#[async_trait]
+pub trait HarnessAdapter: Send {
+    fn kind(&self) -> HarnessKind;
+    fn capabilities(&self) -> AdapterCapabilities;
 
-    pub kind: MessageKind,
-    pub text: String,
-    pub artifact_refs: Vec<ArtifactRef>,
+    async fn start(&mut self, spec: &HarnessStartSpec) -> Result<NativeSession>;
+    async fn dispatch(&mut self, delivery: ResolvedDelivery) -> Result<NativeAcceptance>;
+    async fn cancel_active(&mut self) -> Result<()>;
+    async fn stop(&mut self) -> Result<()>;
+    async fn snapshot(&mut self) -> Result<AdapterSnapshot>;
+    fn events(&mut self) -> AdapterEventStream;
 }
 ```
 
-Suitable message content:
+`dispatch` reports only native acceptance. The Coordinator constructs durable receipts and Task transitions from acceptance plus adapter events. Provider protocol types never cross the adapter seam.
 
-- Additional constraints
-- Clarifying questions
-- Blocked-state explanations
-- Requests for review
-- Notifications that an artifact is ready
+### Herdr integration
 
-Unsuitable message content:
+Herdr owns terminal topology. The plugin owns Worker launch definitions, Harness Host lifecycle, focus, and forced pane closure. Official native integrations remain the semantic status authority for directly running OMP and Codex; the Coordinator uses Herdr metadata only for title, Task, inbox, and presentation fields.
 
-- Complete diffs
-- Large source files
-- Full reports
-- Entire transcripts
+The integration persists live `terminal_id` separately from mutable `pane_id`, bootstraps from `session.snapshot`, follows pane moves, and resnapshots after reconnect. A popup observes Coordinator state and requests commands; it never owns a Harness process.
 
-Provider mapping:
+## Broker and storage
 
-```text
-OMP      → hub.send or prompt
-Codex    → new turn
-Pi       → steer, follow_up, or prompt
-OpenCode → task_id continuation
-```
+One Coordinator daemon per `$HERDR_PLUGIN_STATE_DIR` owns SQLite and a local Unix socket. MCP stdio proxies, CLI commands, Supervisor registration, Worker Hosts, and the popup use the same command/query contract.
 
-## Repository Safety
+Worker Hosts reconnect after a broker restart and replay sequenced host events from their retained buffer. A cold Herdr restart loses the original processes: active Sessions fail, pending mail remains, and any dispatched mutating Task enters Worktree Hold. The Coordinator never automatically adopts, resumes, or replays uncertain native work.
 
-The [Managed repository safety contract](research/mvp/repository-safety-contract.md)
-is authoritative for the MVP's Linux containment, snapshot, scope, publication,
-and recovery guarantees.
+SQLite stores:
 
-### Before Execution
+- Harness definitions and Harness Sessions;
+- Tasks, Result revisions, and Task transitions;
+- messages, delivery attempts, receipts, and inbox read state;
+- attachment metadata;
+- Repository Observations, Advisory Worktree Leases, and Worktree Holds;
+- Herdr terminal and pane bindings; and
+- idempotency records and audit notes.
 
-- Validate the task is bounded
-- Resolve repository and linked-worktree identity
-- Acquire a kernel-owned Worktree Lease
-- Capture a full immutable Repository Snapshot, including dirty, untracked, and ignored state
-- Preserve existing user changes
-- Validate exact-file, subtree, scratch, ignored, dirty, and destructive-change policy
-- Prove the fail-closed Linux containment backend and model broker
-- Resolve the effective role policy
-- Resolve workspace isolation
+Files store Attachments, transcripts, provider logs, diffs, and verification evidence.
 
-### During Execution
+## Tool and CLI surface
 
-- Project the snapshot through a private Run Overlay instead of mounting the live worktree
-- Enforce role tool restrictions
-- Enforce filesystem, process-tree, command, credential, and network policy independently of the provider
-- Track and seal the candidate Publish Delta
-- Record provider events
-- Prevent overlapping editing runs
-- Reject unresolved architecture decisions
-- Enforce timeout and cancellation
+The canonical command contract is exposed through MCP where compatible and through provider-specific host-tool bridges or CLI otherwise.
 
-### After Execution
-
-- Validate the Publish Delta against the Repository Snapshot and effective policy
-- Compare the complete live worktree and Git state with the baseline before publication
-- Confirm verification commands match the task specification
-- Publish through a durable journal and per-path compare-and-swap operations
-- Preserve invalid overlays and quarantine uncertain or partial publication
-- Never automatically revert published or unexpected changes
-- Mark invalid runs explicitly
-- Return diff and evidence to the parent agent
-
-Provider-level tool restrictions are not sufficient security boundaries.
-
-Pi explicitly runs with the permissions of the user and process that launched it and recommends containerization or sandboxing for stronger isolation.
-
-## Workspace Isolation
-
-```rust
-pub enum WorkspaceIsolation {
-    CurrentWorktree,
-    IsolatedWorktree,
-}
-```
-
-### Current Worktree
-
-Use when:
-
-- The task depends on uncommitted user changes
-- The task is small and mechanical
-- The validated candidate should publish back to the selected worktree
-
-`CurrentWorktree` identifies the baseline and publication target. The provider
-still executes against a private Run Overlay and never receives the live
-worktree as a writable mount.
-
-Rule:
-
-> Only one editing workflow may hold the Worktree Lease for a worktree.
-
-Read-only reviewers and verifiers may run concurrently when safe.
-
-### Isolated Worktree
-
-Use when:
-
-- Tasks can be separated cleanly
-- Multiple implementation nodes run in parallel
-- Changes are high risk
-- Integration should happen after independent review
-
-```mermaid
-flowchart TD
-    Main["Main Worktree"]
-
-    Main --> API["Worktree A<br/>API Implementer"]
-    Main --> UI["Worktree B<br/>UI Implementer"]
-    Main --> Tests["Worktree C<br/>Test Writer"]
-
-    API --> Integrator
-    UI --> Integrator
-    Tests --> Integrator
-
-    Integrator --> Review
-```
-
-Merging remains a parent-agent or integrator responsibility.
-
-## State Storage
-
-Use SQLite for indexed runtime state and files for large artifacts.
+Harness tools:
 
 ```text
-$HERDR_PLUGIN_STATE_DIR/
-├── orchestrator.db
-├── artifacts/
-│   └── <artifact-id>.json
-├── transcripts/
-├── logs/
-├── patches/
-└── provider-state/
+harness_list
+harness_status
+harness_inbox
+harness_task_create
+harness_send
+harness_request
+harness_complete
+harness_task_approve
+harness_task_cancel
+harness_hold_clear
 ```
 
-SQLite tables:
+Lifecycle and UI controls additionally expose Worker start/stop, focus, and popup operations. CLI commands use the current Session capability and never accept authoritative `--from` input.
 
-```mermaid
-erDiagram
-    WORKFLOW_RUN ||--o{ WORKFLOW_NODE : contains
-    WORKFLOW_NODE ||--o{ AGENT_RUN : executes
-    AGENT_RUN ||--o{ PROVIDER_SESSION : owns
-    AGENT_RUN ||--o{ ARTIFACT : produces
-    AGENT_RUN ||--o{ MESSAGE : sends
-    AGENT_RUN ||--o{ VERIFICATION : performs
-    AGENT_RUN ||--o{ AGENT_RUN : parent_of
-```
+Per-session capabilities prevent accidental or ordinary protocol-level impersonation. All Harnesses run as the same local operating-system user, so the MVP explicitly does not claim isolation from a malicious same-user process.
 
-Store in SQLite:
-
-- Workflow runs
-- Workflow nodes
-- Agent runs
-- Provider sessions
-- Parent-child relationships
-- Role and policy snapshots
-- Current status
-- Pane mappings
-- Artifact indexes
-- Verification results
-- Messages
-
-Store as files:
-
-- Transcripts
-- Provider logs
-- Diffs
-- Patches
-- Large reports
-- Provider-native session references
-
-## Herdr UI
-
-The real provider process runs in a normal Herdr pane. The popup only displays and controls the run.
-
-```mermaid
-flowchart LR
-    Process["Agent Provider Process"] --> Pane["Normal Herdr Pane"]
-    Pane --> Events["Normalized Events"]
-    Events --> Metadata["Compact Herdr Metadata"]
-    Events --> Popup["Popup Detail Viewer"]
-
-    Popup --> Focus["Focus Pane"]
-    Popup --> Cancel["Cancel Run"]
-    Popup --> Transcript["View Transcript"]
-    Popup --> Artifacts["View Artifacts"]
-```
-
-Suggested tree:
-
-```text
-Feature: Download Queue
-├── ✓ Planner
-│   └── Codex
-├── ● Implementer
-│   └── OMP
-│       ├── ✓ Scout
-│       └── ● Test Helper
-├── ○ Reviewer
-│   └── Codex
-└── ○ Verifier
-    └── Pi
-```
-
-Suggested detail view:
-
-```text
-Role          Implementer
-Provider      OMP
-State         Working
-Delegation    Hybrid
-Worktree      task/download-queue
-Policy        Scoped edit · depth 1
-Session       omp-7f82
-Runtime       04:21
-
-Current step
-cargo test download_queue
-
-Native children
-├── Scout       done
-└── TestHelper  running
-
-Changed files
-M src/download/queue.rs
-A tests/download/queue_test.rs
-```
-
-Recommended TUI libraries:
-
-- Ratatui
-- Crossterm
-- Tokio
-
-## Suggested Rust Project Structure
-
-```text
-herdr-agent-orchestrator/
-├── Cargo.toml
-├── herdr-plugin.toml
-├── schemas/
-│   ├── run-submission-v1.schema.json
-│   ├── dirty-worktree-confirmation-v1.schema.json
-│   ├── resolved-run-spec-v1.schema.json
-│   ├── resolved-agent-run-spec-v1.schema.json
-│   ├── role-definition.schema.json
-│   ├── execution-policy.schema.json
-│   └── artifact-envelope.schema.json
-└── src/
-    ├── main.rs
-    ├── cli.rs
-    │
-    ├── commands/
-    │   ├── run.rs
-    │   ├── worker.rs
-    │   ├── popup.rs
-    │   ├── cancel.rs
-    │   ├── focus.rs
-    │   └── inspect.rs
-    │
-    ├── provider/
-    │   ├── mod.rs
-    │   ├── capabilities.rs
-    │   ├── session.rs
-    │   ├── omp/
-    │   ├── codex/
-    │   ├── pi/
-    │   └── opencode/
-    │
-    ├── role/
-    │   ├── definition.rs
-    │   ├── registry.rs
-    │   ├── loader.rs
-    │   └── resolver.rs
-    │
-    ├── policy/
-    │   ├── execution.rs
-    │   ├── tools.rs
-    │   ├── repository.rs
-    │   └── delegation.rs
-    │
-    ├── workflow/
-    │   ├── definition.rs
-    │   ├── dag.rs
-    │   ├── scheduler.rs
-    │   ├── coordinator.rs
-    │   └── handoff.rs
-    │
-    ├── artifact/
-    │   ├── envelope.rs
-    │   ├── store.rs
-    │   ├── implementation.rs
-    │   ├── review.rs
-    │   ├── verification.rs
-    │   └── handoff.rs
-    │
-    ├── message/
-    │   ├── bus.rs
-    │   └── routing.rs
-    │
-    ├── guard/
-    │   ├── git_snapshot.rs
-    │   ├── write_scope.rs
-    │   ├── repository_lock.rs
-    │   └── verification.rs
-    │
-    ├── herdr/
-    │   ├── cli.rs
-    │   ├── socket.rs
-    │   └── metadata.rs
-    │
-    ├── state/
-    │   ├── database.rs
-    │   ├── migrations.rs
-    │   └── models.rs
-    │
-    └── ui/
-        ├── app.rs
-        ├── event.rs
-        ├── tree.rs
-        └── view.rs
-```
-
-## Suggested Dependencies
-
-```text
-tokio
-serde
-serde_json
-toml
-clap
-async-trait
-thiserror
-anyhow
-tracing
-tracing-subscriber
-ratatui
-crossterm
-uuid
-chrono
-fs2
-sqlx
-jsonschema
-```
-
-Use the Git CLI initially instead of `git2`.
-
-## Implementation Roadmap
-
-```mermaid
-flowchart TD
-    P1["Phase 1<br/>Managed Runtime"] --> P2["Phase 2<br/>Provider Sessions"]
-    P2 --> P3["Phase 3<br/>Pi Provider"]
-    P3 --> P4["Phase 4<br/>OMP Hybrid Mode"]
-    P4 --> P5["Phase 5<br/>OpenCode Provider"]
-    P5 --> P6["Phase 6<br/>Custom Roles and DAG Workflows"]
-```
-
-### Phase 1: Managed Runtime
-
-Implement:
-
-- Rust plugin runtime
-- OMP Provider
-- Codex Provider
-- `implementer`, `reviewer`, and `verifier`
-- Explicit provider selection
-- Versioned `RunSubmissionV1` and immutable resolved run snapshots
-- Repository baseline
-- Write-scope enforcement
-- Repository edit lock
-- Verification engine
-- SQLite state
-- Artifact store
-- Herdr metadata
-- Popup UI
-- Cancel, focus, and inspect
-
-Disable provider-native subagents.
-
-### Phase 2: Provider Session Capabilities
-
-Implement:
-
-- OMP session persistence
-- Codex thread persistence
-- Provider capability negotiation
-- Resume
-- Steering and follow-up
-- Transcript retrieval
-- Handoff packets
-- Isolated worktrees
-
-### Phase 3: Pi Provider
-
-Implement:
-
-- `pi --mode rpc`
-- Pi session identity
-- Prompt, steer, follow-up, and abort
-- Event normalization
-- Tool allowlist mapping
-- Role system-prompt mapping
-- Transcript and state retrieval
-- Pi as managed implementer, reviewer, or verifier
-
-### Phase 4: OMP Hybrid Mode
-
-Implement:
-
-- Native subagent subscriptions
-- OMP child tree
-- Native child transcripts
-- `hub` message mapping
-- Native depth limit
-- Parent-run budget accounting
-- Read-only native helpers first
-
-### Phase 5: OpenCode Provider
-
-Implement:
-
-- OpenCode Session mapping
-- Parent-child session trees
-- `task_id` continuation
-- Permission mapping
-- Child-session popup
-- Optional background-job support
-
-### Phase 6: Custom Roles and Workflows
-
-Implement:
-
-- User role TOML or Markdown
-- Role inheritance
-- Policy presets
-- Workflow YAML or TOML
-- Parallel waves
-- Provider auto-routing
-- Controlled coordinator roles
-
-## MVP Scope
-
-The first usable release includes:
-
-1. Rust plugin runtime
-2. OMP Provider
-3. Codex Provider
-4. Managed delegation mode
-5. Explicit provider selection
-6. Built-in roles
-7. Structured task packets
-8. Repository baseline capture
-9. Write-scope enforcement
-10. Repository edit lock
-11. Verification commands
-12. Normalized events
-13. Persistent SQLite state
-14. Structured artifacts
-15. Herdr metadata
-16. Ratatui popup
-17. Cancel, focus, and inspect
-18. Parent-agent final review
-
-Pi Provider is the first provider added after the MVP.
-
-## Deferred Features
-
-Do not include these in the initial release:
-
-- Automatic provider selection
-- Provider-native subagents
-- OpenCode Provider
-- User-defined roles
-- Role inheritance
-- General workflow DAG execution
-- Multiple editing agents in one worktree
-- Automatic merge
-- Automatic rollback
-- Deep recursive delegation
-- Web dashboard
-- Native graphical UI
-- Distributed workers
-
-## References
-
-### Herdr
-
-- [Plugin System](https://herdr.dev/docs/plugins/)
-- [Socket API](https://herdr.dev/docs/socket-api/)
-- [Agent Management](https://herdr.dev/docs/agents/)
-- [Integrations](https://herdr.dev/docs/integrations/)
-- [CLI Reference](https://herdr.dev/docs/cli-reference/)
+## Harness adapters
 
 ### OMP
 
-- [Oh My Pi Repository](https://github.com/can1357/oh-my-pi)
-- [OMP RPC Reference](https://github.com/can1357/oh-my-pi/blob/main/docs/rpc.md)
-- [OMP Task Tool](https://github.com/can1357/oh-my-pi/blob/main/docs/tools/task.md)
-- [OMP Hub Tool](https://github.com/can1357/oh-my-pi/blob/main/docs/tools/hub.md)
-- [OMP Swarm Extension](https://github.com/can1357/oh-my-pi/tree/main/packages/swarm-extension)
+The MVP pins OMP `17.0.2` and starts `omp --mode rpc` in the Worker pane. The adapter:
+
+- waits for the `ready` frame and correlates interleaved responses by ID;
+- uses `prompt` when idle, `follow_up` for queued active-Task input, and `steer` for explicit steering;
+- observes top-level lifecycle events and settles work at `agent_end`;
+- captures native session identity and messages;
+- aborts cooperatively before forced pane closure; and
+- exposes Coordinator tools through the verified host-tool bridge or configured local MCP bridge.
+
+The selected Worker launch profile may enable OMP `task`, `hub`, extensions, skills, and native children. The Coordinator neither subscribes those children into its registry nor treats them as top-level Tasks.
 
 ### Codex
 
-- [Codex App Server](https://developers.openai.com/codex/app-server)
-- [Codex SDK](https://developers.openai.com/codex/codex-sdk)
-- [Codex Configuration](https://developers.openai.com/codex/config-reference)
+The MVP pins Codex `0.144.5` and starts `codex app-server --listen stdio://`. The adapter:
 
-### Pi
+- performs `initialize` followed by `initialized`;
+- starts one persistent thread for the Harness Session;
+- uses a new `turn/start` after a FollowUp becomes eligible;
+- uses `turn/steer` only for explicit steering of the active turn;
+- consumes item and turn notifications until `turn/completed`;
+- captures thread, turn, transcript, and final item evidence; and
+- uses `turn/interrupt` before stopping the App Server and escalating to pane closure.
 
-- [Pi Repository](https://github.com/earendil-works/pi)
-- [Pi Coding Agent](https://github.com/earendil-works/pi/tree/main/packages/coding-agent)
-- [Pi Agent Core](https://github.com/earendil-works/pi/tree/main/packages/agent)
-- [Pi SDK](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/sdk.md)
-- [Pi RPC Mode](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/rpc.md)
+Codex native multi-agent behavior is permitted by the Worker profile and remains opaque. Collaboration and child-thread events are retained in native logs but do not create Coordinator Harnesses, Sessions, or Tasks.
 
-### OpenCode
+### Compatibility
 
-- [OpenCode Repository](https://github.com/anomalyco/opencode)
-- [OpenCode Agents](https://github.com/anomalyco/opencode/blob/dev/packages/web/src/content/docs/agents.mdx)
-- [OpenCode Task Tool](https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/tool/task.ts)
+Both adapters reject an unverified version. Compatibility fixtures must be regenerated or captured from the installed version and prove launch, delivery, steering, completion, cancellation, native multi-agent tolerance, and shutdown before a new version is accepted.
 
-### Rust
+## Herdr interface
 
-- [Tokio](https://tokio.rs/)
-- [Serde](https://serde.rs/)
-- [Ratatui](https://ratatui.rs/)
-- [Crossterm](https://docs.rs/crossterm/)
-- [Clap](https://docs.rs/clap/)
-- [SQLx](https://github.com/launchbadge/sqlx)
+The plugin manifest declares:
+
+- a normal `worker` pane entrypoint that owns the Harness Host and native process; and
+- a `harness-network` popup entrypoint that reads durable state and sends control commands.
+
+Compact metadata examples:
+
+```text
+OMP Worker · working · inbox 0
+Supervisor · review ready · inbox 1
+```
+
+The popup lists durable Harnesses and current Sessions, then shows the selected Task, inbox, Result revisions, repository evidence, and available actions:
+
+```text
+Harness Network
+
+● supervisor       Codex · Supervisor · inbox 1
+● omp-worker       OMP · Worker · reviewing
+○ codex-review     Codex · Worker · idle
+
+[o] Focus  [m] Message  [i] Inbox  [c] Cancel task  [Esc] Close
+```
+
+Closing the popup never cancels a Task or closes a Worker pane.
+
+## Implementation order
+
+### Milestone 1: Coordinator Core and OMP path
+
+1. Versioned domain contracts, SQLite migrations, attachments, routing, and Task lifecycle.
+2. Coordinator-owned queues, receipts, idempotency, Repository Observations, leases, and holds.
+3. Unix-socket daemon, CLI, Worker Host, and Herdr pane binding.
+4. OMP adapter and Coordinator tool bridge with native multi-agent behavior enabled by profile.
+5. Full Supervisor → OMP Task → Result → Correction or Approval proof.
+
+### Milestone 2: Codex path
+
+1. Codex App Server adapter and Coordinator MCP bridge.
+2. Persistent thread, FollowUp turns, Steer, completion, and cancellation.
+3. Equivalent Supervisor → Codex Task → Result → Correction or Approval proof.
+
+### Milestone 3: Presentation
+
+1. Herdr metadata and reconnect reconciliation.
+2. Harness list, inbox, Task and Result popup views.
+3. Focus, cancellation, Worker stop, and Worktree Hold controls.
+
+Pi is the next adapter after these MVP paths are stable.
+
+## MVP acceptance
+
+The first release must prove:
+
+```text
+Supervisor Harness
+→ create bounded mutating Task
+→ durable Coordinator queue and worktree observation
+→ OMP Worker Harness in a normal Herdr pane
+→ OMP-native multi-agent execution
+→ structured Result and verification evidence
+→ Supervisor review
+→ Correction or Approval
+→ final repository observation and lease release
+```
+
+The second release repeats the same top-level coordination path for Codex.
+
+## Deferred
+
+- automatic Harness or model selection;
+- Worker-to-Worker messages;
+- provider-native child visualization or addressing;
+- automatic Task decomposition or workflow DAGs;
+- multiple mutating Tasks in one worktree;
+- automatic worktrees, merges, publication, rollback, or cleanup;
+- hostile-process isolation and credential brokering;
+- universal artifact or semantic-memory schemas;
+- Task cost and token budgets;
+- arbitrary Worker-pane adoption;
+- distributed brokers, web dashboards, or graphical applications;
+- Pi, OpenCode, and other Harness Kinds.

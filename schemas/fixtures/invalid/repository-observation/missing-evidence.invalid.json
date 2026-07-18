@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "id": "019f7000-0000-7000-8000-000000000040",
+  "task_id": "019f7000-0000-7000-8000-000000000010",
+  "checkpoint": "result",
+  "worktree_root": "/workspace/project",
+  "git_common_dir": "/workspace/project/.git",
+  "head": "0123456789abcdef0123456789abcdef01234567",
+  "changed_paths": [],
+  "captured_at": "2026-07-18T08:31:00.000000Z",
+  "digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+}

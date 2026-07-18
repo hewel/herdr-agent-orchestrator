@@ -1,64 +1,62 @@
-# Herdr Agent Orchestrator
+# Herdr Harness Coordinator
 
 ## Project direction
 
-- Build a Rust Herdr plugin that runs, supervises, and coordinates coding agents in normal Herdr-managed terminal panes.
-- The parent agent retains ownership of intent, architecture, decomposition, acceptance criteria, verification design, final diff review, and the user-facing response.
-- Child agents receive bounded tasks with resolved requirements, declared write scopes, and objectively verifiable completion criteria.
-- Treat `docs/ARCHITECTURE.md` as the product source of truth and `CONTEXT.md` as the canonical domain vocabulary. Keep this guide concise; do not duplicate the full design here.
+- Build a lightweight Rust Herdr plugin that coordinates autonomous top-level coding Harnesses in normal Herdr-managed panes.
+- One Supervisor Harness owns intent, architecture, Task decomposition, Worker selection, corrections, approval, final verification, and the user-facing response.
+- Worker Harnesses execute bounded Tasks and may use their native multi-agent systems; the Coordinator sees only their top-level identity, messages, lifecycle, and consolidated Result.
+- Treat `docs/ARCHITECTURE.md` as the product source of truth and `CONTEXT.md` as the canonical vocabulary. Keep this guide concise.
 
 ## Architectural boundaries
 
-- Herdr Agent Orchestrator is the single top-level workflow authority. Provider-native orchestration may only appear later as a controlled child capability.
-- Keep provider, role, task, and policy independent. OMP and Codex are MVP providers; Pi and OpenCode are later providers, not hard-coded responsibilities.
-- Hide provider-specific protocols behind a shared Rust adapter interface. Shared runtime code consumes normalized events and structured artifacts, not native protocol messages.
-- Prompts describe role behavior; execution policies enforce permissions. Read-only and write-scope rules must be runtime constraints, not prompt-only requests.
-- Exchange structured run specifications, reports, and handoff artifacts instead of relying on cross-provider conversation history.
-- Treat `docs/research/mvp/public-run-contract.md` as the normative boundary between caller intent and immutable resolved runtime authority.
-- The child-agent pane owns the real process. Popups display and control runs but must not own agent lifecycles.
-- Official Herdr integrations may remain authoritative for native provider identity and protocol lifecycle, but this plugin owns top-level workflow, task, role, policy, repository safety, and verification state.
+- The Coordinator owns durable Harness identity, Task queues, star-topology messaging, delivery evidence, pane/process control, and advisory repository coordination. It is not a workflow engine.
+- OMP and Codex are the MVP Harness Kinds. Pi follows the MVP; OpenCode is later.
+- Hide native protocols behind the shared Rust Harness Adapter interface. Provider-specific frames and child-session details stay inside adapters and native logs.
+- Require one active Supervisor per Coordinator state directory and one active Task per Worker. Reject Worker-to-Worker messaging.
+- Use `docs/research/mvp/coordination-contract.md` as the normative public Task/message/Result boundary.
+- The Worker pane owns the Harness Host and native process. The popup observes and controls durable state but never owns a Harness lifecycle.
+- A registered Supervisor is pull-notified through its durable inbox, Herdr metadata, and popup; the Coordinator cannot inject a new turn into an already-running Supervisor process.
 
-## Repository safety
+## Repository coordination
 
-- Treat `docs/research/mvp/repository-safety-contract.md` as the normative Managed-runtime safety boundary.
-- Inspect and preserve the user's existing repository state before every editing run.
-- Capture a Repository Snapshot, validate declared scopes, and acquire a Worktree Lease before execution.
-- Run providers against a private Run Overlay; only a sealed, validated Publish Delta may reach the live worktree.
-- Permit only one editing workflow per worktree. Read-only verification may run concurrently when it cannot interfere with edits.
-- Quarantine uncertain publication and never automatically revert, merge, or discard unexpected modifications.
-- Reject unresolved architecture choices in child tasks; return them to the parent agent for a decision.
+- Use `docs/research/mvp/advisory-worktree-contract.md` as the normative MVP repository boundary.
+- Inspect and preserve existing staged, unstaged, and untracked state before every mutating Task.
+- Permit only one mutating Task per canonical worktree and hold its Advisory Worktree Lease through Result review and Corrections until Supervisor Approval.
+- Compare Git-visible changes with declared exact-file and subtree scopes, but describe this as advisory detection rather than sandbox enforcement.
+- Create a Worktree Hold after uncertain, failed, cancelled, or out-of-scope mutation. Only digest-confirmed Supervisor reconciliation may clear it.
+- Never automatically revert, reset, clean, merge, publish, or discard repository changes.
 
 ## MVP boundaries
 
-- Require explicit provider and role selection. Initial providers are OMP and Codex; built-in roles are implementer, reviewer, and verifier.
-- Use Managed delegation mode for the MVP. Include structured run specs and artifacts, repository guards, verification commands, normalized lifecycle events, persistent SQLite state, Herdr metadata, a Ratatui popup, and cancel/focus/inspect controls.
-- Keep role and policy concepts in the domain model from the start, even when initial role definitions are built in.
-- Defer automatic routing, provider-native subagents, user-defined roles, inheritance, general workflow DAG execution, multiple editing agents, automatic merge/rollback, OpenCode, graphical or web UIs, distributed workers, and deep recursive delegation. Pi is the first provider after the MVP.
+- Require explicit Worker Harness and launch profile selection. Do not route Harnesses or models automatically.
+- Include OMP and Codex adapters, persistent top-level sessions, durable SQLite mailboxes, strict versioned contracts, immutable Attachments, delivery receipts, Questions, Replies, Corrections, Results, Approval, Herdr metadata, popup controls, focus, cancellation, and Worker stop.
+- Permit native multi-agent behavior but do not visualize, address, budget, or route native children.
+- Defer peer messaging, workflow DAGs, automatic decomposition, multiple mutating Tasks per worktree, automatic worktrees, merge/rollback/publication, hostile-process isolation, universal artifacts, distributed brokers, and graphical or web UIs.
 
 ## Implementation order
 
-1. Build the Managed runtime with OMP, Codex, built-in roles, repository guards, SQLite state, artifacts, Herdr metadata, and popup controls.
-2. Add provider capability negotiation, persistent sessions, resume, steering, transcripts, handoffs, and isolated worktrees.
-3. Add Pi as a managed provider.
-4. Add policy-bounded OMP Hybrid mode with read-only native helpers first.
-5. Add OpenCode, then custom roles and general DAG workflows.
-
-The first milestone must prove the full Managed OMP path from parent submission through a bounded edit, verification, scope validation, structured artifact, popup result, and parent review while keeping provider-native subagents disabled.
+1. Build the Coordinator Core, contracts, SQLite state, mailbox, Attachments, Task lifecycle, and advisory worktree coordination.
+2. Prove the full Supervisor → OMP Worker → native multi-agent → Result → Correction or Approval path in real Herdr panes.
+3. Prove the equivalent persistent-thread path for Codex.
+4. Add MCP/host-tool bridges, metadata, popup inbox and Task views, focus, cancellation, stop, and Hold controls.
+5. Add Pi only after both MVP paths are stable.
 
 ## Rust and persistence conventions
 
-- Use async Rust with Tokio and provider traits with `async-trait`; use Serde-backed versioned JSON/TOML types at process and disk boundaries.
+- Use async Rust with Tokio and `async-trait`; use Serde-backed versioned JSON/TOML types at process and disk boundaries.
+- Keep the Coordinator Core as a deep command/query module. OMP and Codex justify the real Harness Adapter seam; avoid pass-through module layers.
 - Use the Git CLI initially rather than `git2`.
-- Store indexed runtime state in SQLite beneath `HERDR_PLUGIN_STATE_DIR`; store large artifacts, transcripts, logs, diffs, and patches as files.
-- Keep provider protocol types inside provider modules and keep Herdr transport details behind the Herdr integration boundary.
-- Prefer focused tests around domain validation, state transitions, repository guards, protocol translation, cancellation, and artifact construction.
+- Store indexed runtime state in SQLite beneath `HERDR_PLUGIN_STATE_DIR`; store Attachments, transcripts, logs, diffs, and verification evidence as files.
+- Keep native protocol types inside adapter modules and Herdr socket types inside the Herdr integration module.
+- Prefer focused tests around schema and typed validation, Task transitions, route authorization, delivery ambiguity, adapter translation, cancellation, Repository Observations, leases, and Holds.
 
 ## Change discipline
 
-- Implement vertical slices in the recommended order; do not scaffold deferred subsystems speculatively.
-- Preserve public and persisted schemas deliberately with explicit `schema_version` fields.
-- Keep verification commands declared in the task packet and report their command, exit status, pass/fail result, and concise evidence.
-- When runtime behavior matters, validate through the real process or Herdr boundary rather than treating compilation alone as completion.
+- Implement vertical slices in the documented order and do not scaffold deferred subsystems.
+- Preserve public and persisted contracts deliberately with explicit `schema_version` fields; never loosen v1 meaning in place.
+- Preserve unrelated local edits and never normalize, revert, or discard user changes.
+- Report verification command, exit status, pass/fail result, evidence, deviations, and risks in every Worker Result.
+- Validate runtime behavior through the real provider and Herdr boundaries; compilation alone is not completion.
 
 ## Agent skills
 
@@ -68,7 +66,7 @@ Issues are tracked in GitHub Issues, and external pull requests are also a triag
 
 ### Triage labels
 
-The repository uses the five default triage labels: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, and `wontfix`. See `docs/agents/triage-labels.md`.
+The repository uses `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, and `wontfix`. See `docs/agents/triage-labels.md`.
 
 ### Domain docs
 

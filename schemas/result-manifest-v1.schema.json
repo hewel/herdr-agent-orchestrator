@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://herdr.dev/schemas/harness-coordinator/result-manifest-v1.schema.json",
+  "title": "ResultManifestV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "task_id", "summary", "changed_files", "verification", "deviations", "risks", "attachments"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "task_id": { "$ref": "common-v1.schema.json#/$defs/uuid" },
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 16384
+    },
+    "changed_files": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "common-v1.schema.json#/$defs/relativePath" }
+    },
+    "verification": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "common-v1.schema.json#/$defs/verificationResult" }
+    },
+    "deviations": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1, "maxLength": 4096 }
+    },
+    "risks": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1, "maxLength": 4096 }
+    },
+    "attachments": {
+      "type": "array",
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": { "$ref": "common-v1.schema.json#/$defs/attachmentId" }
+    }
+  }
+}

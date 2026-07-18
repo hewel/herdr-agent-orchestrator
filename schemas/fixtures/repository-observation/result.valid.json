@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "id": "019f7000-0000-7000-8000-000000000040",
+  "task_id": "019f7000-0000-7000-8000-000000000010",
+  "checkpoint": "result",
+  "worktree_root": "/workspace/project",
+  "git_common_dir": "/workspace/project/.git",
+  "head": "0123456789abcdef0123456789abcdef01234567",
+  "branch": "main",
+  "index_digest": "123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0",
+  "staged_diff": null,
+  "unstaged_diff": "019f7000-0000-7000-8000-000000000041",
+  "untracked": [],
+  "ignored_paths": [
+    "target"
+  ],
+  "status_entries": [
+    {
+      "path": "src/download/queue.rs",
+      "index_status": ".",
+      "worktree_status": "M"
+    },
+    {
+      "path": "tests/download/queue_test.rs",
+      "index_status": ".",
+      "worktree_status": "M"
+    }
+  ],
+  "changed_paths": [
+    "src/download/queue.rs",
+    "tests/download/queue_test.rs"
+  ],
+  "scope_classifications": [
+    {
+      "path": "src/download/queue.rs",
+      "classification": "in_scope",
+      "matched_scope": {
+        "kind": "exact_file",
+        "path": "src/download/queue.rs"
+      }
+    },
+    {
+      "path": "tests/download/queue_test.rs",
+      "classification": "in_scope",
+      "matched_scope": {
+        "kind": "subtree",
+        "path": "tests/download"
+      }
+    }
+  ],
+  "command_evidence": [
+    {
+      "command": "git status --porcelain=v2 -z --ignored=matching",
+      "version": "git version 2.50.1",
+      "exit_code": 0,
+      "diagnostics": "Captured normalized status and ignored path names."
+    }
+  ],
+  "captured_at": "2026-07-18T08:31:00.000000Z",
+  "digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+}

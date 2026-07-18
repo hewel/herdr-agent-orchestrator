@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "request_key": "download-queue-v1",
+  "worker_id": "omp-worker",
+  "title": "Fix duplicate queue insertion",
+  "instructions": "Use the existing queue lock and preserve the public API.",
+  "attachments": [
+    "019f7000-0000-7000-8000-000000000001"
+  ],
+  "repository": {
+    "root": "/workspace/project",
+    "access": "mutating",
+    "write_scopes": [
+      {
+        "kind": "exact_file",
+        "path": "src/download/queue.rs"
+      },
+      {
+        "kind": "subtree",
+        "path": "tests/download"
+      }
+    ]
+  }
+}

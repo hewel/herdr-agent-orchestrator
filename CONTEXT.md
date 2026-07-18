@@ -1,109 +1,91 @@
-# Herdr Agent Orchestrator
+# Herdr Harness Coordinator
 
-Herdr Agent Orchestrator is the control plane that coordinates bounded coding-agent work while preserving one authority for workflow, policy, repository safety, and results.
+Herdr Harness Coordinator is the local coordination network through which one Supervisor directs and reviews bounded work performed by autonomous Worker Harnesses.
 
-## Control plane
+## Network
 
-**Orchestrator**:
-The single top-level authority that owns workflows and coordinates agent runs.
-_Avoid_: Coordinator, provider orchestrator
+**Coordinator**:
+The local authority for harness presence, task delivery, message routing, and durable coordination state.
+_Avoid_: Orchestrator, workflow engine
 
-**Parent Agent**:
-The agent responsible for user intent, architecture decisions, task decomposition, acceptance criteria, final review, and the user-facing response.
-_Avoid_: Root worker, supervisor
+**Harness**:
+A durable, addressable autonomous coding environment such as OMP or Codex.
+_Avoid_: Provider, agent type
 
-**Provider**:
-An execution engine that runs an assigned task without owning the top-level workflow.
-_Avoid_: Role, agent type
+**Harness Session**:
+One live activation of a Harness, bound to a native session and a Herdr terminal.
+_Avoid_: Harness, Agent Run
 
-**Role**:
-The responsibility assigned to an agent run, independent of which provider executes it.
-_Avoid_: Provider profile, agent type
+**Harness Kind**:
+The native harness implementation used by a Harness, initially OMP or Codex.
+_Avoid_: Provider, role
 
-**Execution Policy**:
-The enforceable permissions and limits that bound an agent run.
-_Avoid_: Prompt instructions, role description
+**Harness Tier**:
+The coordination authority assigned to a Harness: Supervisor or Worker.
+_Avoid_: Model Tier, Role
+
+**Supervisor Harness**:
+The sole Harness that owns user intent, technical direction, task decomposition, corrections, approval, and the final response.
+_Avoid_: Parent Agent, root worker
+
+**Worker Harness**:
+An autonomous Harness that executes one bounded Task at a time and returns a consolidated result.
+_Avoid_: Child Agent, provider run
 
 ## Work
 
-**Run Submission**:
-The versioned caller intent for either one Agent Run or the fixed Managed workflow, containing explicit assignments, bounded task intent, repository authority, and a root timeout.
-_Avoid_: Agent Run Spec, request packet
+**Task**:
+A bounded assignment from the Supervisor Harness to one Worker Harness, including repository authority and acceptance context.
+_Avoid_: Workflow node, prompt, Agent Run
 
-**Resolved Run Spec**:
-The immutable, orchestrator-owned authority compiled from an accepted Run Submission and frozen configuration for one top-level run or child Agent Run.
-_Avoid_: Run Submission, mutable run state
+**Task Conversation**:
+The ordered Task, Question, Reply, Correction, Result, and Notification messages associated with one Task.
+_Avoid_: Shared chat history, workflow
 
-**Task Packet**:
-A bounded, resolved objective with its context, requirements, acceptance criteria, write scope, and verification expectations.
-_Avoid_: Prompt, ticket
+**Result**:
+A Worker Harness's consolidated completion report and verification evidence for Supervisor review.
+_Avoid_: Final completion, universal artifact
 
-**Agent Run**:
-One provider session executing one task packet under a resolved role and execution policy.
-_Avoid_: Agent, workflow
+**Approval**:
+The Supervisor Harness's acceptance of a Result and the associated repository state.
+_Avoid_: Worker completion, delivery acknowledgement
 
-**Workflow Run**:
-One orchestrator-owned execution of a workflow template that coordinates child Agent Runs and produces one terminal workflow outcome.
-_Avoid_: Agent Run, provider session
+## Communication
 
-**Workflow Node**:
-A dependency-aware unit of workflow execution that produces an artifact for downstream nodes.
-_Avoid_: Child agent, task packet
+**Bus Message**:
+A short, durable communication between the Supervisor Harness and one Worker Harness.
+_Avoid_: Prompt, artifact
 
-**Delegation Mode**:
-The ownership model governing how an agent run may use provider-native child execution.
-_Avoid_: Provider mode, role mode
+**Message Kind**:
+The purpose of a Bus Message: Task, Result, Question, Reply, Correction, or Notification.
+_Avoid_: Event type, role
 
-**Managed Mode**:
-A delegation mode in which the orchestrator creates and controls every workflow node.
-_Avoid_: Default provider mode
+**Delivery Intent**:
+The sender's explicit choice to process a Bus Message after current work or steer the active work.
+_Avoid_: Auto mode, adapter decision
 
-**Native Mode**:
-A delegation mode in which a provider uses its own multi-agent system within a run.
-_Avoid_: Managed mode
+**Delivery Receipt**:
+Durable evidence about native acceptance of one Bus Message, distinct from Task processing or completion.
+_Avoid_: Result, Approval
 
-**Hybrid Mode**:
-A delegation mode in which the orchestrator owns the top-level workflow while a provider run may create controlled native children.
-_Avoid_: Mixed workflow ownership
+**Attachment**:
+An immutable file stored by the Coordinator and referenced from a Bus Message by identity and digest.
+_Avoid_: Raw file path, universal artifact
 
-## Exchange and safety
+**Durable Mailbox**:
+The persisted ordered messages awaiting or recording delivery for one Harness.
+_Avoid_: Provider queue, conversation history
 
-**Structured Artifact**:
-A versioned result produced by an agent run and consumed without depending on provider-native conversation history.
-_Avoid_: Final message, transcript
+## Repository coordination
 
-**Handoff Packet**:
-A structured artifact that transfers bounded context and instructions between agent runs.
-_Avoid_: Shared chat history
+**Repository Observation**:
+A digest-addressed record of the Git worktree state at a Task checkpoint.
+_Avoid_: Repository Snapshot, Publish Delta
 
-**Repository Guard**:
-The authority that owns repository snapshots, run overlays, write scopes, worktree leases, and validated publication for an agent run.
-_Avoid_: Git wrapper, prompt rule
+**Advisory Worktree Lease**:
+The Coordinator's exclusive scheduling claim for one mutating Task against a canonical worktree.
+_Avoid_: Sandbox, repository lock
 
-**Repository Snapshot**:
-An immutable, run-owned record of the complete worktree and Git baseline from which managed execution begins.
-_Avoid_: Git baseline, checkout copy
-
-**Run Overlay**:
-The private writable repository view in which a managed provider produces a candidate without changing the live worktree.
-_Avoid_: Sandbox worktree, temporary checkout
-
-**Publish Delta**:
-The validated difference between a repository snapshot and a sealed run overlay that is eligible for publication.
-_Avoid_: Agent diff, working changes
-
-**Scratch Scope**:
-A declared writable path whose contents are evidence or temporary runtime output and can never enter a publish delta.
-_Avoid_: Ignored scope, temporary write scope
-
-**Worktree Lease**:
-Exclusive editing ownership of one resolved worktree for the duration of a managed run or workflow.
-_Avoid_: Repository lock, agent lock
-
-**Publish Journal**:
-The durable record of intended and completed host mutations used to identify publication progress and uncertainty.
-_Avoid_: Change log, rollback log
-
-**Repository Quarantine**:
-A state that blocks new editing runs because publication may be partial or repository state cannot be proven safe.
-_Avoid_: Failed lock, dirty repository
+**Worktree Hold**:
+A durable block on new mutating Tasks when the current worktree state requires Supervisor reconciliation.
+_Avoid_: Automatic rollback, Repository Quarantine

@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "message_id": "019f7000-0000-7000-8000-000000000030",
+  "state": "accepted",
+  "attempt_count": 1,
+  "updated_at": "2026-07-18T08:30:00.000000Z",
+  "native_correlation": "omp:req_42"
+}

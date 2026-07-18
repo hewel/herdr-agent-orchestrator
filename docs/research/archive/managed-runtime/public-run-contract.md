@@ -1,18 +1,20 @@
-# Public run contract and resolved snapshots
+# Archived public run contract and resolved snapshots
 
-Status: resolved for the Managed Runtime MVP.
+Status: superseded by `docs/research/mvp/coordination-contract.md` and retained only as historical Managed Runtime research.
+
+Former status: resolved for the Managed Runtime MVP.
 
 This contract separates the intent a caller may submit from the immutable
 authority the orchestrator compiles for execution. It is authoritative for
 individual Managed `AgentRun`s and the fixed Managed implementer → reviewer →
 verifier workflow. The machine-readable public shapes are
-[`run-submission-v1.schema.json`](../../../schemas/run-submission-v1.schema.json)
+[`run-submission-v1.schema.json`](../../../../schemas/archive/managed-runtime/run-submission-v1.schema.json)
 and
-[`dirty-worktree-confirmation-v1.schema.json`](../../../schemas/dirty-worktree-confirmation-v1.schema.json).
+[`dirty-worktree-confirmation-v1.schema.json`](../../../../schemas/archive/managed-runtime/dirty-worktree-confirmation-v1.schema.json).
 The persisted snapshot envelopes are documented by
-[`resolved-run-spec-v1.schema.json`](../../../schemas/resolved-run-spec-v1.schema.json)
+[`resolved-run-spec-v1.schema.json`](../../../../schemas/archive/managed-runtime/resolved-run-spec-v1.schema.json)
 and
-[`resolved-agent-run-spec-v1.schema.json`](../../../schemas/resolved-agent-run-spec-v1.schema.json).
+[`resolved-agent-run-spec-v1.schema.json`](../../../../schemas/archive/managed-runtime/resolved-agent-run-spec-v1.schema.json).
 
 ## Contract boundary
 

@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "worker_id": "omp-worker",
+  "title": "Mutate without declared scope",
+  "instructions": "This fixture must fail scope validation.",
+  "attachments": [],
+  "repository": {
+    "root": "/workspace/project",
+    "access": "mutating",
+    "write_scopes": []
+  }
+}

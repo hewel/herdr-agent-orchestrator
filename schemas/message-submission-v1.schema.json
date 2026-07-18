@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://herdr.dev/schemas/harness-coordinator/message-submission-v1.schema.json",
+  "title": "MessageSubmissionV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "to", "kind", "text", "attachments"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "request_key": { "$ref": "common-v1.schema.json#/$defs/requestKey" },
+    "to": { "$ref": "common-v1.schema.json#/$defs/harnessId" },
+    "task_id": { "$ref": "common-v1.schema.json#/$defs/uuid" },
+    "kind": { "enum": ["question", "reply", "correction", "notification"] },
+    "text": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 16384
+    },
+    "attachments": {
+      "type": "array",
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": { "$ref": "common-v1.schema.json#/$defs/attachmentId" }
+    },
+    "reply_to": { "$ref": "common-v1.schema.json#/$defs/uuid" },
+    "delivery": {
+      "enum": ["follow_up", "steer"],
+      "default": "follow_up"
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "kind": { "const": "notification" } } },
+      "else": { "required": ["task_id"] }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "reply" } } },
+      "then": { "required": ["reply_to"] },
+      "else": { "not": { "required": ["reply_to"] } }
+    }
+  ]
+}

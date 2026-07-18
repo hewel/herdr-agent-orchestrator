@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "worker_id": "omp-worker",
+  "title": "Edit an invalid path",
+  "instructions": "This fixture must fail path validation.",
+  "attachments": [],
+  "repository": {
+    "root": "/workspace/project",
+    "access": "mutating",
+    "write_scopes": [
+      {
+        "kind": "exact_file",
+        "path": "../outside.txt"
+      }
+    ]
+  }
+}

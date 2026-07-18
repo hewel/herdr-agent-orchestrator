@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://herdr.dev/schemas/harness-coordinator/delivery-receipt-v1.schema.json",
+  "title": "DeliveryReceiptV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "message_id", "state", "attempt_count", "updated_at"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "message_id": { "$ref": "common-v1.schema.json#/$defs/uuid" },
+    "state": {
+      "enum": ["pending", "dispatching", "accepted", "retryable_failed", "permanent_failed", "unknown", "cancelled"]
+    },
+    "attempt_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "updated_at": { "$ref": "common-v1.schema.json#/$defs/rfc3339" },
+    "native_correlation": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "error_code": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "error_message": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    }
+  }
+}

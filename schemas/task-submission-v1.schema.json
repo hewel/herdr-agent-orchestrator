@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://herdr.dev/schemas/harness-coordinator/task-submission-v1.schema.json",
+  "title": "TaskSubmissionV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "worker_id", "title", "instructions", "attachments", "repository"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "request_key": { "$ref": "common-v1.schema.json#/$defs/requestKey" },
+    "worker_id": { "$ref": "common-v1.schema.json#/$defs/harnessId" },
+    "related_task_id": { "$ref": "common-v1.schema.json#/$defs/uuid" },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160
+    },
+    "instructions": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 16384
+    },
+    "attachments": {
+      "type": "array",
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": { "$ref": "common-v1.schema.json#/$defs/attachmentId" }
+    },
+    "repository": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["root", "access", "write_scopes"],
+      "properties": {
+        "root": { "$ref": "common-v1.schema.json#/$defs/absolutePath" },
+        "access": { "enum": ["read_only", "mutating"] },
+        "write_scopes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "common-v1.schema.json#/$defs/writeScope" }
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "access": { "const": "read_only" } } },
+          "then": { "properties": { "write_scopes": { "maxItems": 0 } } }
+        },
+        {
+          "if": { "properties": { "access": { "const": "mutating" } } },
+          "then": { "properties": { "write_scopes": { "minItems": 1 } } }
+        }
+      ]
+    }
+  }
+}

@@ -1,3 +1,7 @@
+---
+status: superseded by ADR-0004
+---
+
 # Use one top-level orchestrator
 
 Herdr Agent Orchestrator is the single authority for top-level workflows, scheduling, policy, repository safety, and artifact routing. OMP, Codex, Pi, and OpenCode remain execution providers because allowing Herdr, provider-native multi-agent systems, and a custom workflow runtime to coordinate peers independently would create competing ownership, inconsistent enforcement, and ambiguous cancellation and status.

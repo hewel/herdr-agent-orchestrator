@@ -1,4 +1,6 @@
-# Managed repository safety contract
+# Archived Managed repository safety contract
+
+Status: superseded for the MVP by `docs/research/mvp/advisory-worktree-contract.md` and retained as possible future managed-execution research.
 
 ## Decision
 
@@ -12,7 +14,7 @@ The contract is authoritative for Managed OMP and Managed Codex. Provider
 approval modes, prompts, native sandboxes, and final Git checks are
 defense-in-depth; none replaces this boundary. The architectural reason for
 staging writes before publication is recorded in
-[ADR 0002](../../adr/0002-stage-managed-writes-before-publication.md).
+[ADR 0002](../../../adr/0002-stage-managed-writes-before-publication.md).
 
 ## Guarantee boundary
 
@@ -275,7 +277,7 @@ path is proved, Managed OMP remains unsupported.
 
 Codex uses its run-owned managed home and native command sandbox as additional
 defense-in-depth. Repository skills and instructions are audited as required by
-the [Codex App Server host contract](codex-app-server-host-contract.md), but the
+the [Codex App Server host contract](../../mvp/codex-app-server-host-contract.md), but the
 outer Repository Guard remains authoritative. App Server receives the broker
 endpoint and run-scoped capability, never a reusable provider credential.
 

@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "id": "OMP-Worker",
+  "kind": "omp",
+  "tier": "worker",
+  "cwd": "/workspace/project",
+  "launch_profile": "omp-cost-efficient"
+}

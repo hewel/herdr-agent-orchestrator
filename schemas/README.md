@@ -1,32 +1,18 @@
-# Contract schemas
+# Coordinator contract schemas
 
-These Draft 2020-12 schemas are the checked-in wire and persistence boundary
-for the Managed Runtime MVP:
+These Draft 2020-12 schemas are the checked-in wire and persistence boundary for the Harness Coordinator MVP:
 
-- `run-submission-v1.schema.json` validates the closed public submission union;
-- `dirty-worktree-confirmation-v1.schema.json` validates exact confirmation
-  messages for prepared dirty runs; and
-- `resolved-run-spec-v1.schema.json` validates the immutable top-level snapshot
-  envelope shape; and
-- `resolved-agent-run-spec-v1.schema.json` validates the sealed child-level
-  authority passed to a provider adapter.
+- `harness-definition-v1.schema.json` defines durable Harness registration and launch identity;
+- `task-submission-v1.schema.json` defines bounded Task and repository authority input;
+- `message-submission-v1.schema.json` defines Question, Reply, Correction, and Notification input;
+- `result-manifest-v1.schema.json` defines the consolidated Worker Result;
+- `delivery-receipt-v1.schema.json` defines current native-delivery evidence; and
+- `repository-observation-v1.schema.json` defines advisory Git checkpoint evidence.
 
-Files beneath `fixtures/` are golden examples. Schema validation is only the
-first admission layer. Rust typed validation must additionally enforce UTF-8
-byte limits, lexical and descriptor-relative path rules, scope overlap,
-role-policy compatibility, unique verification IDs, worktree identity,
-idempotency, snapshot digests, dirty-path equality, and configuration
-provenance described in the
-[public run contract](../docs/research/mvp/public-run-contract.md).
+`common-v1.schema.json` contains shared scalar and value definitions. Files under `fixtures/` are golden valid and invalid examples. The archived Managed Runtime schemas remain under `archive/managed-runtime/` for historical reference and are not active contracts.
 
-The `digest` fields in resolved fixtures are real SHA-256 values over RFC 8785
-canonical bytes of `value`. Their `submission_digest` fields likewise match the
-corresponding public fixture after `request_key` removal. The fixtures use only
-integers and ordinary UTF-8 strings so generic key-sorted JSON is sufficient
-for a local smoke check; production code must use a conforming RFC 8785
-implementation.
+Schema validation is the first admission layer. Rust typed validation must additionally enforce canonical Git identity, descriptor-relative path and symlink rules, UTF-8 byte ceilings beyond JSON Schema's scalar-value `maxLength`, scope overlap normalization, session-bound authorization, route permissions, Task state transitions, idempotency digests, delivery ambiguity, and Repository Observation integrity described in the MVP contracts.
 
-Do not loosen a v1 schema in place. Any public field, default, constraint,
-enum, or semantic change creates a new public schema version. Persisted
-snapshot envelope versions evolve independently when public v1 meaning is
-unchanged.
+Run `node scripts/validate-contracts.mjs` to parse every active schema, resolve local references, compile patterns, validate positive and negative wire fixtures, and check semantic route fixtures.
+
+Do not loosen a v1 schema in place. Adding fields, enum values, defaults, or semantic meaning creates a new public schema version.

@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "worker_id": "codex-review",
+  "title": "Review the implementation",
+  "instructions": "Review without modifying files.",
+  "attachments": [],
+  "repository": {
+    "root": "/workspace/project",
+    "access": "read_only",
+    "write_scopes": [
+      {
+        "kind": "subtree",
+        "path": "src"
+      }
+    ]
+  }
+}

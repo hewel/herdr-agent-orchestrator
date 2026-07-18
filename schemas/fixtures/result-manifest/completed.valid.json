@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "task_id": "019f7000-0000-7000-8000-000000000010",
+  "summary": "The existing queue lock now covers duplicate detection and insertion.",
+  "changed_files": [
+    "src/download/queue.rs",
+    "tests/download/queue_test.rs"
+  ],
+  "verification": [
+    {
+      "command": "cargo test download_queue",
+      "exit_code": 0,
+      "passed": true,
+      "evidence": "019f7000-0000-7000-8000-000000000021"
+    }
+  ],
+  "deviations": [],
+  "risks": [
+    "The advisory Coordinator cannot attribute concurrent same-scope user edits."
+  ],
+  "attachments": [
+    "019f7000-0000-7000-8000-000000000020",
+    "019f7000-0000-7000-8000-000000000021"
+  ]
+}

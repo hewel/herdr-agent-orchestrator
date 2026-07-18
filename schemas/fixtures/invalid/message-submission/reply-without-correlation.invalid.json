@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "to": "omp-worker",
+  "task_id": "019f7000-0000-7000-8000-000000000010",
+  "kind": "reply",
+  "text": "Preserve the public API.",
+  "attachments": [],
+  "delivery": "follow_up"
+}
