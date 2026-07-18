@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+
+: "${HERDR_SOCKET_PATH:?Herdr did not provide HERDR_SOCKET_PATH}"
+: "${HERDR_PLUGIN_STATE_DIR:?Herdr did not provide HERDR_PLUGIN_STATE_DIR}"
+
+coordinator_bin="${HERDR_COORDINATOR_BIN:-herdr-harness-coordinator}"
+exec "$coordinator_bin" popup

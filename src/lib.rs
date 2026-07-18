@@ -5,6 +5,7 @@ pub mod attachment;
 pub mod broker;
 pub mod contract;
 pub mod core;
+pub mod herdr;
 pub mod profile;
 pub mod process_adapter;
 pub mod repository;

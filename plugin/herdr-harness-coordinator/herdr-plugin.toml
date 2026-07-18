@@ -1,0 +1,22 @@
+manifest_version = 1
+name = "Harness Coordinator"
+version = "0.1.0"
+description = "Coordinate durable Supervisor and Worker Harness sessions in Herdr panes."
+min_herdr_version = "0.7.4"
+platforms = ["linux"]
+
+[[panes]]
+id = "worker"
+title = "Harness Worker"
+description = "Own one Coordinator Harness Host and its native OMP or Codex process."
+placement = "tab"
+command = ["scripts/worker"]
+
+[[panes]]
+id = "harness-network"
+title = "Harness Network"
+description = "View durable Coordinator state and invoke Supervisor-authorized controls."
+placement = "popup"
+width = "80%"
+height = "80%"
+command = ["scripts/harness-network"]
