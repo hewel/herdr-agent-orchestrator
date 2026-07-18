@@ -9,7 +9,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::{
     broker::{BrokerOperation, BrokerRequest, BrokerResponse, call},
-    contract::{HarnessId, MessageSubmissionV1, ResultManifestV1, SCHEMA_VERSION, TaskId},
+    contract::{
+        HarnessId, MessageSubmissionV1, ObservationCheckpoint, ResultManifestV1, SCHEMA_VERSION,
+        TaskId,
+    },
     core::{ActorContext, CoordinatorCommand, CoordinatorQuery, SessionCapability},
 };
 
@@ -144,6 +147,14 @@ impl McpServer {
                     observation_digest: args.observation_digest,
                 })
             }
+            "harness_repository_observe" => {
+                let args: ObserveArgs = serde_json::from_value(arguments)
+                    .context("invalid repository observation arguments")?;
+                execute(CoordinatorCommand::CaptureRepositoryObservation {
+                    task_id: args.task_id,
+                    checkpoint: args.checkpoint,
+                })
+            }
             "harness_task_cancel" => {
                 let args: TaskArgs =
                     serde_json::from_value(arguments).context("invalid cancellation arguments")?;
@@ -195,10 +206,6 @@ impl McpServer {
     }
 }
 
-#[expect(
-    clippy::large_enum_variant,
-    reason = "the bridge preserves typed Core commands until broker serialization"
-)]
 enum ToolOperation {
     Execute(CoordinatorCommand),
     Query(CoordinatorQuery),
@@ -223,6 +230,12 @@ struct ApproveArgs {
     task_id: TaskId,
     result_revision: u32,
     observation_digest: String,
+}
+
+#[derive(Deserialize)]
+struct ObserveArgs {
+    task_id: TaskId,
+    checkpoint: ObservationCheckpoint,
 }
 
 #[derive(Deserialize)]
@@ -294,6 +307,11 @@ fn tools() -> Vec<Value> {
             "harness_complete",
             "Submit one Result candidate for the current native turn.",
             passthrough.clone(),
+        ),
+        tool(
+            "harness_repository_observe",
+            "Capture trusted Git evidence and return its digest.",
+            json!({"type":"object","required":["task_id","checkpoint"],"properties":{"task_id":{"type":"string"},"checkpoint":{"type":"string","enum":["before_dispatch","result","cancel","failure","approval","hold_clear"]}},"additionalProperties":false}),
         ),
         tool(
             "harness_task_approve",

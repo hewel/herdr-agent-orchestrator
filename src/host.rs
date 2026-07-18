@@ -3,7 +3,9 @@
 use std::{collections::BTreeMap, fmt::Write as _, path::Path, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use futures::StreamExt;
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -33,12 +35,31 @@ const PRE_WRITE_RETRIES: usize = 3;
 ///
 /// Returns an error when Session bootstrap, profile validation, broker delivery, or the
 /// provider lifecycle fails.
+pub async fn run_worker_host(socket: &Path, state_dir: &Path, bearer: String) -> Result<()> {
+    let capability = SessionCapability::from_bearer(bearer)?;
+    let result = run_worker_host_inner(socket, state_dir, capability.clone()).await;
+    if let Err(error) = &result {
+        let _ = broker_execute(
+            socket,
+            capability,
+            CoordinatorCommand::RecordHostFailed {
+                diagnostic: format!("{error:#}"),
+            },
+        )
+        .await;
+    }
+    result
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "the Host loop owns one provider lifecycle and event stream"
 )]
-pub async fn run_worker_host(socket: &Path, state_dir: &Path, bearer: String) -> Result<()> {
-    let capability = SessionCapability::from_bearer(bearer)?;
+async fn run_worker_host_inner(
+    socket: &Path,
+    state_dir: &Path,
+    capability: SessionCapability,
+) -> Result<()> {
     let session = broker_query(socket, capability.clone(), CoordinatorQuery::SessionSelf).await?;
     let QueryResult::Session(session) = session else {
         bail!("broker returned the wrong Session bootstrap projection");
@@ -96,6 +117,11 @@ pub async fn run_worker_host(socket: &Path, state_dir: &Path, bearer: String) ->
     loop {
         tokio::select! {
             _ = ticker.tick() => {
+                broker_execute(
+                    socket,
+                    capability.clone(),
+                    CoordinatorCommand::ClaimNextTask,
+                ).await?;
                 let inbox = broker_query(socket, capability.clone(), CoordinatorQuery::Inbox).await?;
                 let QueryResult::Inbox(messages) = inbox else { bail!("broker returned the wrong inbox projection") };
                 if let Some(message) = messages.first() {
@@ -259,6 +285,158 @@ pub async fn render_popup(socket: &Path, bearer: String) -> Result<String> {
     Ok(output)
 }
 
+/// Runs the interactive Supervisor popup until Escape or `q` is pressed.
+///
+/// The selected Task follows FIFO display order. Arrow keys change selection; `a` approves a
+/// reviewing Task after a fresh trusted Observation, `c` cancels it, `h` clears its Hold after a
+/// fresh reconciliation Observation, and `s` stops the first online Worker.
+///
+/// # Errors
+///
+/// Returns an error when terminal setup, broker access, or an authorized action fails.
+pub async fn run_popup(socket: &Path, bearer: String) -> Result<()> {
+    let capability = SessionCapability::from_bearer(bearer.clone())?;
+    let mut terminal = ratatui::init();
+    let result = run_popup_loop(&mut terminal, socket, &bearer, &capability).await;
+    ratatui::restore();
+    result
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the compact popup event loop keeps selection and authorized controls together"
+)]
+async fn run_popup_loop(
+    terminal: &mut ratatui::DefaultTerminal,
+    socket: &Path,
+    bearer: &str,
+    capability: &SessionCapability,
+) -> Result<()> {
+    let mut selected = 0_usize;
+    loop {
+        let tasks = broker_query(socket, capability.clone(), CoordinatorQuery::ListTasks).await?;
+        let QueryResult::Tasks(tasks) = tasks else {
+            bail!("invalid Task list response")
+        };
+        selected = selected.min(tasks.len().saturating_sub(1));
+        let mut content = render_popup(socket, bearer.to_owned()).await?;
+        let _ = writeln!(
+            content,
+            "\nSelected: {}\n[↑/↓] Select  [a] Approve  [c] Cancel  [h] Clear Hold  [s] Stop Worker  [Esc/q] Close",
+            tasks
+                .get(selected)
+                .map_or_else(|| "none".to_owned(), |task| task.id.to_string())
+        );
+        terminal.draw(|frame| {
+            frame.render_widget(
+                Paragraph::new(content)
+                    .block(Block::default().borders(Borders::ALL).title(" Herdr "))
+                    .wrap(Wrap { trim: false }),
+                frame.area(),
+            );
+        })?;
+        if !event::poll(Duration::from_millis(500))? {
+            continue;
+        }
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
+            KeyCode::Up => selected = selected.saturating_sub(1),
+            KeyCode::Down => selected = (selected + 1).min(tasks.len().saturating_sub(1)),
+            KeyCode::Char('c') => {
+                if let Some(task) = tasks.get(selected) {
+                    broker_execute(
+                        socket,
+                        capability.clone(),
+                        CoordinatorCommand::CancelTask { task_id: task.id },
+                    )
+                    .await?;
+                }
+            }
+            KeyCode::Char('a') => {
+                if let Some(task) = tasks.get(selected) {
+                    let captured = broker_execute(
+                        socket,
+                        capability.clone(),
+                        CoordinatorCommand::CaptureRepositoryObservation {
+                            task_id: task.id,
+                            checkpoint: crate::contract::ObservationCheckpoint::Approval,
+                        },
+                    )
+                    .await?;
+                    let CommandOutcome::ObservationRecorded { digest, .. } = captured else {
+                        bail!("repository capture returned the wrong outcome")
+                    };
+                    broker_execute(
+                        socket,
+                        capability.clone(),
+                        CoordinatorCommand::ApproveTask {
+                            task_id: task.id,
+                            result_revision: task.result_revision,
+                            observation_digest: digest,
+                        },
+                    )
+                    .await?;
+                }
+            }
+            KeyCode::Char('h') => {
+                if let Some(task) = tasks.get(selected) {
+                    let captured = broker_execute(
+                        socket,
+                        capability.clone(),
+                        CoordinatorCommand::CaptureRepositoryObservation {
+                            task_id: task.id,
+                            checkpoint: crate::contract::ObservationCheckpoint::HoldClear,
+                        },
+                    )
+                    .await?;
+                    let CommandOutcome::ObservationRecorded { digest, .. } = captured else {
+                        bail!("repository capture returned the wrong outcome")
+                    };
+                    broker_execute(
+                        socket,
+                        capability.clone(),
+                        CoordinatorCommand::ClearWorktreeHold {
+                            task_id: task.id,
+                            observation_digest: digest,
+                            audit_note: "Supervisor reconciled the repository from the popup."
+                                .to_owned(),
+                        },
+                    )
+                    .await?;
+                }
+            }
+            KeyCode::Char('s') => {
+                let status =
+                    broker_query(socket, capability.clone(), CoordinatorQuery::HarnessStatus)
+                        .await?;
+                let QueryResult::HarnessStatus(status) = status else {
+                    bail!("invalid Harness status response")
+                };
+                if let Some(worker) = status.into_iter().find(|harness| {
+                    harness.tier == crate::contract::HarnessTier::Worker
+                        && harness.presence == "online"
+                }) {
+                    broker_execute(
+                        socket,
+                        capability.clone(),
+                        CoordinatorCommand::StopWorker {
+                            worker_id: worker.id,
+                        },
+                    )
+                    .await?;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 async fn resolve_delivery(
     adapter: &mut dyn HarnessAdapter,
     socket: &Path,
@@ -338,10 +516,7 @@ async fn dispatch_with_safe_retries(
     for _ in 0..PRE_WRITE_RETRIES {
         match adapter.dispatch(delivery.clone()).await {
             Ok(acceptance) => return Ok(acceptance),
-            Err(error)
-                if error.to_string().contains("unknown")
-                    || error.to_string().contains("after write") =>
-            {
+            Err(error) if error.provider_bytes_may_have_been_written() => {
                 return Err(error);
             }
             Err(error) => last = Some(error),

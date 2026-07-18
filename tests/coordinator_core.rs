@@ -1,13 +1,11 @@
 use std::path::PathBuf;
 
-use chrono::Utc;
 use herdr_harness_coordinator::{
     contract::{
-        AttachmentId, CommandEvidenceV1, DeliveryIntent, HarnessDefinitionV1, HarnessId,
-        HarnessKind, HarnessTier, MessageKind, MessageSubmissionV1, ObservationCheckpoint,
-        RepositoryAccess, RepositoryObservationId, RepositoryObservationV1, ResultManifestV1,
-        SCHEMA_VERSION, TaskId, TaskRepositoryAuthorityV1, TaskSubmissionV1, VerificationResultV1,
-        WriteScopeV1,
+        AttachmentId, DeliveryIntent, HarnessDefinitionV1, HarnessId, HarnessKind, HarnessTier,
+        MessageKind, MessageSubmissionV1, ObservationCheckpoint, RepositoryAccess,
+        ResultManifestV1, SCHEMA_VERSION, TaskId, TaskRepositoryAuthorityV1, TaskSubmissionV1,
+        VerificationResultV1, WriteScopeV1,
     },
     core::{
         ActorContext, CommandOutcome, Coordinator, CoordinatorCommand, CoordinatorQuery,
@@ -58,6 +56,210 @@ async fn supervisor_registration_makes_the_harness_queryable() {
         harnesses,
         vec!["supervisor".parse().expect("ID must be valid")]
     );
+}
+
+#[tokio::test]
+async fn request_keys_replay_original_outcomes_and_reject_changed_payloads() {
+    let (state, coordinator, supervisor, _worker, _task_id) = seeded_task().await;
+    let worker_id: HarnessId = "omp-worker".parse().expect("ID must be valid");
+    let submission = TaskSubmissionV1 {
+        schema_version: SCHEMA_VERSION,
+        request_key: Some("task-retry-1".to_owned()),
+        worker_id: worker_id.clone(),
+        related_task_id: None,
+        title: "Idempotent task".to_owned(),
+        instructions: "Prove that task retries return the original outcome.".to_owned(),
+        attachments: Vec::new(),
+        repository: TaskRepositoryAuthorityV1 {
+            root: state.path().join("project"),
+            access: RepositoryAccess::ReadOnly,
+            write_scopes: Vec::new(),
+        },
+    };
+    let first = coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorCommand::CreateTask {
+                submission: submission.clone(),
+            },
+        )
+        .await
+        .expect("first keyed Task must succeed");
+    let replay = coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorCommand::CreateTask {
+                submission: submission.clone(),
+            },
+        )
+        .await
+        .expect("same keyed Task must replay");
+    assert_eq!(
+        serde_json::to_value(first).expect("outcome serializes"),
+        serde_json::to_value(replay).expect("outcome serializes")
+    );
+
+    let mut changed = submission;
+    changed.title = "Changed payload".to_owned();
+    let error = coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor,
+            },
+            CoordinatorCommand::CreateTask {
+                submission: changed,
+            },
+        )
+        .await
+        .expect_err("changed payload must conflict");
+    assert_eq!(
+        error.category,
+        herdr_harness_coordinator::core::ErrorCategory::Conflict
+    );
+}
+
+#[tokio::test]
+async fn taskless_notifications_remain_on_the_supervisor_worker_star() {
+    let (_state, coordinator, supervisor, worker, _task_id) = seeded_task().await;
+    let submission = MessageSubmissionV1 {
+        schema_version: SCHEMA_VERSION,
+        request_key: Some("notification-retry-1".to_owned()),
+        to: "omp-worker".parse().expect("ID must be valid"),
+        task_id: None,
+        kind: MessageKind::Notification,
+        text: "Coordinator notice".to_owned(),
+        attachments: Vec::new(),
+        reply_to: None,
+        delivery: DeliveryIntent::FollowUp,
+    };
+    let first = coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorCommand::SendMessage {
+                submission: submission.clone(),
+            },
+        )
+        .await
+        .expect("Supervisor notification must succeed");
+    let replay = coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor,
+            },
+            CoordinatorCommand::SendMessage { submission },
+        )
+        .await
+        .expect("notification retry must replay");
+    assert_eq!(
+        serde_json::to_value(first).expect("outcome serializes"),
+        serde_json::to_value(replay).expect("outcome serializes")
+    );
+
+    let error = coordinator
+        .execute(
+            ActorContext::Session { capability: worker },
+            CoordinatorCommand::SendMessage {
+                submission: MessageSubmissionV1 {
+                    schema_version: SCHEMA_VERSION,
+                    request_key: None,
+                    to: "omp-worker".parse().expect("ID must be valid"),
+                    task_id: None,
+                    kind: MessageKind::Notification,
+                    text: "self route".to_owned(),
+                    attachments: Vec::new(),
+                    reply_to: None,
+                    delivery: DeliveryIntent::FollowUp,
+                },
+            },
+        )
+        .await
+        .expect_err("Worker self-route must be forbidden");
+    assert_eq!(
+        error.category,
+        herdr_harness_coordinator::core::ErrorCategory::Forbidden
+    );
+}
+
+#[tokio::test]
+async fn active_mutating_lease_is_held_across_coordinator_instances() {
+    let (state, coordinator, supervisor, _worker, task_id) = seeded_task().await;
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor,
+            },
+            CoordinatorCommand::DispatchTask { task_id },
+        )
+        .await
+        .expect("first Coordinator must acquire the lease");
+
+    let error = Coordinator::open(state.path())
+        .await
+        .expect_err("second Coordinator must not share the mutating lease");
+    assert_eq!(
+        error.category,
+        herdr_harness_coordinator::core::ErrorCategory::RepositoryBlocked
+    );
+}
+
+#[tokio::test]
+async fn worker_host_failure_records_repository_evidence_and_a_hold() {
+    let (_state, coordinator, supervisor, worker, task_id) = seeded_task().await;
+    let CommandOutcome::TaskDispatching { message_id, .. } = coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorCommand::DispatchTask { task_id },
+        )
+        .await
+        .expect("Task must dispatch")
+    else {
+        panic!("dispatch must return its Message")
+    };
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: worker.clone(),
+            },
+            CoordinatorCommand::AcceptDelivery {
+                message_id,
+                native_correlation: "native-turn".to_owned(),
+            },
+        )
+        .await
+        .expect("provider must accept the Task");
+    coordinator
+        .execute(
+            ActorContext::Session { capability: worker },
+            CoordinatorCommand::RecordHostFailed {
+                diagnostic: "provider process exited unexpectedly".to_owned(),
+            },
+        )
+        .await
+        .expect("Host failure must settle durably");
+
+    assert_task_state(&coordinator, &supervisor, task_id, TaskState::Failed, 0).await;
+    let QueryResult::Holds(holds) = coordinator
+        .query(
+            ActorContext::Session {
+                capability: supervisor,
+            },
+            CoordinatorQuery::ActiveHolds,
+        )
+        .await
+        .expect("Hold query must succeed")
+    else {
+        panic!("Hold query must return Holds")
+    };
+    assert_eq!(holds.len(), 1);
+    assert_eq!(holds[0].task_id, task_id);
 }
 
 #[tokio::test]
@@ -256,18 +458,21 @@ async fn question_reply_result_and_correction_follow_the_v1_lifecycle() {
         )
         .await
         .expect("corrected turn must become reviewable");
-    let digest = "a".repeat(64);
-    coordinator
+    let CommandOutcome::ObservationRecorded { digest, .. } = coordinator
         .execute(
             ActorContext::Session {
                 capability: supervisor.clone(),
             },
-            CoordinatorCommand::RecordRepositoryObservation {
-                observation: observation(task_id, &digest),
+            CoordinatorCommand::CaptureRepositoryObservation {
+                task_id,
+                checkpoint: ObservationCheckpoint::Approval,
             },
         )
         .await
-        .expect("Supervisor may index current approval evidence");
+        .expect("Supervisor may capture current approval evidence")
+    else {
+        panic!("capture must return a digest")
+    };
     coordinator
         .execute(
             ActorContext::Session {
@@ -345,18 +550,21 @@ async fn mutating_cancellation_hold_clears_only_with_current_digest_and_audit_no
         )
         .await
         .expect("provider cancellation evidence");
-    let digest = "c".repeat(64);
-    coordinator
+    let CommandOutcome::ObservationRecorded { digest, .. } = coordinator
         .execute(
             ActorContext::Session {
                 capability: supervisor.clone(),
             },
-            CoordinatorCommand::RecordRepositoryObservation {
-                observation: observation(task_id, &digest),
+            CoordinatorCommand::CaptureRepositoryObservation {
+                task_id,
+                checkpoint: ObservationCheckpoint::HoldClear,
             },
         )
         .await
-        .expect("reconciliation Observation");
+        .expect("reconciliation Observation")
+    else {
+        panic!("capture must return a digest")
+    };
     coordinator
         .execute(
             ActorContext::Session {
@@ -420,18 +628,21 @@ async fn ambiguous_dispatch_requires_digest_confirmed_supervisor_reconciliation(
         0,
     )
     .await;
-    let digest = "b".repeat(64);
-    coordinator
+    let CommandOutcome::ObservationRecorded { digest, .. } = coordinator
         .execute(
             ActorContext::Session {
                 capability: supervisor.clone(),
             },
-            CoordinatorCommand::RecordRepositoryObservation {
-                observation: observation(task_id, &digest),
+            CoordinatorCommand::CaptureRepositoryObservation {
+                task_id,
+                checkpoint: ObservationCheckpoint::HoldClear,
             },
         )
         .await
-        .expect("Supervisor must capture current repository state");
+        .expect("Supervisor must capture current repository state")
+    else {
+        panic!("capture must return a digest")
+    };
     coordinator
         .execute(
             ActorContext::Session {
@@ -452,6 +663,15 @@ async fn ambiguous_dispatch_requires_digest_confirmed_supervisor_reconciliation(
 #[tokio::test]
 async fn inbox_and_popup_projections_follow_durable_read_markers() {
     let (_state, coordinator, supervisor, worker, _task_id) = seeded_task().await;
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: worker.clone(),
+            },
+            CoordinatorCommand::ClaimNextTask,
+        )
+        .await
+        .expect("Worker Host must claim its oldest queued Task");
     let QueryResult::Inbox(messages) = coordinator
         .query(
             ActorContext::Session {
@@ -563,10 +783,18 @@ async fn host_events_replay_idempotently_and_supervisor_can_stop_an_idle_worker(
 #[tokio::test]
 async fn supervisor_can_queue_a_mutating_task_for_an_explicit_worker() {
     let state = tempfile::tempdir().expect("state directory must exist");
+    let repository_root = state.path().join("project");
+    std::fs::create_dir_all(&repository_root).expect("repository fixture directory");
+    let status = std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(&repository_root)
+        .status()
+        .expect("git init must run");
+    assert!(status.success(), "git init must succeed");
     let coordinator = Coordinator::open(state.path())
         .await
         .expect("Coordinator must open");
-    let supervisor = supervisor_definition();
+    let supervisor = supervisor_definition(repository_root.clone());
     let CommandOutcome::SupervisorRegistered { capability, .. } = coordinator
         .execute(
             ActorContext::Bootstrap,
@@ -585,7 +813,7 @@ async fn supervisor_can_queue_a_mutating_task_for_an_explicit_worker() {
         id: worker_id.clone(),
         kind: HarnessKind::Omp,
         tier: HarnessTier::Worker,
-        cwd: PathBuf::from("/tmp/project"),
+        cwd: repository_root.clone(),
         launch_profile: Some("omp-worker".to_owned()),
         model: Some("anthropic/claude-sonnet-4".to_owned()),
     };
@@ -612,7 +840,7 @@ async fn supervisor_can_queue_a_mutating_task_for_an_explicit_worker() {
         instructions: "Change only src/lib.rs and report verification.".to_owned(),
         attachments: Vec::new(),
         repository: TaskRepositoryAuthorityV1 {
-            root: PathBuf::from("/tmp/project"),
+            root: repository_root,
             access: RepositoryAccess::Mutating,
             write_scopes: vec![WriteScopeV1::ExactFile {
                 path: PathBuf::from("src/lib.rs"),
@@ -646,13 +874,13 @@ async fn supervisor_can_queue_a_mutating_task_for_an_explicit_worker() {
     assert_eq!(task.state, TaskState::Queued);
 }
 
-fn supervisor_definition() -> HarnessDefinitionV1 {
+fn supervisor_definition(cwd: PathBuf) -> HarnessDefinitionV1 {
     HarnessDefinitionV1 {
         schema_version: SCHEMA_VERSION,
         id: "supervisor".parse::<HarnessId>().expect("ID must be valid"),
         kind: HarnessKind::Codex,
         tier: HarnessTier::Supervisor,
-        cwd: PathBuf::from("/tmp/project"),
+        cwd,
         launch_profile: None,
         model: Some("gpt-5.4".to_owned()),
     }
@@ -666,6 +894,14 @@ async fn seeded_task() -> (
     TaskId,
 ) {
     let state = tempfile::tempdir().expect("state directory must exist");
+    let repository_root = state.path().join("project");
+    std::fs::create_dir_all(repository_root.join("src")).expect("repository fixture directory");
+    let status = std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(&repository_root)
+        .status()
+        .expect("git init must run");
+    assert!(status.success(), "git init must succeed");
     let coordinator = Coordinator::open(state.path())
         .await
         .expect("Coordinator must open");
@@ -676,7 +912,7 @@ async fn seeded_task() -> (
         .execute(
             ActorContext::Bootstrap,
             CoordinatorCommand::RegisterSupervisor {
-                definition: supervisor_definition(),
+                definition: supervisor_definition(repository_root.clone()),
             },
         )
         .await
@@ -699,7 +935,7 @@ async fn seeded_task() -> (
                     id: worker_id.clone(),
                     kind: HarnessKind::Omp,
                     tier: HarnessTier::Worker,
-                    cwd: PathBuf::from("/tmp/project"),
+                    cwd: repository_root.clone(),
                     launch_profile: Some("omp-worker".to_owned()),
                     model: None,
                 },
@@ -727,7 +963,7 @@ async fn seeded_task() -> (
                     instructions: "Exercise the durable lifecycle.".to_owned(),
                     attachments: Vec::new(),
                     repository: TaskRepositoryAuthorityV1 {
-                        root: PathBuf::from("/tmp/project"),
+                        root: repository_root,
                         access: RepositoryAccess::Mutating,
                         write_scopes: vec![WriteScopeV1::Subtree {
                             path: PathBuf::from("src"),
@@ -779,35 +1015,6 @@ fn result_manifest(task_id: TaskId, summary: &str, evidence: AttachmentId) -> Re
         deviations: Vec::new(),
         risks: Vec::new(),
         attachments: Vec::new(),
-    }
-}
-
-fn observation(task_id: TaskId, digest: &str) -> RepositoryObservationV1 {
-    RepositoryObservationV1 {
-        schema_version: SCHEMA_VERSION,
-        id: RepositoryObservationId::new(),
-        task_id,
-        checkpoint: ObservationCheckpoint::Approval,
-        worktree_root: PathBuf::from("/tmp/project"),
-        git_common_dir: PathBuf::from("/tmp/project/.git"),
-        head: None,
-        branch: Some("main".to_owned()),
-        index_digest: "0".repeat(64),
-        staged_diff: None,
-        unstaged_diff: None,
-        untracked: Vec::new(),
-        ignored_paths: Vec::new(),
-        status_entries: Vec::new(),
-        changed_paths: vec![PathBuf::from("src/lib.rs")],
-        scope_classifications: Vec::new(),
-        command_evidence: vec![CommandEvidenceV1 {
-            command: "git status --porcelain=v2 -z".to_owned(),
-            version: "git version 2".to_owned(),
-            exit_code: 0,
-            diagnostics: String::new(),
-        }],
-        captured_at: Utc::now(),
-        digest: digest.to_owned(),
     }
 }
 

@@ -7,6 +7,21 @@ use herdr_harness_coordinator::{
 };
 
 #[test]
+fn adapter_error_exposes_typed_delivery_ambiguity() {
+    let ambiguous = herdr_harness_coordinator::adapter::AdapterError::DeliveryAmbiguous {
+        kind: HarnessKind::Omp,
+        message: "write timed out".to_owned(),
+    };
+    let pre_write = herdr_harness_coordinator::adapter::AdapterError::Operation {
+        kind: HarnessKind::Omp,
+        message: "provider is not running".to_owned(),
+    };
+
+    assert!(ambiguous.provider_bytes_may_have_been_written());
+    assert!(!pre_write.provider_bytes_may_have_been_written());
+}
+
+#[test]
 fn harness_adapter_is_object_safe_for_runtime_provider_selection() {
     fn accepts_adapter(_: Option<&mut dyn HarnessAdapter>) {}
 

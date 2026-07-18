@@ -54,6 +54,22 @@ pub enum AdapterError {
         /// Concise provider or transport diagnostic.
         message: String,
     },
+    /// A provider request failed after a write was attempted, so replay is unsafe.
+    #[error("{kind:?} delivery acceptance is ambiguous: {message}")]
+    DeliveryAmbiguous {
+        /// Provider being operated.
+        kind: HarnessKind,
+        /// Concise provider or transport diagnostic.
+        message: String,
+    },
+}
+
+impl AdapterError {
+    /// Whether the failed operation may already have reached the provider.
+    #[must_use]
+    pub fn provider_bytes_may_have_been_written(&self) -> bool {
+        matches!(self, Self::DeliveryAmbiguous { .. })
+    }
 }
 
 /// Result returned by provider-neutral Adapter operations.

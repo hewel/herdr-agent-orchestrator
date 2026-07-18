@@ -101,13 +101,7 @@ async fn main() -> Result<()> {
             socket,
         } => {
             let socket = socket.unwrap_or_else(|| state_dir.join("coordinator.sock"));
-            let output =
-                herdr_harness_coordinator::host::render_popup(&socket, supervisor_capability)
-                    .await?;
-            tokio::io::stdout()
-                .write_all(output.as_bytes())
-                .await
-                .context("writing popup snapshot")
+            herdr_harness_coordinator::host::run_popup(&socket, supervisor_capability).await
         }
         Command::Mcp {
             session_capability,

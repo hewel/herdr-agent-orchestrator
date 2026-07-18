@@ -8,6 +8,7 @@ use std::{
     process::{Command, Output},
 };
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -17,7 +18,7 @@ use crate::contract::{
 };
 
 /// Canonical identity used to distinguish one Git worktree from another.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct RepositoryIdentity {
     /// Canonical root of this worktree.
     pub worktree_root: PathBuf,
@@ -32,7 +33,7 @@ pub struct GitRepository {
 }
 
 /// Immutable Git-visible state captured at one instant.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepositorySnapshot {
     /// Canonical repository identity.
     pub identity: RepositoryIdentity,

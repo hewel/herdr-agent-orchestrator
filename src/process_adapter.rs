@@ -114,15 +114,15 @@ impl ProcessAdapter {
         runtime.pending.lock().await.insert(id.clone(), tx);
         if let Err(error) = write_line(kind, runtime.stdin.as_mut(), &payload).await {
             runtime.pending.lock().await.remove(&id);
-            return Err(error);
+            return Err(delivery_ambiguous(kind, error.to_string()));
         }
         match timeout(self.request_timeout, rx).await {
             Ok(Ok(Ok(value))) => Ok(value),
-            Ok(Ok(Err(message))) => Err(operation(kind, message)),
-            Ok(Err(_)) => Err(operation(kind, "provider response channel closed")),
+            Ok(Ok(Err(message))) => Err(delivery_ambiguous(kind, message)),
+            Ok(Err(_)) => Err(delivery_ambiguous(kind, "provider response channel closed")),
             Err(_) => {
                 runtime.pending.lock().await.remove(&id);
-                Err(operation(
+                Err(delivery_ambiguous(
                     kind,
                     format!("request {id} timed out after write; acceptance is unknown"),
                 ))
@@ -921,6 +921,13 @@ fn ensure_fresh(kind: HarnessKind, runtime: Option<&Runtime>) -> AdapterResult<(
 
 fn operation(kind: HarnessKind, message: impl Into<String>) -> AdapterError {
     AdapterError::Operation {
+        kind,
+        message: message.into(),
+    }
+}
+
+fn delivery_ambiguous(kind: HarnessKind, message: impl Into<String>) -> AdapterError {
+    AdapterError::DeliveryAmbiguous {
         kind,
         message: message.into(),
     }
