@@ -1,0 +1,927 @@
+//! Process-backed OMP RPC and Codex App Server Harness Adapters.
+
+use std::{
+    collections::HashMap, fmt::Write as _, path::Path, process::Stdio, sync::Arc, time::Duration,
+};
+
+use async_trait::async_trait;
+use futures::stream;
+use serde_json::{Value, json};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Lines},
+    process::{Child, ChildStdin, ChildStdout, Command},
+    sync::{Mutex, mpsc, oneshot},
+    time::timeout,
+};
+
+use crate::{
+    adapter::{
+        AdapterCapabilities, AdapterError, AdapterEvent, AdapterEventStream, AdapterLifecycle,
+        AdapterResult, AdapterSnapshot, CodexFrame, HarnessAdapter, HarnessStartSpec,
+        NativeAcceptance, NativeDeliveryKind, NativeSession, NativeTurnStatus, OmpFrame,
+        ResolvedDelivery, classify_codex_frame, classify_omp_frame, validate_codex_version_output,
+        validate_omp_version_output,
+    },
+    contract::HarnessKind,
+};
+
+const START_TIMEOUT: Duration = Duration::from_secs(30);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const STOP_TIMEOUT: Duration = Duration::from_secs(15);
+type Reply = Result<Value, String>;
+type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<Reply>>>>;
+
+#[derive(Debug)]
+struct State {
+    lifecycle: AdapterLifecycle,
+    session_id: Option<String>,
+    thread_id: Option<String>,
+    active_turn_id: Option<String>,
+    queued_input_count: Option<u32>,
+    model: Option<String>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            lifecycle: AdapterLifecycle::Starting,
+            session_id: None,
+            thread_id: None,
+            active_turn_id: None,
+            queued_input_count: None,
+            model: None,
+        }
+    }
+}
+
+struct Runtime {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    pending: Pending,
+}
+
+struct ProcessAdapter {
+    runtime: Option<Runtime>,
+    state: Arc<Mutex<State>>,
+    event_tx: mpsc::Sender<AdapterResult<AdapterEvent>>,
+    event_rx: Option<mpsc::Receiver<AdapterResult<AdapterEvent>>>,
+    start_timeout: Duration,
+    request_timeout: Duration,
+    stop_timeout: Duration,
+    next_id: u64,
+}
+
+impl ProcessAdapter {
+    fn new() -> Self {
+        let (event_tx, event_rx) = mpsc::channel(256);
+        Self {
+            runtime: None,
+            state: Arc::new(Mutex::new(State::default())),
+            event_tx,
+            event_rx: Some(event_rx),
+            start_timeout: START_TIMEOUT,
+            request_timeout: REQUEST_TIMEOUT,
+            stop_timeout: STOP_TIMEOUT,
+            next_id: 1,
+        }
+    }
+
+    fn with_timeouts(mut self, start: Duration, request: Duration, stop: Duration) -> Self {
+        self.start_timeout = start;
+        self.request_timeout = request;
+        self.stop_timeout = stop;
+        self
+    }
+
+    fn id(&mut self) -> String {
+        let id = format!("host-{}", self.next_id);
+        self.next_id += 1;
+        id
+    }
+
+    async fn request(
+        &mut self,
+        kind: HarnessKind,
+        mut payload: Value,
+        id: String,
+    ) -> AdapterResult<Value> {
+        payload["id"] = Value::String(id.clone());
+        let runtime = self
+            .runtime
+            .as_mut()
+            .ok_or_else(|| operation(kind, "provider is not running"))?;
+        let (tx, rx) = oneshot::channel();
+        runtime.pending.lock().await.insert(id.clone(), tx);
+        if let Err(error) = write_line(kind, runtime.stdin.as_mut(), &payload).await {
+            runtime.pending.lock().await.remove(&id);
+            return Err(error);
+        }
+        match timeout(self.request_timeout, rx).await {
+            Ok(Ok(Ok(value))) => Ok(value),
+            Ok(Ok(Err(message))) => Err(operation(kind, message)),
+            Ok(Err(_)) => Err(operation(kind, "provider response channel closed")),
+            Err(_) => {
+                runtime.pending.lock().await.remove(&id);
+                Err(operation(
+                    kind,
+                    format!("request {id} timed out after write; acceptance is unknown"),
+                ))
+            }
+        }
+    }
+
+    async fn stop(&mut self, kind: HarnessKind) -> AdapterResult<()> {
+        let Some(mut runtime) = self.runtime.take() else {
+            return Ok(());
+        };
+        self.state.lock().await.lifecycle = AdapterLifecycle::Stopping;
+        runtime.stdin.take();
+        match timeout(self.stop_timeout, runtime.child.wait()).await {
+            Ok(Ok(status)) if status.success() => {
+                self.state.lock().await.lifecycle = AdapterLifecycle::Stopped;
+                Ok(())
+            }
+            Ok(Ok(status)) => {
+                self.state.lock().await.lifecycle = AdapterLifecycle::Failed;
+                Err(operation(kind, format!("process exited with {status}")))
+            }
+            Ok(Err(error)) => {
+                self.state.lock().await.lifecycle = AdapterLifecycle::Failed;
+                Err(operation(kind, format!("wait for process: {error}")))
+            }
+            Err(_) => {
+                let _ = runtime.child.start_kill();
+                self.state.lock().await.lifecycle = AdapterLifecycle::Failed;
+                Err(operation(kind, "clean shutdown timed out"))
+            }
+        }
+    }
+
+    async fn snapshot(&self) -> AdapterSnapshot {
+        let state = self.state.lock().await;
+        AdapterSnapshot {
+            lifecycle: state.lifecycle,
+            session_id: state.session_id.clone(),
+            thread_id: state.thread_id.clone(),
+            active_turn_id: state.active_turn_id.clone(),
+            steerable: state.lifecycle == AdapterLifecycle::Working,
+            queued_input_count: state.queued_input_count,
+            model: state.model.clone(),
+        }
+    }
+
+    fn events(&mut self) -> AdapterEventStream {
+        let Some(rx) = self.event_rx.take() else {
+            return Box::pin(stream::empty());
+        };
+        Box::pin(stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (event, rx))
+        }))
+    }
+}
+
+/// Process-backed Adapter for OMP RPC 17.0.2.
+pub struct OmpProcessAdapter(ProcessAdapter);
+
+impl Default for OmpProcessAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl OmpProcessAdapter {
+    /// Creates an Adapter with the contract default timeouts.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(ProcessAdapter::new())
+    }
+
+    /// Overrides process timeouts, primarily for compatibility fixtures.
+    #[must_use]
+    pub fn with_timeouts(self, start: Duration, request: Duration, stop: Duration) -> Self {
+        Self(self.0.with_timeouts(start, request, stop))
+    }
+}
+
+/// Process-backed Adapter for Codex App Server 0.144.5.
+pub struct CodexProcessAdapter(ProcessAdapter);
+
+impl Default for CodexProcessAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CodexProcessAdapter {
+    /// Creates an Adapter with the contract default timeouts.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(ProcessAdapter::new())
+    }
+
+    /// Overrides process timeouts, primarily for compatibility fixtures.
+    #[must_use]
+    pub fn with_timeouts(self, start: Duration, request: Duration, stop: Duration) -> Self {
+        Self(self.0.with_timeouts(start, request, stop))
+    }
+}
+
+#[async_trait]
+impl HarnessAdapter for OmpProcessAdapter {
+    fn kind(&self) -> HarnessKind {
+        HarnessKind::Omp
+    }
+
+    fn capabilities(&self) -> AdapterCapabilities {
+        AdapterCapabilities {
+            persistent_session: true,
+            active_turn_steering: true,
+            active_turn_follow_up: true,
+            cooperative_cancellation: true,
+        }
+    }
+
+    async fn start(&mut self, spec: &HarnessStartSpec) -> AdapterResult<NativeSession> {
+        ensure_fresh(HarnessKind::Omp, self.0.runtime.as_ref())?;
+        version(HarnessKind::Omp, &spec.executable).await?;
+        tokio::fs::create_dir_all(&spec.provider_state_dir)
+            .await
+            .map_err(|error| operation(HarnessKind::Omp, error.to_string()))?;
+        let session_dir = spec.provider_state_dir.join("provider-session");
+        tokio::fs::create_dir_all(&session_dir)
+            .await
+            .map_err(|error| operation(HarnessKind::Omp, error.to_string()))?;
+        let mut command = Command::new(&spec.executable);
+        command
+            .arg("--profile")
+            .arg(&spec.provider_profile)
+            .args(["--mode", "rpc", "--cwd"])
+            .arg(&spec.cwd)
+            .arg("--session-dir")
+            .arg(session_dir);
+        for overlay in &spec.config_overlays {
+            command.arg("--config").arg(overlay);
+        }
+        let (mut child, stdin, stdout) = spawn(&mut command, spec, HarnessKind::Omp)?;
+        let mut lines = BufReader::new(stdout).lines();
+        let line = timeout(self.0.start_timeout, lines.next_line())
+            .await
+            .map_err(|_| operation(HarnessKind::Omp, "ready frame timed out"))?
+            .map_err(|error| operation(HarnessKind::Omp, error.to_string()))?
+            .ok_or_else(|| operation(HarnessKind::Omp, "process exited before ready"))?;
+        if classify_omp_frame(&line)? != OmpFrame::Ready {
+            let _ = child.start_kill();
+            return Err(operation(HarnessKind::Omp, "first frame was not ready"));
+        }
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        omp_reader(
+            lines,
+            Arc::clone(&pending),
+            Arc::clone(&self.0.state),
+            self.0.event_tx.clone(),
+        );
+        drain_stderr(child.stderr.take());
+        self.0.runtime = Some(Runtime {
+            child,
+            stdin: Some(stdin),
+            pending,
+        });
+        let id = self.0.id();
+        let value = self
+            .0
+            .request(HarnessKind::Omp, json!({"type": "get_state"}), id)
+            .await?;
+        let native = NativeSession {
+            session_id: field(&value, "sessionId"),
+            thread_id: None,
+            cwd: spec.cwd.clone(),
+            model: model(&value).or_else(|| spec.model.clone()),
+        };
+        {
+            let mut state = self.0.state.lock().await;
+            state.lifecycle = AdapterLifecycle::Idle;
+            state.session_id.clone_from(&native.session_id);
+            state.model.clone_from(&native.model);
+            state.queued_input_count = number(&value, "queuedMessageCount");
+        }
+        emit(
+            &self.0.event_tx,
+            AdapterEvent::SessionStarted(native.clone()),
+        )
+        .await;
+        Ok(native)
+    }
+
+    async fn dispatch(&mut self, delivery: ResolvedDelivery) -> AdapterResult<NativeAcceptance> {
+        let command = match delivery.kind {
+            NativeDeliveryKind::StartTurn => "prompt",
+            NativeDeliveryKind::FollowUp => "follow_up",
+            NativeDeliveryKind::Steer => "steer",
+        };
+        if delivery.kind == NativeDeliveryKind::StartTurn {
+            self.0.state.lock().await.lifecycle = AdapterLifecycle::Working;
+        }
+        let value = self
+            .0
+            .request(
+                HarnessKind::Omp,
+                json!({"type": command, "message": delivery_text(&delivery)}),
+                delivery.correlation.clone(),
+            )
+            .await;
+        let value = match value {
+            Ok(value) => value,
+            Err(error) => {
+                self.0.state.lock().await.lifecycle = AdapterLifecycle::Failed;
+                return Err(error);
+            }
+        };
+        Ok(NativeAcceptance {
+            correlation: delivery.correlation,
+            turn_id: None,
+            evidence: format!("OMP accepted {command}: {value}"),
+        })
+    }
+
+    async fn cancel_active(&mut self) -> AdapterResult<()> {
+        let id = self.0.id();
+        self.0
+            .request(HarnessKind::Omp, json!({"type": "abort"}), id)
+            .await?;
+        self.0.state.lock().await.lifecycle = AdapterLifecycle::Stopping;
+        Ok(())
+    }
+
+    async fn stop(&mut self) -> AdapterResult<()> {
+        self.0.stop(HarnessKind::Omp).await?;
+        emit(
+            &self.0.event_tx,
+            AdapterEvent::Exited { exit_code: Some(0) },
+        )
+        .await;
+        Ok(())
+    }
+
+    async fn snapshot(&mut self) -> AdapterResult<AdapterSnapshot> {
+        let id = self.0.id();
+        let value = self
+            .0
+            .request(HarnessKind::Omp, json!({"type": "get_state"}), id)
+            .await?;
+        {
+            let mut state = self.0.state.lock().await;
+            state.lifecycle = if boolean(&value, "isStreaming") {
+                AdapterLifecycle::Working
+            } else {
+                AdapterLifecycle::Idle
+            };
+            state.session_id = field(&value, "sessionId");
+            state.queued_input_count = number(&value, "queuedMessageCount");
+            state.model = model(&value);
+        }
+        Ok(self.0.snapshot().await)
+    }
+
+    fn events(&mut self) -> AdapterEventStream {
+        self.0.events()
+    }
+}
+
+#[async_trait]
+impl HarnessAdapter for CodexProcessAdapter {
+    fn kind(&self) -> HarnessKind {
+        HarnessKind::Codex
+    }
+
+    fn capabilities(&self) -> AdapterCapabilities {
+        AdapterCapabilities {
+            persistent_session: true,
+            active_turn_steering: true,
+            active_turn_follow_up: false,
+            cooperative_cancellation: true,
+        }
+    }
+
+    async fn start(&mut self, spec: &HarnessStartSpec) -> AdapterResult<NativeSession> {
+        ensure_fresh(HarnessKind::Codex, self.0.runtime.as_ref())?;
+        version(HarnessKind::Codex, &spec.executable).await?;
+        tokio::fs::create_dir_all(&spec.provider_state_dir)
+            .await
+            .map_err(|error| operation(HarnessKind::Codex, error.to_string()))?;
+        let mut command = Command::new(&spec.executable);
+        command.arg("--profile").arg(&spec.provider_profile).args([
+            "app-server",
+            "--listen",
+            "stdio://",
+            "--strict-config",
+        ]);
+        let (mut child, stdin, stdout) = spawn(&mut command, spec, HarnessKind::Codex)?;
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        codex_reader(
+            BufReader::new(stdout).lines(),
+            Arc::clone(&pending),
+            Arc::clone(&self.0.state),
+            self.0.event_tx.clone(),
+        );
+        drain_stderr(child.stderr.take());
+        self.0.runtime = Some(Runtime {
+            child,
+            stdin: Some(stdin),
+            pending,
+        });
+        let id = self.0.id();
+        timeout(
+            self.0.start_timeout,
+            self.0.request(
+                HarnessKind::Codex,
+                json!({"method":"initialize","params":{"clientInfo":{"name":"herdr_harness_coordinator","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}}}),
+                id,
+            ),
+        )
+        .await
+        .map_err(|_| operation(HarnessKind::Codex, "initialize timed out"))??;
+        write_line(
+            HarnessKind::Codex,
+            self.0
+                .runtime
+                .as_mut()
+                .and_then(|runtime| runtime.stdin.as_mut()),
+            &json!({"method":"initialized"}),
+        )
+        .await?;
+        let id = self.0.id();
+        let value = self
+            .0
+            .request(
+                HarnessKind::Codex,
+                json!({"method":"thread/start","params":{"cwd":spec.cwd,"model":spec.model,"ephemeral":false}}),
+                id,
+            )
+            .await?;
+        let thread = value.get("thread").unwrap_or(&value);
+        let thread_id = field(thread, "id")
+            .ok_or_else(|| operation(HarnessKind::Codex, "thread/start omitted thread id"))?;
+        let native = NativeSession {
+            session_id: field(thread, "sessionId"),
+            thread_id: Some(thread_id),
+            cwd: field(thread, "cwd").map_or_else(|| spec.cwd.clone(), Into::into),
+            model: field(thread, "model").or_else(|| spec.model.clone()),
+        };
+        {
+            let mut state = self.0.state.lock().await;
+            state.lifecycle = AdapterLifecycle::Idle;
+            state.session_id.clone_from(&native.session_id);
+            state.thread_id.clone_from(&native.thread_id);
+            state.model.clone_from(&native.model);
+        }
+        emit(
+            &self.0.event_tx,
+            AdapterEvent::SessionStarted(native.clone()),
+        )
+        .await;
+        Ok(native)
+    }
+
+    async fn dispatch(&mut self, delivery: ResolvedDelivery) -> AdapterResult<NativeAcceptance> {
+        if delivery.kind == NativeDeliveryKind::FollowUp {
+            return Err(operation(
+                HarnessKind::Codex,
+                "active FollowUp must remain queued",
+            ));
+        }
+        let state = self.0.state.lock().await;
+        let thread = state
+            .thread_id
+            .clone()
+            .ok_or_else(|| operation(HarnessKind::Codex, "thread is not established"))?;
+        let turn = state.active_turn_id.clone();
+        drop(state);
+        let input = codex_input(&delivery);
+        let payload = match delivery.kind {
+            NativeDeliveryKind::StartTurn => {
+                json!({"method":"turn/start","params":{"threadId":thread,"input":input}})
+            }
+            NativeDeliveryKind::Steer => {
+                let turn = turn.ok_or_else(|| operation(HarnessKind::Codex, "no active turn"))?;
+                json!({"method":"turn/steer","params":{"threadId":thread,"expectedTurnId":turn,"input":input}})
+            }
+            NativeDeliveryKind::FollowUp => unreachable!("rejected above"),
+        };
+        let method = payload["method"].as_str().unwrap_or_default().to_owned();
+        if delivery.kind == NativeDeliveryKind::StartTurn {
+            self.0.state.lock().await.lifecycle = AdapterLifecycle::Working;
+        }
+        let id = self.0.id();
+        let value = self.0.request(HarnessKind::Codex, payload, id).await;
+        let value = match value {
+            Ok(value) => value,
+            Err(error) => {
+                self.0.state.lock().await.lifecycle = AdapterLifecycle::Failed;
+                return Err(error);
+            }
+        };
+        let turn_id = value
+            .get("turn")
+            .and_then(|turn| field(turn, "id"))
+            .or_else(|| field(&value, "turnId"));
+        if delivery.kind == NativeDeliveryKind::StartTurn {
+            let mut state = self.0.state.lock().await;
+            if state.lifecycle == AdapterLifecycle::Working {
+                state.active_turn_id.clone_from(&turn_id);
+            }
+        }
+        Ok(NativeAcceptance {
+            correlation: delivery.correlation,
+            turn_id,
+            evidence: format!("Codex accepted {method}"),
+        })
+    }
+
+    async fn cancel_active(&mut self) -> AdapterResult<()> {
+        let state = self.0.state.lock().await;
+        let thread = state
+            .thread_id
+            .clone()
+            .ok_or_else(|| operation(HarnessKind::Codex, "thread is not established"))?;
+        let turn = state
+            .active_turn_id
+            .clone()
+            .ok_or_else(|| operation(HarnessKind::Codex, "no active turn"))?;
+        drop(state);
+        let id = self.0.id();
+        self.0
+            .request(
+                HarnessKind::Codex,
+                json!({"method":"turn/interrupt","params":{"threadId":thread,"turnId":turn}}),
+                id,
+            )
+            .await?;
+        self.0.state.lock().await.lifecycle = AdapterLifecycle::Stopping;
+        Ok(())
+    }
+
+    async fn stop(&mut self) -> AdapterResult<()> {
+        self.0.stop(HarnessKind::Codex).await?;
+        emit(
+            &self.0.event_tx,
+            AdapterEvent::Exited { exit_code: Some(0) },
+        )
+        .await;
+        Ok(())
+    }
+
+    async fn snapshot(&mut self) -> AdapterResult<AdapterSnapshot> {
+        let thread = self
+            .0
+            .state
+            .lock()
+            .await
+            .thread_id
+            .clone()
+            .ok_or_else(|| operation(HarnessKind::Codex, "thread is not established"))?;
+        let id = self.0.id();
+        self.0
+            .request(
+                HarnessKind::Codex,
+                json!({"method":"thread/read","params":{"threadId":thread,"includeTurns":true}}),
+                id,
+            )
+            .await?;
+        Ok(self.0.snapshot().await)
+    }
+
+    fn events(&mut self) -> AdapterEventStream {
+        self.0.events()
+    }
+}
+
+async fn version(kind: HarnessKind, executable: &Path) -> AdapterResult<()> {
+    let output = Command::new(executable)
+        .arg("--version")
+        .output()
+        .await
+        .map_err(|error| operation(kind, error.to_string()))?;
+    if !output.status.success() {
+        return Err(operation(
+            kind,
+            format!("version check exited with {}", output.status),
+        ));
+    }
+    let stdout =
+        String::from_utf8(output.stdout).map_err(|error| operation(kind, error.to_string()))?;
+    match kind {
+        HarnessKind::Omp => validate_omp_version_output(&stdout),
+        HarnessKind::Codex => validate_codex_version_output(&stdout),
+    }
+}
+
+fn spawn(
+    command: &mut Command,
+    spec: &HarnessStartSpec,
+    kind: HarnessKind,
+) -> AdapterResult<(Child, ChildStdin, ChildStdout)> {
+    command
+        .current_dir(&spec.cwd)
+        .env_clear()
+        .envs(&spec.environment)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .map_err(|error| operation(kind, error.to_string()))?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| operation(kind, "missing stdin"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| operation(kind, "missing stdout"))?;
+    Ok((child, stdin, stdout))
+}
+
+async fn write_line(
+    kind: HarnessKind,
+    stdin: Option<&mut ChildStdin>,
+    value: &Value,
+) -> AdapterResult<()> {
+    let stdin = stdin.ok_or_else(|| operation(kind, "provider stdin is closed"))?;
+    let mut bytes =
+        serde_json::to_vec(value).map_err(|error| operation(kind, error.to_string()))?;
+    bytes.push(b'\n');
+    stdin
+        .write_all(&bytes)
+        .await
+        .map_err(|error| operation(kind, error.to_string()))?;
+    stdin
+        .flush()
+        .await
+        .map_err(|error| operation(kind, error.to_string()))
+}
+
+fn omp_reader(
+    mut lines: Lines<BufReader<ChildStdout>>,
+    pending: Pending,
+    state: Arc<Mutex<State>>,
+    events: mpsc::Sender<AdapterResult<AdapterEvent>>,
+) {
+    tokio::spawn(async move {
+        while let Ok(Some(line)) = lines.next_line().await {
+            match classify_omp_frame(&line) {
+                Ok(OmpFrame::Response { id, result, .. }) => {
+                    if let Some(tx) = pending.lock().await.remove(&id.to_string()) {
+                        let _ = tx.send(result);
+                    }
+                }
+                Ok(OmpFrame::SessionEvent {
+                    event_type,
+                    payload,
+                }) => {
+                    provider_event(HarnessKind::Omp, &event_type, &payload, &state, &events).await;
+                }
+                Ok(OmpFrame::ExtensionUiRequest { id, method, .. }) => {
+                    send(
+                        &events,
+                        AdapterEvent::InputRequired {
+                            correlation: Some(id.to_string()),
+                            prompt: format!("OMP extension requested {method}"),
+                        },
+                    )
+                    .await;
+                }
+                Ok(OmpFrame::HostToolCall { id, tool_name, .. }) => {
+                    send(
+                        &events,
+                        AdapterEvent::Activity {
+                            summary: format!("OMP host tool {tool_name} ({id})"),
+                        },
+                    )
+                    .await;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    let _ = events.send(Err(error)).await;
+                }
+            }
+        }
+        reader_failed(HarnessKind::Omp, pending, state, events).await;
+    });
+}
+
+fn codex_reader(
+    mut lines: Lines<BufReader<ChildStdout>>,
+    pending: Pending,
+    state: Arc<Mutex<State>>,
+    events: mpsc::Sender<AdapterResult<AdapterEvent>>,
+) {
+    tokio::spawn(async move {
+        while let Ok(Some(line)) = lines.next_line().await {
+            match classify_codex_frame(&line) {
+                Ok(CodexFrame::Response { id, result }) => {
+                    if let Some(tx) = pending.lock().await.remove(&id.to_string()) {
+                        let _ = tx.send(result.map_err(|error| error.to_string()));
+                    }
+                }
+                Ok(CodexFrame::Notification { method, params }) => {
+                    provider_event(HarnessKind::Codex, &method, &params, &state, &events).await;
+                }
+                Ok(CodexFrame::ServerRequest { id, method, .. }) => {
+                    send(
+                        &events,
+                        AdapterEvent::InputRequired {
+                            correlation: Some(id.to_string()),
+                            prompt: format!("Codex requested {method}"),
+                        },
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    let _ = events.send(Err(error)).await;
+                }
+            }
+        }
+        reader_failed(HarnessKind::Codex, pending, state, events).await;
+    });
+}
+
+async fn provider_event(
+    kind: HarnessKind,
+    event: &str,
+    value: &Value,
+    state: &Mutex<State>,
+    events: &mpsc::Sender<AdapterResult<AdapterEvent>>,
+) {
+    if event == "agent_start" || event == "turn_start" || event == "turn/started" {
+        let turn_id = value.get("turn").and_then(|turn| field(turn, "id"));
+        let mut current = state.lock().await;
+        current.lifecycle = AdapterLifecycle::Working;
+        current.active_turn_id.clone_from(&turn_id);
+        drop(current);
+        send(events, AdapterEvent::TurnStarted { turn_id }).await;
+    } else if event == "agent_end" || event == "turn/completed" {
+        let turn = value.get("turn").unwrap_or(value);
+        let turn_id = field(turn, "id");
+        let status = match field(turn, "status").as_deref() {
+            Some("interrupted" | "cancelled") => NativeTurnStatus::Interrupted,
+            Some("failed") => NativeTurnStatus::Failed,
+            _ => NativeTurnStatus::Completed,
+        };
+        let mut current = state.lock().await;
+        current.lifecycle = AdapterLifecycle::Idle;
+        current.active_turn_id = None;
+        drop(current);
+        send(events, AdapterEvent::TurnCompleted { turn_id, status }).await;
+    } else if event.contains("agentMessage") || event == "message_end" {
+        if let Some(text) = find_text(value) {
+            send(events, AdapterEvent::Transcript { text }).await;
+        }
+    } else if event.contains("commandExecution") || event.contains("fileChange") {
+        send(
+            events,
+            AdapterEvent::Activity {
+                summary: event.to_owned(),
+            },
+        )
+        .await;
+    } else if event == "error" {
+        state.lock().await.lifecycle = AdapterLifecycle::Failed;
+        send(
+            events,
+            AdapterEvent::Failed {
+                message: format!(
+                    "{kind:?}: {}",
+                    find_text(value).unwrap_or_else(|| value.to_string())
+                ),
+            },
+        )
+        .await;
+    }
+}
+
+async fn reader_failed(
+    kind: HarnessKind,
+    pending: Pending,
+    state: Arc<Mutex<State>>,
+    events: mpsc::Sender<AdapterResult<AdapterEvent>>,
+) {
+    let expected_shutdown = state.lock().await.lifecycle == AdapterLifecycle::Stopping;
+    for (_, tx) in pending.lock().await.drain() {
+        let _ = tx.send(Err("provider stdout reached EOF".to_owned()));
+    }
+    if expected_shutdown {
+        return;
+    }
+    state.lock().await.lifecycle = AdapterLifecycle::Failed;
+    send(
+        &events,
+        AdapterEvent::Failed {
+            message: format!("{kind:?} provider stdout reached EOF"),
+        },
+    )
+    .await;
+}
+
+fn drain_stderr(stderr: Option<tokio::process::ChildStderr>) {
+    if let Some(mut stderr) = stderr {
+        tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            let _ = stderr.read_to_end(&mut bytes).await;
+        });
+    }
+}
+
+fn delivery_text(delivery: &ResolvedDelivery) -> String {
+    let mut text = delivery.text.clone();
+    if !delivery.attachments.is_empty() {
+        text.push_str("\n\nImmutable attachments:\n");
+        for attachment in &delivery.attachments {
+            let _ = writeln!(
+                text,
+                "- {} ({})",
+                attachment.path.display(),
+                attachment.media_type
+            );
+        }
+    }
+    text
+}
+
+fn codex_input(delivery: &ResolvedDelivery) -> Vec<Value> {
+    let mut input = vec![json!({"type":"text","text":delivery_text(delivery)})];
+    input.extend(
+        delivery
+            .attachments
+            .iter()
+            .filter(|item| item.media_type.starts_with("image/"))
+            .map(|item| json!({"type":"localImage","path":item.path})),
+    );
+    input
+}
+
+fn field(value: &Value, name: &str) -> Option<String> {
+    value
+        .get(name)
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn model(value: &Value) -> Option<String> {
+    value.get("model").and_then(|model| {
+        model
+            .as_str()
+            .map(ToOwned::to_owned)
+            .or_else(|| field(model, "id").or_else(|| field(model, "modelId")))
+    })
+}
+
+fn number(value: &Value, name: &str) -> Option<u32> {
+    value
+        .get(name)
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+}
+
+fn boolean(value: &Value, name: &str) -> bool {
+    value.get(name).and_then(Value::as_bool).unwrap_or(false)
+}
+
+fn find_text(value: &Value) -> Option<String> {
+    ["text", "message", "delta"]
+        .into_iter()
+        .find_map(|key| field(value, key))
+        .or_else(|| {
+            value
+                .as_object()
+                .and_then(|object| object.values().find_map(find_text))
+        })
+        .or_else(|| {
+            value
+                .as_array()
+                .and_then(|array| array.iter().find_map(find_text))
+        })
+}
+
+async fn emit(sender: &mpsc::Sender<AdapterResult<AdapterEvent>>, event: AdapterEvent) {
+    let _ = sender.send(Ok(event)).await;
+}
+
+async fn send(sender: &mpsc::Sender<AdapterResult<AdapterEvent>>, event: AdapterEvent) {
+    let _ = sender.send(Ok(event)).await;
+}
+
+fn ensure_fresh(kind: HarnessKind, runtime: Option<&Runtime>) -> AdapterResult<()> {
+    if runtime.is_none() {
+        Ok(())
+    } else {
+        Err(operation(kind, "Adapter is already started"))
+    }
+}
+
+fn operation(kind: HarnessKind, message: impl Into<String>) -> AdapterError {
+    AdapterError::Operation {
+        kind,
+        message: message.into(),
+    }
+}
