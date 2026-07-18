@@ -301,6 +301,94 @@ async fn queued_cancellation_is_terminal_without_native_dispatch() {
 }
 
 #[tokio::test]
+async fn mutating_cancellation_hold_clears_only_with_current_digest_and_audit_note() {
+    let (_state, coordinator, supervisor, worker, task_id) = seeded_task().await;
+    let CommandOutcome::TaskDispatching { message_id, .. } = coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorCommand::DispatchTask { task_id },
+        )
+        .await
+        .expect("dispatch")
+    else {
+        panic!("dispatch outcome")
+    };
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: worker.clone(),
+            },
+            CoordinatorCommand::AcceptDelivery {
+                message_id,
+                native_correlation: "prompt-1".to_owned(),
+            },
+        )
+        .await
+        .expect("acceptance");
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorCommand::CancelTask { task_id },
+        )
+        .await
+        .expect("cancellation intent");
+    coordinator
+        .execute(
+            ActorContext::Session { capability: worker },
+            CoordinatorCommand::RecordCancellationCompleted {
+                task_id,
+                succeeded: true,
+            },
+        )
+        .await
+        .expect("provider cancellation evidence");
+    let digest = "c".repeat(64);
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorCommand::RecordRepositoryObservation {
+                observation: observation(task_id, &digest),
+            },
+        )
+        .await
+        .expect("reconciliation Observation");
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorCommand::ClearWorktreeHold {
+                task_id,
+                observation_digest: digest,
+                audit_note:
+                    "Repository inspected after cancellation; retained changes are expected."
+                        .to_owned(),
+            },
+        )
+        .await
+        .expect("digest-confirmed Hold clearance");
+    let QueryResult::Holds(holds) = coordinator
+        .query(
+            ActorContext::Session {
+                capability: supervisor,
+            },
+            CoordinatorQuery::ActiveHolds,
+        )
+        .await
+        .expect("Hold query")
+    else {
+        panic!("Hold query result")
+    };
+    assert!(holds.is_empty());
+}
+
+#[tokio::test]
 async fn ambiguous_dispatch_requires_digest_confirmed_supervisor_reconciliation() {
     let (_state, coordinator, supervisor, worker, task_id) = seeded_task().await;
     let CommandOutcome::TaskDispatching { message_id, .. } = coordinator

@@ -62,6 +62,18 @@ enum Command {
         #[arg(long, env = "HERDR_COORDINATOR_SOCKET")]
         socket: Option<PathBuf>,
     },
+    /// Serve identity-bound Coordinator tools over MCP stdio.
+    Mcp {
+        /// Harness Session capability retained by this proxy process.
+        #[arg(long, env = "HERDR_HARNESS_CAPABILITY")]
+        session_capability: String,
+        /// Durable plugin state directory.
+        #[arg(long, env = "HERDR_PLUGIN_STATE_DIR")]
+        state_dir: PathBuf,
+        /// Broker Unix socket; defaults beneath the state directory.
+        #[arg(long, env = "HERDR_COORDINATOR_SOCKET")]
+        socket: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -96,6 +108,16 @@ async fn main() -> Result<()> {
                 .write_all(output.as_bytes())
                 .await
                 .context("writing popup snapshot")
+        }
+        Command::Mcp {
+            session_capability,
+            state_dir,
+            socket,
+        } => {
+            let socket = socket.unwrap_or_else(|| state_dir.join("coordinator.sock"));
+            herdr_harness_coordinator::mcp::from_bearer(&socket, session_capability)?
+                .run_stdio()
+                .await
         }
     }
 }

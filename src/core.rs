@@ -206,6 +206,12 @@ pub enum CoordinatorCommand {
         observation_digest: String,
         audit_note: String,
     },
+    /// Clear a reconciled Worktree Hold without modifying repository files.
+    ClearWorktreeHold {
+        task_id: TaskId,
+        observation_digest: String,
+        audit_note: String,
+    },
 }
 
 /// Explicit Supervisor resolution after ambiguous native acceptance.
@@ -434,6 +440,8 @@ pub enum CommandOutcome {
     TaskCancellationUpdated { task_id: TaskId, state: TaskState },
     /// Ambiguous delivery was recorded or explicitly reconciled.
     DeliveryUnknownUpdated { task_id: TaskId, state: TaskState },
+    /// A digest-confirmed Worktree Hold was cleared.
+    HoldCleared { task_id: TaskId },
 }
 
 /// Successful query result.
@@ -655,6 +663,19 @@ impl Coordinator {
                 let actor = self.authenticate(&capability).await?;
                 self.require_supervisor(&actor)?;
                 self.resolve_delivery_unknown(task_id, resolution, observation_digest, audit_note)
+                    .await
+            }
+            (
+                ActorContext::Session { capability },
+                CoordinatorCommand::ClearWorktreeHold {
+                    task_id,
+                    observation_digest,
+                    audit_note,
+                },
+            ) => {
+                let actor = self.authenticate(&capability).await?;
+                self.require_supervisor(&actor)?;
+                self.clear_worktree_hold(task_id, observation_digest, audit_note)
                     .await
             }
             _ => Err(CoordinatorError::new(
@@ -2115,6 +2136,82 @@ impl Coordinator {
             task_id,
             state: next,
         })
+    }
+
+    async fn clear_worktree_hold(
+        &self,
+        task_id: TaskId,
+        observation_digest: String,
+        audit_note: String,
+    ) -> Result<CommandOutcome, CoordinatorError> {
+        validate_digest(&observation_digest)?;
+        if audit_note.trim().is_empty() || audit_note.len() > 4096 {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidInput,
+                "audit note must contain 1 to 4096 bytes",
+            ));
+        }
+        let mut transaction = self.pool.begin().await.map_err(CoordinatorError::storage)?;
+        let state: Option<String> = sqlx::query_scalar("SELECT state FROM tasks WHERE id = ?")
+            .bind(task_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        let state = TaskState::from_str(&state.ok_or_else(|| {
+            CoordinatorError::new(ErrorCategory::NotFound, "Task does not exist")
+        })?)?;
+        if !matches!(
+            state,
+            TaskState::Reviewing | TaskState::Cancelled | TaskState::Failed
+        ) {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidState,
+                "Hold clearance requires a reviewing, cancelled, or failed Task",
+            ));
+        }
+        let observation_id: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM repository_observations WHERE task_id = ? AND digest = ? ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(task_id.to_string())
+        .bind(&observation_digest)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(CoordinatorError::storage)?;
+        let observation_id = observation_id.ok_or_else(|| {
+            CoordinatorError::new(
+                ErrorCategory::Conflict,
+                "Hold reconciliation Observation digest does not match",
+            )
+        })?;
+        let now = timestamp();
+        let changed = sqlx::query("UPDATE worktree_holds SET cleared_at = ?, observation_id = ?, audit_note = ? WHERE task_id = ? AND cleared_at IS NULL")
+            .bind(&now)
+            .bind(observation_id)
+            .bind(audit_note)
+            .bind(task_id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?
+            .rows_affected();
+        if changed != 1 {
+            return Err(CoordinatorError::new(
+                ErrorCategory::NotFound,
+                "Task has no active Worktree Hold",
+            ));
+        }
+        if matches!(state, TaskState::Cancelled | TaskState::Failed) {
+            sqlx::query("UPDATE worktree_leases SET released_at = ? WHERE task_id = ? AND released_at IS NULL")
+                .bind(&now)
+                .bind(task_id.to_string())
+                .execute(&mut *transaction)
+                .await
+                .map_err(CoordinatorError::storage)?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(CoordinatorError::storage)?;
+        Ok(CommandOutcome::HoldCleared { task_id })
     }
 
     async fn authenticate(
