@@ -506,7 +506,13 @@ fn decode_broker<T: serde::de::DeserializeOwned>(
 }
 
 fn inherited_supervisor_environment() -> BTreeMap<String, String> {
-    const SAFE: [&str; 10] = [
+    filter_supervisor_environment(std::env::vars())
+}
+
+fn filter_supervisor_environment(
+    variables: impl IntoIterator<Item = (String, String)>,
+) -> BTreeMap<String, String> {
+    const SAFE: [&str; 12] = [
         "HOME",
         "PATH",
         "USER",
@@ -517,8 +523,11 @@ fn inherited_supervisor_environment() -> BTreeMap<String, String> {
         "LC_ALL",
         "XDG_CONFIG_HOME",
         "XDG_DATA_HOME",
+        "HERDR_CODEX_APPROVAL_POLICY",
+        "HERDR_CODEX_SANDBOX_MODE",
     ];
-    std::env::vars()
+    variables
+        .into_iter()
         .filter(|(name, _)| SAFE.contains(&name.as_str()))
         .collect()
 }
@@ -791,4 +800,34 @@ fn compact_payload(event: &SupervisorEvent) -> String {
             &attachments
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::filter_supervisor_environment;
+
+    #[test]
+    fn managed_codex_policy_survives_the_supervisor_environment_allowlist() {
+        let environment = filter_supervisor_environment([
+            ("HERDR_CODEX_APPROVAL_POLICY".to_owned(), "never".to_owned()),
+            (
+                "HERDR_CODEX_SANDBOX_MODE".to_owned(),
+                "danger_full_access".to_owned(),
+            ),
+            ("UNSAFE_PROVIDER_SECRET".to_owned(), "drop-me".to_owned()),
+        ]);
+        assert_eq!(
+            environment
+                .get("HERDR_CODEX_APPROVAL_POLICY")
+                .map(String::as_str),
+            Some("never")
+        );
+        assert_eq!(
+            environment
+                .get("HERDR_CODEX_SANDBOX_MODE")
+                .map(String::as_str),
+            Some("danger_full_access")
+        );
+        assert!(!environment.contains_key("UNSAFE_PROVIDER_SECRET"));
+    }
 }
