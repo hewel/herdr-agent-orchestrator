@@ -3690,15 +3690,23 @@ impl Coordinator {
             ));
         }
         let revision: i64 = task.get("result_revision");
-        let result_manifest: Option<String> = sqlx::query_scalar("SELECT manifest_json FROM results WHERE task_id = ? AND revision = ? AND native_turn_id = ?")
-            .bind(task_id.to_string())
-            .bind(revision)
-            .bind(&native_turn_id)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(CoordinatorError::storage)?;
+        // The Worker Host is the authority for the provider's terminal turn ID. A
+        // long-lived provider MCP child (notably Codex) cannot inherit a new
+        // environment value for every app-server turn, so harness_complete records
+        // a candidate correlation while the Task is Working. One active top-level
+        // Task per Worker Session makes the current Task/revision unambiguous; bind
+        // the candidate to the observed native turn only when that turn settles.
+        let result_manifest: Option<String> = sqlx::query_scalar(
+            "SELECT manifest_json FROM results WHERE task_id = ? AND revision = ?",
+        )
+        .bind(task_id.to_string())
+        .bind(revision)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(CoordinatorError::storage)?;
         let next = if succeeded && result_manifest.is_some() {
-            sqlx::query("UPDATE results SET terminal_at = ? WHERE task_id = ? AND revision = ?")
+            sqlx::query("UPDATE results SET native_turn_id = ?, terminal_at = ? WHERE task_id = ? AND revision = ?")
+                .bind(&native_turn_id)
                 .bind(timestamp())
                 .bind(task_id.to_string())
                 .bind(revision)

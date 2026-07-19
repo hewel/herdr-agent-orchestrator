@@ -1375,7 +1375,10 @@ async fn question_reply_result_and_correction_follow_the_v1_lifecycle() {
             },
             CoordinatorCommand::CompleteTask {
                 manifest: result_manifest(task_id, "first result", attachment.id),
-                native_turn_id: "turn-2".to_owned(),
+                // Codex MCP runs as a long-lived child process and cannot inherit the
+                // app-server's current turn ID. Its submission correlation is therefore
+                // only a candidate until the Worker Host observes turn/completed.
+                native_turn_id: "codex-thread-submission-correlation".to_owned(),
             },
         )
         .await
@@ -1395,6 +1398,19 @@ async fn question_reply_result_and_correction_follow_the_v1_lifecycle() {
         .await
         .expect("successful terminal evidence must make Result reviewable");
     assert_task_state(&coordinator, &supervisor, task_id, TaskState::Reviewing, 0).await;
+    let pool = sqlx::SqlitePool::connect(&format!(
+        "sqlite://{}",
+        state.path().join("coordinator.sqlite3").display()
+    ))
+    .await
+    .expect("test must inspect settled Result evidence");
+    let settled_turn_id: String =
+        sqlx::query_scalar("SELECT native_turn_id FROM results WHERE task_id = ? AND revision = 0")
+            .bind(task_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("settled Result must retain the Host-observed turn ID");
+    assert_eq!(settled_turn_id, "turn-2");
     let QueryResult::SupervisorEvents(events) = coordinator
         .query(
             ActorContext::Session {
