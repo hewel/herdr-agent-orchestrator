@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
+    fmt,
     fs::File,
     path::{Path, PathBuf},
     str::FromStr,
@@ -14,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::{
-    Row, SqlitePool,
+    Row, SqliteConnection, SqlitePool,
     sqlite::{
         SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous,
     },
@@ -22,7 +23,7 @@ use sqlx::{
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::adapter::{AdapterCapabilities, AdapterLifecycle, AdapterSnapshot};
+use crate::adapter::{AdapterCapabilities, AdapterEvent, AdapterLifecycle, AdapterSnapshot};
 use crate::attachment::{AttachmentMetadata, AttachmentStore};
 use crate::contract::{
     CommandEvidenceV1, DeliveryAttemptId, DeliveryIntent, DependencyCondition,
@@ -331,6 +332,16 @@ pub enum CoordinatorCommand {
     RecordSupervisorDisconnected { diagnostic: Option<String> },
     /// Persist the latest provider-neutral native health evidence.
     RecordAdapterSnapshot { snapshot: AdapterSnapshot },
+    /// Convergently assign the current Herdr location of one Coordinator-managed Session.
+    ///
+    /// A Worker Host may assign only its own Session. The Supervisor may assign any live Session
+    /// joined to a durable Harness in this Coordinator state directory. Repeating the same
+    /// `(session_id, terminal_id, pane_id)` assignment is idempotent and needs no request key.
+    RecordPaneLocation {
+        session_id: HarnessSessionId,
+        terminal_id: String,
+        pane_id: String,
+    },
     /// Claim the oldest retry-safe durable Supervisor-attention event.
     ClaimNextSupervisorEvent,
     /// Record provider-native acceptance separately from model processing.
@@ -447,6 +458,8 @@ pub enum CoordinatorQuery {
     ResolvedTaskInput { task_id: TaskId },
     /// Return durable Supervisor events ordered by attention FIFO.
     SupervisorEvents,
+    /// Return one coherent aggregate snapshot for the Harness Network dashboard.
+    Dashboard,
 }
 
 /// Durable Task lifecycle state.
@@ -510,7 +523,9 @@ impl FromStr for TaskSchedulingState {
 }
 
 impl TaskState {
-    fn as_str(self) -> &'static str {
+    /// Returns the stable snake-case lifecycle label used at public boundaries.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Queued => "queued",
             Self::Dispatching => "dispatching",
@@ -691,6 +706,161 @@ pub struct SessionSelfView {
     pub event_sequence: u64,
 }
 
+/// Dashboard read-model schema version, independent from the public v1 Task/message contracts.
+pub const DASHBOARD_SCHEMA_VERSION: u32 = 1;
+
+/// Provider-neutral live Session presence exposed by the Dashboard contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessPresence {
+    Starting,
+    Online,
+    Reconnecting,
+    Disconnected,
+    Stopped,
+    Failed,
+}
+
+impl fmt::Display for HarnessPresence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Starting => "starting",
+            Self::Online => "online",
+            Self::Reconnecting => "reconnecting",
+            Self::Disconnected => "disconnected",
+            Self::Stopped => "stopped",
+            Self::Failed => "failed",
+        })
+    }
+}
+
+/// Provider-neutral live Session activity exposed by the Dashboard contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessActivity {
+    Starting,
+    Idle,
+    Working,
+    Waiting,
+    Reviewing,
+    Cancelling,
+    DeliveryUnknown,
+    Stopping,
+    Failed,
+}
+
+impl fmt::Display for HarnessActivity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Starting => "starting",
+            Self::Idle => "idle",
+            Self::Working => "working",
+            Self::Waiting => "waiting",
+            Self::Reviewing => "reviewing",
+            Self::Cancelling => "cancelling",
+            Self::DeliveryUnknown => "delivery_unknown",
+            Self::Stopping => "stopping",
+            Self::Failed => "failed",
+        })
+    }
+}
+
+/// Latest normalized provider activity retained by a pane-resident Worker Host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DashboardActivityView {
+    /// Dashboard read-model schema version.
+    pub schema_version: u32,
+    pub summary: String,
+    pub observed_at: String,
+}
+
+/// Current live Session details needed to render and focus one Worker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DashboardSessionView {
+    /// Dashboard read-model schema version.
+    pub schema_version: u32,
+    pub id: HarnessSessionId,
+    pub presence: HarnessPresence,
+    pub activity: HarnessActivity,
+    pub native_health: crate::contract::NativeSessionHealth,
+    pub context_tokens: Option<u64>,
+    pub context_window: Option<u64>,
+    pub context_percent: Option<String>,
+    pub compaction_count: Option<u32>,
+    pub context_observed_at: Option<String>,
+    pub last_seen_at: String,
+    pub terminal_id: Option<String>,
+    pub pane_id: Option<String>,
+    pub last_activity: Option<DashboardActivityView>,
+}
+
+/// Sole Supervisor summary shown above the aggregate Worker dashboard.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DashboardSupervisorView {
+    /// Dashboard read-model schema version.
+    pub schema_version: u32,
+    pub id: HarnessId,
+    pub session_id: HarnessSessionId,
+    pub presence: HarnessPresence,
+    pub activity: HarnessActivity,
+    pub unread_messages: u32,
+    pub attention_count: u32,
+    pub terminal_id: Option<String>,
+    pub pane_id: Option<String>,
+}
+
+/// Dashboard-only Task projection that adds presentation metadata without changing [`TaskView`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DashboardTaskView {
+    /// Dashboard read-model schema version.
+    pub schema_version: u32,
+    /// Short user-facing Task title from the durable submission.
+    pub title: String,
+    /// Stable v1 Task projection.
+    pub task: TaskView,
+    pub scheduling_state: TaskSchedulingState,
+    pub dependencies: Vec<TaskDependencyView>,
+    pub dependents: Vec<TaskId>,
+    pub worker_queue_position: Option<u32>,
+    pub waiting_for_worker: bool,
+    pub waiting_for_session: bool,
+    pub waiting_for_repository: bool,
+}
+
+/// One top-level Worker and its current scheduling, repository, and attention state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DashboardWorkerView {
+    /// Dashboard read-model schema version.
+    pub schema_version: u32,
+    pub id: HarnessId,
+    pub kind: crate::contract::HarnessKind,
+    pub launch_profile: Option<String>,
+    pub model: Option<String>,
+    pub session: Option<DashboardSessionView>,
+    pub unread_messages: u32,
+    pub active_task: Option<DashboardTaskView>,
+    pub queued_tasks: Vec<DashboardTaskView>,
+    pub holds: Vec<HoldView>,
+    pub attention_events: Vec<SupervisorEventView>,
+}
+
+/// Atomic read model consumed by the terminal-only Harness Network popup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DashboardView {
+    /// Dashboard read-model schema version.
+    pub schema_version: u32,
+    pub generated_at: String,
+    pub supervisor: DashboardSupervisorView,
+    pub workers: Vec<DashboardWorkerView>,
+    pub attention_events: Vec<SupervisorEventView>,
+}
+
 /// Successful command outcome.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -785,6 +955,8 @@ pub enum CommandOutcome {
     SupervisorDisconnected,
     /// Latest native health and context evidence was retained.
     AdapterSnapshotRecorded,
+    /// Current Herdr terminal and pane identities were retained.
+    PaneLocationRecorded { session_id: HarnessSessionId },
     /// Oldest retry-safe event was reserved for native injection.
     SupervisorEventClaimed { event: Option<SupervisorEventView> },
     /// Supervisor event delivery state was updated.
@@ -824,6 +996,8 @@ pub enum QueryResult {
     ResolvedTaskInput(ResolvedTaskInputView),
     /// Durable Supervisor-attention events.
     SupervisorEvents(Vec<SupervisorEventView>),
+    /// Coherent aggregate Harness Network dashboard.
+    Dashboard(DashboardView),
 }
 
 /// One Coordinator daemon's deep transactional state module.
@@ -1202,6 +1376,19 @@ impl Coordinator {
             }
             (
                 ActorContext::Session { capability },
+                CoordinatorCommand::RecordPaneLocation {
+                    session_id,
+                    terminal_id,
+                    pane_id,
+                },
+            ) => {
+                let actor = self.authenticate(&capability).await?;
+                self.require_supervisor(&actor)?;
+                self.record_pane_location(&actor, session_id, terminal_id, pane_id)
+                    .await
+            }
+            (
+                ActorContext::Session { capability },
                 CoordinatorCommand::RecordSupervisorBinding {
                     native_session_id,
                     native_thread_id,
@@ -1498,6 +1685,14 @@ impl Coordinator {
             CoordinatorCommand::RecordAdapterSnapshot { snapshot } => {
                 self.record_adapter_snapshot(actor, snapshot).await
             }
+            CoordinatorCommand::RecordPaneLocation {
+                session_id,
+                terminal_id,
+                pane_id,
+            } => {
+                self.record_pane_location(actor, session_id, terminal_id, pane_id)
+                    .await
+            }
             CoordinatorCommand::ClaimNextSupervisorEvent => {
                 self.require_supervisor(actor)?;
                 self.claim_next_supervisor_event(actor).await
@@ -1694,6 +1889,10 @@ impl Coordinator {
                     self.supervisor_events().await?,
                 ))
             }
+            CoordinatorQuery::Dashboard => {
+                self.require_supervisor(&actor)?;
+                self.dashboard().await
+            }
         }
     }
 
@@ -1819,8 +2018,22 @@ impl Coordinator {
     }
 
     async fn task_graph(&self) -> Result<QueryResult, CoordinatorError> {
+        let mut connection = self
+            .pool
+            .acquire()
+            .await
+            .map_err(CoordinatorError::storage)?;
+        Ok(QueryResult::TaskGraph(
+            self.task_graph_projection(&mut connection).await?,
+        ))
+    }
+
+    async fn task_graph_projection(
+        &self,
+        connection: &mut SqliteConnection,
+    ) -> Result<Vec<TaskGraphView>, CoordinatorError> {
         let rows = sqlx::query("SELECT t.id, t.worker_id, t.state, t.scheduling_state, t.result_revision, t.submission_json, t.created_sequence, t.task_role, t.session_reuse_policy, b.effective_policy, b.harness_session_id, b.reused, b.decision_reason, b.context_percent FROM tasks t LEFT JOIN task_session_bindings b ON b.task_id = t.id AND b.superseded_at IS NULL ORDER BY t.created_sequence")
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *connection)
             .await
             .map_err(CoordinatorError::storage)?;
         let mut graph = Vec::with_capacity(rows.len());
@@ -1828,7 +2041,7 @@ impl Coordinator {
             let task = task_view_from_row(&row)?;
             let dependencies = sqlx::query("SELECT dependency_task_id, condition, failure_policy, satisfied_by_result_revision FROM task_dependencies WHERE task_id = ? ORDER BY dependency_task_id")
                 .bind(task.id.to_string())
-                .fetch_all(&self.pool)
+                .fetch_all(&mut *connection)
                 .await
                 .map_err(CoordinatorError::storage)?
                 .iter()
@@ -1836,7 +2049,7 @@ impl Coordinator {
                 .collect::<Result<Vec<_>, _>>()?;
             let dependents = sqlx::query_scalar::<_, String>("SELECT task_id FROM task_dependencies WHERE dependency_task_id = ? ORDER BY task_id")
                 .bind(task.id.to_string())
-                .fetch_all(&self.pool)
+                .fetch_all(&mut *connection)
                 .await
                 .map_err(CoordinatorError::storage)?
                 .iter()
@@ -1846,13 +2059,13 @@ impl Coordinator {
             let position: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE worker_id = ? AND scheduling_state = 'ready' AND state = 'queued' AND created_sequence <= ?")
                 .bind(task.worker_id.as_str())
                 .bind(row.get::<i64, _>("created_sequence"))
-                .fetch_one(&self.pool)
+                .fetch_one(&mut *connection)
                 .await
                 .map_err(CoordinatorError::storage)?;
             let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE worker_id = ? AND id <> ? AND state IN ('dispatching','working','waiting','reviewing','cancelling','delivery_unknown')")
                 .bind(task.worker_id.as_str())
                 .bind(task.id.to_string())
-                .fetch_one(&self.pool)
+                .fetch_one(&mut *connection)
                 .await
                 .map_err(CoordinatorError::storage)?;
             let submission: TaskSubmissionV1 = serde_json::from_str(row.get("submission_json"))
@@ -1862,7 +2075,7 @@ impl Coordinator {
                 .bind(repository_key.as_ref())
                 .bind(repository_key.as_ref())
                 .bind(task.id.to_string())
-                .fetch_one(&self.pool)
+                .fetch_one(&mut *connection)
                 .await
                 .map_err(CoordinatorError::storage)?;
             let is_waiting =
@@ -1881,7 +2094,7 @@ impl Coordinator {
                 waiting_for_repository: is_waiting && repository_blockers != 0,
             });
         }
-        Ok(QueryResult::TaskGraph(graph))
+        Ok(graph)
     }
 
     async fn inbox(&self, actor: &AuthenticatedActor) -> Result<QueryResult, CoordinatorError> {
@@ -1951,6 +2164,210 @@ impl Coordinator {
             })
             .collect::<Result<Vec<_>, CoordinatorError>>()?;
         Ok(QueryResult::HarnessStatus(status))
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one transaction assembles the coherent cross-subsystem dashboard snapshot"
+    )]
+    async fn dashboard(&self) -> Result<QueryResult, CoordinatorError> {
+        let mut transaction = self.pool.begin().await.map_err(CoordinatorError::storage)?;
+        let graph = self.task_graph_projection(&mut transaction).await?;
+        let title_rows =
+            sqlx::query("SELECT id, submission_json FROM tasks ORDER BY created_sequence")
+                .fetch_all(&mut *transaction)
+                .await
+                .map_err(CoordinatorError::storage)?;
+        let task_titles = title_rows
+            .iter()
+            .map(|row| {
+                let task_id = parse_uuid_id(row.get("id"))?;
+                let submission: TaskSubmissionV1 = serde_json::from_str(row.get("submission_json"))
+                    .map_err(CoordinatorError::storage)?;
+                Ok((task_id, submission.title))
+            })
+            .collect::<Result<BTreeMap<_, _>, CoordinatorError>>()?;
+        let event_rows = sqlx::query("SELECT id, kind, task_id, result_revision, source_message_id, summary, attachments_json, delivery_intent, state, created_at FROM supervisor_events WHERE state NOT IN ('processed', 'cancelled') ORDER BY created_sequence")
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        let attention_events = event_rows
+            .iter()
+            .map(supervisor_event_view)
+            .collect::<Result<Vec<_>, _>>()?;
+        let hold_rows = sqlx::query("SELECT id, repository_key, task_id, reason FROM worktree_holds WHERE cleared_at IS NULL ORDER BY created_at")
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        let holds = hold_rows
+            .iter()
+            .map(|row| {
+                Ok(HoldView {
+                    id: parse_uuid_id(row.get("id"))?,
+                    repository_key: row.get::<&str, _>("repository_key").to_owned(),
+                    task_id: parse_uuid_id(row.get("task_id"))?,
+                    reason: row.get::<&str, _>("reason").to_owned(),
+                })
+            })
+            .collect::<Result<Vec<_>, CoordinatorError>>()?;
+
+        let supervisor_row = sqlx::query("SELECT h.id, s.id AS session_id, s.presence, s.activity, s.terminal_id, s.pane_id, (SELECT COUNT(*) FROM messages m LEFT JOIN inbox_reads r ON r.harness_id = h.id AND r.message_id = m.id WHERE m.recipient_id = h.id AND r.message_id IS NULL) AS unread_messages FROM harnesses h JOIN harness_sessions s ON s.id = (SELECT current.id FROM harness_sessions current WHERE current.harness_id = h.id AND current.ended_at IS NULL ORDER BY current.started_at DESC LIMIT 1) WHERE h.tier = 'supervisor'")
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?
+            .ok_or_else(|| {
+                CoordinatorError::new(
+                    ErrorCategory::StorageFailure,
+                    "dashboard requires one live Supervisor Session",
+                )
+            })?;
+        let supervisor_unread: i64 = supervisor_row.get("unread_messages");
+        let supervisor = DashboardSupervisorView {
+            schema_version: DASHBOARD_SCHEMA_VERSION,
+            id: HarnessId::from_str(supervisor_row.get("id")).map_err(CoordinatorError::storage)?,
+            session_id: parse_uuid_id(supervisor_row.get("session_id"))?,
+            presence: harness_presence_from_str(supervisor_row.get("presence"))?,
+            activity: harness_activity_from_str(supervisor_row.get("activity"))?,
+            unread_messages: u32::try_from(supervisor_unread).map_err(CoordinatorError::storage)?,
+            attention_count: u32::try_from(attention_events.len())
+                .map_err(CoordinatorError::storage)?,
+            terminal_id: supervisor_row
+                .get::<Option<&str>, _>("terminal_id")
+                .map(str::to_owned),
+            pane_id: supervisor_row
+                .get::<Option<&str>, _>("pane_id")
+                .map(str::to_owned),
+        };
+
+        let worker_rows = sqlx::query("SELECT h.id, h.kind, h.launch_profile, COALESCE(s.effective_model, h.model) AS model, s.id AS session_id, s.presence, s.activity, s.native_health, s.context_tokens, s.context_window, s.context_percent, s.compaction_count, s.adapter_snapshot_at, s.last_seen_at, s.terminal_id, s.pane_id, (SELECT COUNT(*) FROM messages m LEFT JOIN inbox_reads r ON r.harness_id = h.id AND r.message_id = m.id WHERE m.recipient_id = h.id AND r.message_id IS NULL) AS unread_messages FROM harnesses h LEFT JOIN harness_sessions s ON s.id = (SELECT current.id FROM harness_sessions current WHERE current.harness_id = h.id AND current.ended_at IS NULL ORDER BY current.started_at DESC LIMIT 1) WHERE h.tier = 'worker' ORDER BY h.created_at, h.id")
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        let mut workers = Vec::with_capacity(worker_rows.len());
+        for row in worker_rows {
+            let id = HarnessId::from_str(row.get("id")).map_err(CoordinatorError::storage)?;
+            let session = if let Some(session_id) = row.get::<Option<&str>, _>("session_id") {
+                let activity_row = sqlx::query("SELECT CASE WHEN json_type(event_json, '$.value.summary') = 'text' THEN json_extract(event_json, '$.value.summary') WHEN json_type(event_json, '$.summary') = 'text' THEN json_extract(event_json, '$.summary') END AS summary, received_at FROM host_events WHERE session_id = ? AND json_extract(event_json, '$.kind') = 'activity' AND (json_type(event_json, '$.value.summary') = 'text' OR json_type(event_json, '$.summary') = 'text') ORDER BY sequence DESC LIMIT 1")
+                    .bind(session_id)
+                    .fetch_optional(&mut *transaction)
+                    .await
+                    .map_err(CoordinatorError::storage)?;
+                let last_activity = activity_row
+                    .map(|activity| {
+                        Ok(DashboardActivityView {
+                            schema_version: DASHBOARD_SCHEMA_VERSION,
+                            summary: activity
+                                .try_get::<String, _>("summary")
+                                .map_err(CoordinatorError::storage)?,
+                            observed_at: activity
+                                .try_get::<String, _>("received_at")
+                                .map_err(CoordinatorError::storage)?,
+                        })
+                    })
+                    .transpose()?;
+                Some(DashboardSessionView {
+                    schema_version: DASHBOARD_SCHEMA_VERSION,
+                    id: parse_uuid_id(session_id)?,
+                    presence: harness_presence_from_str(row.get("presence"))?,
+                    activity: harness_activity_from_str(row.get("activity"))?,
+                    native_health: native_session_health_from_str(row.get("native_health"))?,
+                    context_tokens: row
+                        .get::<Option<i64>, _>("context_tokens")
+                        .map(u64::try_from)
+                        .transpose()
+                        .map_err(CoordinatorError::storage)?,
+                    context_window: row
+                        .get::<Option<i64>, _>("context_window")
+                        .map(u64::try_from)
+                        .transpose()
+                        .map_err(CoordinatorError::storage)?,
+                    context_percent: row
+                        .get::<Option<f64>, _>("context_percent")
+                        .map(|value| format!("{:.0}", value.clamp(0.0, 100.0))),
+                    compaction_count: row
+                        .get::<Option<i64>, _>("compaction_count")
+                        .map(u32::try_from)
+                        .transpose()
+                        .map_err(CoordinatorError::storage)?,
+                    context_observed_at: row
+                        .get::<Option<&str>, _>("adapter_snapshot_at")
+                        .map(str::to_owned),
+                    last_seen_at: row.get("last_seen_at"),
+                    terminal_id: row.get::<Option<&str>, _>("terminal_id").map(str::to_owned),
+                    pane_id: row.get::<Option<&str>, _>("pane_id").map(str::to_owned),
+                    last_activity,
+                })
+            } else {
+                None
+            };
+            let active_task = graph
+                .iter()
+                .find(|entry| {
+                    entry.task.worker_id == id
+                        && matches!(
+                            entry.task.state,
+                            TaskState::Dispatching
+                                | TaskState::Working
+                                | TaskState::Waiting
+                                | TaskState::Reviewing
+                                | TaskState::Cancelling
+                                | TaskState::DeliveryUnknown
+                        )
+                })
+                .map(|entry| dashboard_task_view(entry, &task_titles))
+                .transpose()?;
+            let queued_tasks = graph
+                .iter()
+                .filter(|entry| entry.task.worker_id == id && entry.task.state == TaskState::Queued)
+                .map(|entry| dashboard_task_view(entry, &task_titles))
+                .collect::<Result<Vec<_>, _>>()?;
+            let worker_task_ids = graph
+                .iter()
+                .filter(|entry| entry.task.worker_id == id)
+                .map(|entry| entry.task.id)
+                .collect::<Vec<_>>();
+            let worker_holds = holds
+                .iter()
+                .filter(|hold| worker_task_ids.contains(&hold.task_id))
+                .cloned()
+                .collect();
+            let worker_events = attention_events
+                .iter()
+                .filter(|event| {
+                    event
+                        .task_id
+                        .is_some_and(|task_id| worker_task_ids.contains(&task_id))
+                })
+                .cloned()
+                .collect();
+            let unread: i64 = row.get("unread_messages");
+            workers.push(DashboardWorkerView {
+                schema_version: DASHBOARD_SCHEMA_VERSION,
+                id,
+                kind: harness_kind_from_str(row.get("kind"))?,
+                launch_profile: row
+                    .get::<Option<&str>, _>("launch_profile")
+                    .map(str::to_owned),
+                model: row.get::<Option<&str>, _>("model").map(str::to_owned),
+                session,
+                unread_messages: u32::try_from(unread).map_err(CoordinatorError::storage)?,
+                active_task,
+                queued_tasks,
+                holds: worker_holds,
+                attention_events: worker_events,
+            });
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(CoordinatorError::storage)?;
+        Ok(QueryResult::Dashboard(DashboardView {
+            schema_version: DASHBOARD_SCHEMA_VERSION,
+            generated_at: timestamp(),
+            supervisor,
+            workers,
+            attention_events,
+        }))
     }
 
     async fn active_holds(&self) -> Result<QueryResult, CoordinatorError> {
@@ -5216,6 +5633,81 @@ impl Coordinator {
         Ok(CommandOutcome::AdapterSnapshotRecorded)
     }
 
+    async fn record_pane_location(
+        &self,
+        actor: &AuthenticatedActor,
+        session_id: HarnessSessionId,
+        terminal_id: String,
+        pane_id: String,
+    ) -> Result<CommandOutcome, CoordinatorError> {
+        if actor.tier == HarnessTier::Worker
+            && (actor.host_connection_id.is_none() || actor.session_id != session_id)
+        {
+            return Err(CoordinatorError::new(
+                ErrorCategory::Forbidden,
+                "a Worker Host may record only its own pane location",
+            ));
+        }
+        if terminal_id.trim().is_empty()
+            || terminal_id.len() > 512
+            || pane_id.trim().is_empty()
+            || pane_id.len() > 512
+        {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidInput,
+                "terminal_id and pane_id must contain 1 to 512 bytes",
+            ));
+        }
+        let mut transaction = self.pool.begin().await.map_err(CoordinatorError::storage)?;
+        let target_tier: Option<String> = sqlx::query_scalar(
+            "SELECT s.harness_tier FROM harness_sessions s JOIN harnesses h ON h.id = s.harness_id AND h.tier = s.harness_tier WHERE s.id = ? AND s.ended_at IS NULL",
+        )
+        .bind(session_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(CoordinatorError::storage)?;
+        if target_tier.is_none() {
+            return Err(CoordinatorError::new(
+                ErrorCategory::NotFound,
+                "pane location target is not a live Coordinator-managed Session",
+            ));
+        }
+        let terminal_in_use: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM harness_sessions WHERE terminal_id = ? AND id <> ? AND ended_at IS NULL)")
+            .bind(&terminal_id)
+            .bind(session_id.to_string())
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?;
+        if terminal_in_use {
+            return Err(CoordinatorError::new(
+                ErrorCategory::Conflict,
+                "terminal_id is already bound to another live Session",
+            ));
+        }
+        let changed = sqlx::query("UPDATE harness_sessions SET terminal_id = ?, pane_id = ?, last_seen_at = ? WHERE id = ? AND ended_at IS NULL AND (terminal_id IS NOT ? OR pane_id IS NOT ?)")
+            .bind(&terminal_id)
+            .bind(&pane_id)
+            .bind(timestamp())
+            .bind(session_id.to_string())
+            .bind(&terminal_id)
+            .bind(&pane_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(CoordinatorError::storage)?
+            .rows_affected();
+        if changed > 1 {
+            return Err(CoordinatorError::new(
+                ErrorCategory::StorageFailure,
+                "pane location assignment updated more than one Session",
+            ));
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(CoordinatorError::storage)?;
+        Ok(CommandOutcome::PaneLocationRecorded { session_id })
+    }
+
     async fn record_supervisor_binding(
         &self,
         actor: &AuthenticatedActor,
@@ -5949,6 +6441,20 @@ impl Coordinator {
             return Err(CoordinatorError::new(
                 ErrorCategory::InvalidInput,
                 "Host event exceeds 65,536 bytes",
+            ));
+        }
+        let normalized: AdapterEvent = serde_json::from_str(&event_json).map_err(|error| {
+            CoordinatorError::new(
+                ErrorCategory::InvalidInput,
+                format!("Host event does not match the provider-neutral AdapterEvent: {error}"),
+            )
+        })?;
+        if let AdapterEvent::Activity { summary } = &normalized
+            && summary.trim().is_empty()
+        {
+            return Err(CoordinatorError::new(
+                ErrorCategory::InvalidInput,
+                "Host activity summary must not be blank",
             ));
         }
         let mut transaction = self.pool.begin().await.map_err(CoordinatorError::storage)?;
@@ -6787,6 +7293,30 @@ fn task_view_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<TaskView, Coordin
     })
 }
 
+fn dashboard_task_view(
+    graph: &TaskGraphView,
+    task_titles: &BTreeMap<TaskId, String>,
+) -> Result<DashboardTaskView, CoordinatorError> {
+    let title = task_titles.get(&graph.task.id).cloned().ok_or_else(|| {
+        CoordinatorError::new(
+            ErrorCategory::StorageFailure,
+            format!("Dashboard Task {} has no durable title", graph.task.id),
+        )
+    })?;
+    Ok(DashboardTaskView {
+        schema_version: DASHBOARD_SCHEMA_VERSION,
+        title,
+        task: graph.task.clone(),
+        scheduling_state: graph.scheduling_state,
+        dependencies: graph.dependencies.clone(),
+        dependents: graph.dependents.clone(),
+        worker_queue_position: graph.worker_queue_position,
+        waiting_for_worker: graph.waiting_for_worker,
+        waiting_for_session: graph.waiting_for_session,
+        waiting_for_repository: graph.waiting_for_repository,
+    })
+}
+
 fn task_dependency_view_from_row(
     row: &sqlx::sqlite::SqliteRow,
 ) -> Result<TaskDependencyView, CoordinatorError> {
@@ -7444,6 +7974,39 @@ fn native_session_health_as_str(health: crate::contract::NativeSessionHealth) ->
     }
 }
 
+fn harness_presence_from_str(value: &str) -> Result<HarnessPresence, CoordinatorError> {
+    match value {
+        "starting" => Ok(HarnessPresence::Starting),
+        "online" => Ok(HarnessPresence::Online),
+        "reconnecting" => Ok(HarnessPresence::Reconnecting),
+        "disconnected" => Ok(HarnessPresence::Disconnected),
+        "stopped" => Ok(HarnessPresence::Stopped),
+        "failed" => Ok(HarnessPresence::Failed),
+        _ => Err(CoordinatorError::new(
+            ErrorCategory::StorageFailure,
+            format!("unknown Harness presence `{value}`"),
+        )),
+    }
+}
+
+fn harness_activity_from_str(value: &str) -> Result<HarnessActivity, CoordinatorError> {
+    match value {
+        "starting" => Ok(HarnessActivity::Starting),
+        "idle" => Ok(HarnessActivity::Idle),
+        "working" => Ok(HarnessActivity::Working),
+        "waiting" => Ok(HarnessActivity::Waiting),
+        "reviewing" => Ok(HarnessActivity::Reviewing),
+        "cancelling" => Ok(HarnessActivity::Cancelling),
+        "delivery_unknown" => Ok(HarnessActivity::DeliveryUnknown),
+        "stopping" => Ok(HarnessActivity::Stopping),
+        "failed" => Ok(HarnessActivity::Failed),
+        _ => Err(CoordinatorError::new(
+            ErrorCategory::StorageFailure,
+            format!("unknown Harness activity `{value}`"),
+        )),
+    }
+}
+
 fn native_session_health_from_str(
     value: &str,
 ) -> Result<crate::contract::NativeSessionHealth, CoordinatorError> {
@@ -7502,6 +8065,17 @@ fn kind_name(kind: crate::contract::HarnessKind) -> &'static str {
     match kind {
         crate::contract::HarnessKind::Omp => "omp",
         crate::contract::HarnessKind::Codex => "codex",
+    }
+}
+
+fn harness_kind_from_str(value: &str) -> Result<crate::contract::HarnessKind, CoordinatorError> {
+    match value {
+        "omp" => Ok(crate::contract::HarnessKind::Omp),
+        "codex" => Ok(crate::contract::HarnessKind::Codex),
+        _ => Err(CoordinatorError::new(
+            ErrorCategory::StorageFailure,
+            format!("unknown Harness kind `{value}`"),
+        )),
     }
 }
 

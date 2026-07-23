@@ -72,13 +72,17 @@ detail: download queue fix
 inbox: 0
 ```
 
-The popup derives its list and detail views from Coordinator queries, not screen scraping or metadata tokens.
+The popup derives its list and detail views from one transactional Coordinator dashboard query, not screen scraping or metadata tokens. The dashboard contains all top-level Workers, their current Sessions, active and queued Tasks, scheduling blockers, Holds, normalized activity, context observations, and Supervisor attention. Provider-native children remain opaque.
 
 ## Focus
 
-Focus resolves the stored `terminal_id` through a fresh or current snapshot, updates stale pane location, and calls `plugin.pane.focus` for the current plugin-owned Worker pane. A missing terminal marks the Session disconnected or failed before returning an error.
+Focus resolves the stored `terminal_id` through a fresh snapshot, updates stale pane location, and calls `plugin.pane.focus` for the current plugin-owned Worker pane. A missing terminal returns an explicit error and never guesses from a stale pane ID.
 
 Supervisor focus uses its registered current pane but is not required to be plugin-owned.
+
+Worker launch always requests `focus = false`. The launcher compares pre-open and post-open snapshots and restores focus only when the known managed Supervisor owned it before the Worker opened. Once `plugin.pane.open` succeeds, snapshot, pane-location, or restoration failures are reported as warnings and never abort or retry the Worker launch. The dashboard focuses a Worker only after an explicit `o` action.
+
+Pane-location recording is durable and typed. A Worker Host may record only its own live Session; the Supervisor may record a Coordinator-managed live Session after Herdr returns or resolves its terminal and pane identities. Stable terminal identity remains authoritative when a pane moves.
 
 ## Cancellation and stop
 
@@ -115,24 +119,26 @@ After a cold Herdr restart, original Supervisor and Worker processes are gone ev
 
 The popup is a viewer/controller over durable state. It supports:
 
-- Harness and presence list;
-- current and queued Tasks;
-- inbox and message details;
-- Result revisions and Attachments;
-- Repository Observations and Worktree Holds;
-- focus;
-- send Reply, Correction, or Notification;
+- one attention-sorted list of all top-level Workers;
+- selected-Worker Session health, context, normalized activity, current and queued Tasks;
+- dependency, Worker-capacity, Session, repository, and Worktree Hold blockers;
+- explicit Worker focus by stable terminal identity;
 - approve or cancel Task;
 - clear Hold with digest and note; and
 - stop Worker Harness.
+
+Selection is keyed by durable Harness ID across refreshes. Wide terminals show list and detail together; narrow terminals switch between them. A failed refresh retains the last valid snapshot and marks it stale. Message composition, transcript viewing, and provider-native child visualization are outside this surface.
 
 Controls are authorized through the active Supervisor capability. Worker or unauthenticated popup commands are rejected.
 
 ## Acceptance scenarios
 
-- A Worker opens unfocused in a normal tab and publishes native status plus Coordinator metadata.
+- A Worker opens unfocused in a normal tab; if Herdr moves focus unexpectedly, the previously focused managed Supervisor is restored without retrying the Worker launch.
+- Multiple Workers in mixed active, queued, waiting, reviewing, offline, and Hold states remain visible together in one dashboard.
 - Moving the pane changes public location without changing Harness Session identity.
 - Focus works after resolving a stale pane ID through terminal identity.
+- Popup selection and controls continue to target the same Harness ID when status ordering changes.
+- A failed dashboard refresh leaves the last valid snapshot visible and marked stale.
 - Broker restart reconnects a live Worker without replaying accepted messages.
 - Cooperative cancellation uses the adapter; timeout escalation closes the pane and records a Hold.
 - Closing the popup leaves every Harness running.

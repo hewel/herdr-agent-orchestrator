@@ -49,6 +49,8 @@ pub enum HerdrError {
     TerminalMissing(String),
     #[error("terminal {0} occurs more than once in the current Herdr snapshot")]
     DuplicateTerminal(String),
+    #[error("the current Herdr snapshot reports more than one focused pane")]
+    MultipleFocusedPanes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,6 +109,20 @@ impl SessionSnapshot {
             return Err(HerdrError::DuplicateTerminal(terminal_id.to_owned()));
         }
         Ok(PaneLocation::from(pane))
+    }
+
+    /// Returns the sole focused pane when the snapshot reports one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HerdrError::MultipleFocusedPanes`] for an ambiguous snapshot.
+    pub fn focused_pane(&self) -> Result<Option<&PaneInfo>, HerdrError> {
+        let mut focused = self.panes.iter().filter(|pane| pane.focused);
+        let pane = focused.next();
+        if focused.next().is_some() {
+            return Err(HerdrError::MultipleFocusedPanes);
+        }
+        Ok(pane)
     }
 }
 
@@ -250,6 +266,14 @@ pub struct PluginPaneInfo {
     pub pane: PaneInfo,
 }
 
+/// Result of opening a Worker after best-effort focus preservation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerPaneOpenOutcome {
+    pub plugin_pane: PluginPaneInfo,
+    pub focus_restored: bool,
+    pub warnings: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct HerdrSocketClient {
     socket_path: PathBuf,
@@ -300,6 +324,69 @@ impl HerdrSocketClient {
         parse_plugin_pane(&result, "plugin_pane_opened")
     }
 
+    /// Opens a Worker and restores focus only when a known managed Supervisor owned it before.
+    ///
+    /// Snapshot and restoration failures after a successful open are returned as warnings so
+    /// callers never abort or duplicate the already-open Worker.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when Herdr does not open the Worker pane.
+    pub async fn open_worker_preserving_focus(
+        &self,
+        params: PluginPaneOpenParams,
+        managed_supervisor_terminal_id: Option<&str>,
+    ) -> Result<WorkerPaneOpenOutcome, HerdrError> {
+        let mut warnings = Vec::new();
+        let focused_before = match self.snapshot().await {
+            Ok(snapshot) => match snapshot.focused_pane() {
+                Ok(focused) => focused.map(|pane| pane.terminal_id.clone()),
+                Err(error) => {
+                    warnings.push(format!("could not identify pre-open focus: {error}"));
+                    None
+                }
+            },
+            Err(error) => {
+                warnings.push(format!("could not capture pre-open focus: {error}"));
+                None
+            }
+        };
+        let plugin_pane = self.open_worker(params).await?;
+        let mut focus_restored = false;
+        match self.snapshot().await {
+            Ok(snapshot) => match snapshot.focused_pane() {
+                Ok(focused_after) => {
+                    let focused_after = focused_after.map(|pane| pane.terminal_id.as_str());
+                    if focused_before.as_deref() != focused_after
+                        && focused_before.as_deref() == managed_supervisor_terminal_id
+                        && let Some(terminal_id) = focused_before.as_deref()
+                    {
+                        match snapshot.resolve_terminal(terminal_id) {
+                            Ok(location) => match self.focus(&location.pane_id).await {
+                                Ok(_) => focus_restored = true,
+                                Err(error) => warnings.push(format!(
+                                    "Worker opened, but managed Supervisor focus restoration failed: {error}"
+                                )),
+                            },
+                            Err(error) => warnings.push(format!(
+                                "Worker opened, but managed Supervisor focus could not be resolved: {error}"
+                            )),
+                        }
+                    }
+                }
+                Err(error) => {
+                    warnings.push(format!("could not inspect post-open focus: {error}"));
+                }
+            },
+            Err(error) => warnings.push(format!("could not capture post-open focus: {error}")),
+        }
+        Ok(WorkerPaneOpenOutcome {
+            plugin_pane,
+            focus_restored,
+            warnings,
+        })
+    }
+
     /// Focuses the current public location of a plugin-owned pane.
     ///
     /// # Errors
@@ -310,6 +397,16 @@ impl HerdrSocketClient {
             .call("plugin.pane.focus", json!({ "pane_id": pane_id }))
             .await?;
         parse_plugin_pane(&result, "plugin_pane_focused")
+    }
+
+    /// Resolves a stable terminal identity through a fresh snapshot, then focuses its live pane.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the terminal cannot be resolved or Herdr rejects the focus request.
+    pub async fn focus_terminal(&self, terminal_id: &str) -> Result<PluginPaneInfo, HerdrError> {
+        let location = self.snapshot().await?.resolve_terminal(terminal_id)?;
+        self.focus(&location.pane_id).await
     }
 
     /// Closes a plugin-owned Worker pane after lifecycle intent is persisted.

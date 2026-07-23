@@ -16,22 +16,25 @@ use tokio::{
     task::JoinSet,
 };
 
-use crate::{
-    contract::SCHEMA_VERSION,
-    core::{
-        ActorContext, Coordinator, CoordinatorCommand, CoordinatorError, CoordinatorQuery,
-        ErrorCategory,
-    },
+use crate::core::{
+    ActorContext, Coordinator, CoordinatorCommand, CoordinatorError, CoordinatorQuery,
+    ErrorCategory,
 };
 
 /// Maximum accepted request or emitted response frame.
 pub const MAX_BROKER_FRAME_BYTES: usize = 1024 * 1024;
 
+/// Original broker operation set. New v2-only operations are rejected under this version.
+pub const BROKER_SCHEMA_V1: u32 = 1;
+
+/// Broker operation set that adds the aggregate Dashboard and pane-location assignment.
+pub const BROKER_SCHEMA_V2: u32 = 2;
+
 /// One versioned broker request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BrokerRequest {
-    /// Must equal the public contract version.
+    /// Broker envelope/operation-set version, independent from nested domain schema versions.
     pub schema_version: u32,
     /// Caller-selected correlation returned unchanged.
     pub request_id: String,
@@ -67,7 +70,7 @@ pub enum BrokerOperation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BrokerResponse {
-    /// Public contract version.
+    /// Broker envelope version used to encode this response.
     pub schema_version: u32,
     /// Correlation copied from the request when decodable.
     pub request_id: Option<String>,
@@ -280,6 +283,7 @@ async fn serve_connection(coordinator: Arc<Coordinator>, stream: UnixStream) -> 
         }
         let response = if frame.len() > MAX_BROKER_FRAME_BYTES {
             BrokerResponse::error(
+                BROKER_SCHEMA_V1,
                 None,
                 ErrorCategory::InvalidInput,
                 "broker frame exceeds 1 MiB",
@@ -291,6 +295,7 @@ async fn serve_connection(coordinator: Arc<Coordinator>, stream: UnixStream) -> 
             .map_err(|source| io::Error::new(io::ErrorKind::InvalidData, source))?;
         if encoded.len() + 1 > MAX_BROKER_FRAME_BYTES {
             encoded = serde_json::to_vec(&BrokerResponse::error(
+                response.schema_version,
                 response.request_id,
                 ErrorCategory::StorageFailure,
                 "broker response exceeds 1 MiB",
@@ -309,14 +314,29 @@ async fn handle_frame(coordinator: &Coordinator, frame: &[u8]) -> BrokerResponse
     let request: BrokerRequest = match serde_json::from_slice(frame) {
         Ok(request) => request,
         Err(error) => {
-            return BrokerResponse::error(None, ErrorCategory::InvalidInput, error.to_string());
+            return BrokerResponse::error(
+                BROKER_SCHEMA_V1,
+                None,
+                ErrorCategory::InvalidInput,
+                error.to_string(),
+            );
         }
     };
-    if request.schema_version != SCHEMA_VERSION {
+    if !matches!(request.schema_version, BROKER_SCHEMA_V1 | BROKER_SCHEMA_V2) {
         return BrokerResponse::error(
+            BROKER_SCHEMA_V2,
             Some(request.request_id),
             ErrorCategory::UnsupportedVersion,
-            "broker schema_version must equal 1",
+            "broker schema_version must equal 1 or 2",
+        );
+    }
+    let schema_version = request.schema_version;
+    if request.operation.minimum_schema_version() > schema_version {
+        return BrokerResponse::error(
+            schema_version,
+            Some(request.request_id),
+            ErrorCategory::UnsupportedVersion,
+            "the requested broker operation requires schema_version 2",
         );
     }
     let request_id = Some(request.request_id);
@@ -332,23 +352,40 @@ async fn handle_frame(coordinator: &Coordinator, frame: &[u8]) -> BrokerResponse
     };
     match outcome {
         Ok(result) => BrokerResponse {
-            schema_version: SCHEMA_VERSION,
+            schema_version,
             request_id,
             result: Some(result),
             error: None,
         },
-        Err(error) => BrokerResponse::core_error(request_id, error),
+        Err(error) => BrokerResponse::core_error(schema_version, request_id, error),
+    }
+}
+
+impl BrokerOperation {
+    fn minimum_schema_version(&self) -> u32 {
+        match self {
+            Self::Execute {
+                command: CoordinatorCommand::RecordPaneLocation { .. },
+                ..
+            }
+            | Self::Query {
+                query: CoordinatorQuery::Dashboard,
+                ..
+            } => BROKER_SCHEMA_V2,
+            Self::Execute { .. } | Self::Query { .. } => BROKER_SCHEMA_V1,
+        }
     }
 }
 
 impl BrokerResponse {
     fn error(
+        schema_version: u32,
         request_id: Option<String>,
         category: ErrorCategory,
         message: impl Into<String>,
     ) -> Self {
         Self {
-            schema_version: SCHEMA_VERSION,
+            schema_version,
             request_id,
             result: None,
             error: Some(BrokerErrorBody {
@@ -358,7 +395,11 @@ impl BrokerResponse {
         }
     }
 
-    fn core_error(request_id: Option<String>, error: CoordinatorError) -> Self {
-        Self::error(request_id, error.category, error.message)
+    fn core_error(
+        schema_version: u32,
+        request_id: Option<String>,
+        error: CoordinatorError,
+    ) -> Self {
+        Self::error(schema_version, request_id, error.category, error.message)
     }
 }

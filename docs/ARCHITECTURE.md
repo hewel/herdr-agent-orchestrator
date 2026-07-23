@@ -111,16 +111,22 @@ pub struct HarnessSession {
 pub enum HarnessPresence {
     Starting,
     Online,
+    Reconnecting,
     Disconnected,
     Stopped,
     Failed,
 }
 
 pub enum HarnessActivity {
+    Starting,
     Idle,
     Working,
     Waiting,
+    Reviewing,
     Cancelling,
+    DeliveryUnknown,
+    Stopping,
+    Failed,
 }
 ```
 
@@ -447,7 +453,7 @@ impl Coordinator {
 }
 ```
 
-Commands cover Supervisor registration, Worker start/stop, Task creation, Question, Reply, Correction, Notification, Result completion, Approval, cancellation, Worktree Hold clearance, and session events. Queries cover Harnesses, Sessions, Tasks, the Task graph and readiness blockers, inboxes, receipts, worktree state, and popup views.
+Commands cover Supervisor registration, Worker start/stop, Task creation, Question, Reply, Correction, Notification, Result completion, Approval, cancellation, Worktree Hold clearance, pane-location recording, and session events. Queries cover Harnesses, Sessions, Tasks, the Task graph and readiness blockers, inboxes, receipts, worktree state, and one coherent aggregate dashboard view.
 
 Routing, authorization, idempotency, Task transitions, queue eligibility, SQLite transactions, leases, receipts, and attachment admission stay behind this interface. Callers do not manipulate tables or state transitions directly.
 
@@ -479,7 +485,9 @@ A managed Supervisor pane runs a Supervisor Host with the narrower `SupervisorAd
 
 Herdr owns terminal topology. The plugin owns Worker launch definitions, Harness Host lifecycle, focus, and forced pane closure. Official native integrations remain the semantic status authority for directly running OMP and Codex; the Coordinator uses Herdr metadata only for title, Task, inbox, and presentation fields.
 
-The integration persists live `terminal_id` separately from mutable `pane_id`, bootstraps from `session.snapshot`, follows pane moves, and resnapshots after reconnect. A popup observes Coordinator state and requests commands; it never owns a Harness process.
+The integration persists live `terminal_id` separately from mutable `pane_id`, bootstraps from `session.snapshot`, follows pane moves, and resnapshots after reconnect. A Worker Host may record only its own Session location; the Supervisor may record or refresh a Coordinator-managed Session after Herdr has returned or resolved that location.
+
+Worker tabs are requested with `focus = false`. The launcher snapshots focus before and after opening a Worker and restores the managed Supervisor only when that Supervisor owned focus before the open. Snapshot or restoration failures after a successful pane open are warnings rather than launch failures, so focus repair cannot abort or duplicate an already-running Worker. A popup observes Coordinator state and requests commands; it never owns a Harness process.
 
 ## Broker and storage
 
@@ -577,23 +585,21 @@ OMP Worker · working · inbox 0
 Supervisor · review ready · inbox 1
 ```
 
-The popup lists durable Harnesses and current Sessions, then shows the selected Task, inbox, Result revisions, repository evidence, dependency blockers and bindings, Worker queue position, and available actions:
+The popup reads one transactional `DashboardView` containing the Supervisor summary and every top-level Worker. It sorts attention-required Workers first, preserves selection by durable Harness ID, and shows the selected Worker's Session health, latest normalized activity, context observation, active Task, queued work, scheduling blockers, Holds, and attention count. Provider-native children and transcripts remain private to their containing Harness.
 
 ```text
-Harness Network
+Harness Network · Supervisor supervisor online/idle
 
-● supervisor       Codex · Supervisor · inbox 1
-● omp-worker       OMP · Worker · reviewing
-○ codex-review     Codex · Worker · idle
+Workers                         Worker detail
+› ● omp-worker    reviewing     final-verification · revision 2
+  ● codex-review  working       context 42% · observed 12:04:31
+  ○ omp-verify    queued        waiting repository
 
-Task final-verification · blocked · queued on omp-worker
-✓ backend-implementation  result_ready · revision 2
-● frontend-implementation approved · awaiting Approval
-
-[o] Focus  [m] Message  [i] Inbox  [c] Cancel task  [Esc] Close
+[↑/↓] Select  [Enter/→] Detail  [o] Open Worker  [a] Approve
+[c] Cancel  [h] Clear Hold  [s] Stop Worker  [Esc/q] Close
 ```
 
-Closing the popup never cancels a Task or closes a Worker pane.
+Wide terminals render Worker list and detail together; narrow terminals switch between them. The popup refreshes once per second, retains the last valid snapshot with a visible stale warning after a query failure, and closes before yielding control after an explicit Worker-focus action. Closing the popup by itself never cancels a Task or closes a Worker pane.
 
 ## Implementation order
 

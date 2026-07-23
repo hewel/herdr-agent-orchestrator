@@ -9,16 +9,16 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::{
     activation::{ActivationRegistry, DesiredActivation},
-    broker::{BrokerOperation, BrokerRequest, BrokerResponse, call},
+    broker::{BROKER_SCHEMA_V2, BrokerOperation, BrokerRequest, BrokerResponse, call},
     contract::{
         HarnessDefinitionV1, HarnessId, HarnessTier, MessageSubmissionV1, ObservationCheckpoint,
         ResultManifestV1, SCHEMA_VERSION, SupervisorEventId, TaskId,
     },
     core::{
-        ActorContext, CoordinatorCommand, CoordinatorQuery, HostConnectionCapability,
-        SessionCapability, SupervisorEventResolution,
+        ActorContext, CoordinatorCommand, CoordinatorQuery, DashboardView,
+        HostConnectionCapability, QueryResult, SessionCapability, SupervisorEventResolution,
     },
-    herdr::{HerdrSocketClient, PluginPaneOpenParams},
+    herdr::{HerdrSocketClient, PluginPaneOpenParams, WorkerPaneOpenOutcome},
     profile::ProfileRegistry,
 };
 
@@ -282,7 +282,7 @@ impl McpServer {
         let response = call(
             &self.socket,
             &BrokerRequest {
-                schema_version: SCHEMA_VERSION,
+                schema_version: BROKER_SCHEMA_V2,
                 request_id: uuid::Uuid::now_v7().to_string(),
                 operation: match operation {
                     ToolOperation::Execute(command) => BrokerOperation::Execute {
@@ -325,7 +325,7 @@ impl McpServer {
         let response = call(
             &self.socket,
             &BrokerRequest {
-                schema_version: SCHEMA_VERSION,
+                schema_version: BROKER_SCHEMA_V2,
                 request_id: uuid::Uuid::now_v7().to_string(),
                 operation: BrokerOperation::Execute {
                     actor: self.actor.clone(),
@@ -394,28 +394,12 @@ impl McpServer {
         if let Some(error) = response.error {
             bail!("Coordinator {:?}: {}", error.category, error.message);
         }
-        let launch = async {
-            let structured = response
-                .result
-                .context("Coordinator response omitted Worker start result")?;
-            let outcome: crate::core::CommandOutcome = serde_json::from_value(structured.clone())?;
-            let crate::core::CommandOutcome::WorkerStarted { capability, .. } = outcome else {
-                bail!("Coordinator returned the wrong Worker start outcome")
-            };
-            let bearer = serde_json::to_value(capability)?
-                .as_str()
-                .context("Session capability did not serialize as a bearer")?
-                .to_owned();
-            self.open_worker_pane(&bearer, &definition, workspace_id)
-                .await?;
-            let public = json!({"worker_id": worker_id, "presence": "starting"});
-            Ok(json!({
-                "content": [{"type":"text","text":serde_json::to_string_pretty(&public)?}],
-                "structuredContent": public,
-                "isError": false
-            }))
-        }
-        .await;
+        let structured = response
+            .result
+            .context("Coordinator response omitted Worker start result")?;
+        let launch = self
+            .finish_worker_launch(structured, &definition, workspace_id, &worker_id)
+            .await;
         if let Err(error) = &launch {
             let _ = call(
                 &self.socket,
@@ -436,12 +420,75 @@ impl McpServer {
         launch
     }
 
+    async fn finish_worker_launch(
+        &self,
+        structured: Value,
+        definition: &HarnessDefinitionV1,
+        workspace_id: String,
+        worker_id: &HarnessId,
+    ) -> Result<Value> {
+        let outcome: crate::core::CommandOutcome = serde_json::from_value(structured)?;
+        let crate::core::CommandOutcome::WorkerStarted {
+            session_id,
+            capability,
+        } = outcome
+        else {
+            bail!("Coordinator returned the wrong Worker start outcome")
+        };
+        let bearer = serde_json::to_value(capability)?
+            .as_str()
+            .context("Session capability did not serialize as a bearer")?
+            .to_owned();
+        let mut warnings = Vec::new();
+        let supervisor_terminal_id = match self.dashboard().await {
+            Ok(dashboard) => dashboard.supervisor.terminal_id,
+            Err(error) => {
+                warnings.push(format!(
+                    "Worker focus preservation could not resolve the managed Supervisor: {error:#}"
+                ));
+                None
+            }
+        };
+        let opened = self
+            .open_worker_pane(
+                &bearer,
+                definition,
+                workspace_id,
+                supervisor_terminal_id.as_deref(),
+            )
+            .await?;
+        warnings.extend(opened.warnings);
+        let pane = &opened.plugin_pane.pane;
+        if let Err(error) = self
+            .record_pane_location(session_id, &pane.terminal_id, &pane.pane_id)
+            .await
+        {
+            warnings.push(format!(
+                "Worker opened, but its pane location was not recorded: {error:#}"
+            ));
+        }
+        let public = json!({
+            "worker_id": worker_id,
+            "presence": "starting",
+            "terminal_id": pane.terminal_id,
+            "pane_id": pane.pane_id,
+            "focus_restored": opened.focus_restored,
+            "warnings": warnings,
+        });
+        Ok(json!({
+            "content": [{"type":"text","text":serde_json::to_string_pretty(&public)?}],
+            "structuredContent": public,
+            "isError": false
+        }))
+    }
+
     async fn open_worker_pane(
         &self,
         bearer: &str,
         definition: &HarnessDefinitionV1,
         workspace_id: String,
-    ) -> Result<()> {
+        managed_supervisor_terminal_id: Option<&str>,
+    ) -> Result<WorkerPaneOpenOutcome> {
         let socket_path = self
             .herdr_socket
             .clone()
@@ -466,9 +513,61 @@ impl McpServer {
             std::env::current_exe()?.to_string_lossy().into_owned(),
         );
         HerdrSocketClient::new(socket_path)
-            .open_worker(pane)
+            .open_worker_preserving_focus(pane, managed_supervisor_terminal_id)
             .await
-            .context("opening Herdr Worker pane")?;
+            .context("opening Herdr Worker pane")
+    }
+
+    async fn dashboard(&self) -> Result<DashboardView> {
+        let response = call(
+            &self.socket,
+            &BrokerRequest {
+                schema_version: BROKER_SCHEMA_V2,
+                request_id: uuid::Uuid::now_v7().to_string(),
+                operation: BrokerOperation::Query {
+                    actor: self.actor.clone(),
+                    query: CoordinatorQuery::Dashboard,
+                },
+            },
+        )
+        .await?;
+        if let Some(error) = response.error {
+            bail!("Coordinator {:?}: {}", error.category, error.message);
+        }
+        let result = response
+            .result
+            .context("Coordinator response omitted Dashboard result")?;
+        let QueryResult::Dashboard(dashboard) = serde_json::from_value(result)? else {
+            bail!("Coordinator returned the wrong Dashboard projection")
+        };
+        Ok(dashboard)
+    }
+
+    async fn record_pane_location(
+        &self,
+        session_id: crate::contract::HarnessSessionId,
+        terminal_id: &str,
+        pane_id: &str,
+    ) -> Result<()> {
+        let response = call(
+            &self.socket,
+            &BrokerRequest {
+                schema_version: BROKER_SCHEMA_V2,
+                request_id: uuid::Uuid::now_v7().to_string(),
+                operation: BrokerOperation::Execute {
+                    actor: self.actor.clone(),
+                    command: CoordinatorCommand::RecordPaneLocation {
+                        session_id,
+                        terminal_id: terminal_id.to_owned(),
+                        pane_id: pane_id.to_owned(),
+                    },
+                },
+            },
+        )
+        .await?;
+        if let Some(error) = response.error {
+            bail!("Coordinator {:?}: {}", error.category, error.message);
+        }
         Ok(())
     }
 

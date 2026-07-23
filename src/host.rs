@@ -1,11 +1,22 @@
 //! Pane-resident Worker Host and terminal popup entrypoint behavior.
 
-use std::{collections::BTreeMap, fmt::Write as _, path::Path, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fmt::Write as _,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use futures::StreamExt;
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::{
+    Frame,
+    layout::{Constraint, Layout},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
+};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -14,16 +25,17 @@ use crate::{
         ResolvedDelivery, WorkerCompletionTools,
     },
     attachment::AttachmentStore,
-    broker::{BrokerOperation, BrokerRequest, call_with_connect_retry},
+    broker::{BROKER_SCHEMA_V2, BrokerOperation, BrokerRequest, call_with_connect_retry},
     contract::{
         DeliveryIntent, HarnessKind, HarnessTier, MessageSubmissionV1, SCHEMA_VERSION,
         TaskSubmissionV1,
     },
     core::{
-        ActorContext, CommandOutcome, CoordinatorCommand, CoordinatorQuery,
-        HarnessCompatibilityEvidenceV1, HostConnectionCapability, InboxMessageView, QueryResult,
-        SessionCapability, TaskState,
+        ActorContext, CommandOutcome, CoordinatorCommand, CoordinatorQuery, DashboardView,
+        HarnessCompatibilityEvidenceV1, HarnessStatusView, HoldView, HostConnectionCapability,
+        InboxMessageView, QueryResult, SessionCapability, TaskGraphView, TaskState, TaskView,
     },
+    herdr::HerdrSocketClient,
     host_presence::HostHeartbeat,
     process_adapter::{CodexProcessAdapter, OmpProcessAdapter},
     profile::{parse_launch_profile_snapshot, resolve_executable},
@@ -394,185 +406,843 @@ async fn run_worker_host_inner(
     }
 }
 
-/// Renders one durable text snapshot for the Herdr popup entrypoint.
-///
-/// Mutating popup actions use the same broker command frames through the `call` CLI.
+/// One top-level Worker row in the Supervisor popup.
+#[derive(Debug, Clone)]
+pub struct PopupWorkerView {
+    id: crate::contract::HarnessId,
+    kind: String,
+    model: Option<String>,
+    launch_profile: Option<String>,
+    presence: String,
+    activity: String,
+    native_health: Option<String>,
+    context_percent: Option<String>,
+    context_observed_at: Option<String>,
+    last_activity: Option<(String, String)>,
+    session_id: Option<crate::contract::HarnessSessionId>,
+    terminal_id: Option<String>,
+    unread_messages: u32,
+    active_task: Option<PopupTaskView>,
+    queued_tasks: Vec<PopupTaskView>,
+    blockers: Vec<String>,
+    holds: Vec<HoldView>,
+    attention_events: usize,
+}
+
+#[derive(Debug, Clone)]
+struct PopupTaskView {
+    title: String,
+    graph: TaskGraphView,
+}
+
+impl std::ops::Deref for PopupTaskView {
+    type Target = TaskGraphView;
+
+    fn deref(&self) -> &Self::Target {
+        &self.graph
+    }
+}
+
+impl PopupWorkerView {
+    fn attention_required(&self) -> bool {
+        self.unread_messages > 0
+            || !self.holds.is_empty()
+            || self.attention_events > 0
+            || matches!(
+                self.activity.as_str(),
+                "waiting" | "reviewing" | "cancelling" | "delivery_unknown"
+            )
+            || self.active_task.as_ref().is_some_and(|task| {
+                matches!(
+                    task.task.state,
+                    TaskState::Waiting
+                        | TaskState::Reviewing
+                        | TaskState::Cancelling
+                        | TaskState::DeliveryUnknown
+                )
+            })
+    }
+
+    fn priority(&self) -> u8 {
+        if self.attention_required() {
+            0
+        } else if self.active_task.as_ref().is_some_and(|task| {
+            matches!(
+                task.task.state,
+                TaskState::Dispatching | TaskState::Working | TaskState::Cancelling
+            )
+        }) {
+            1
+        } else if !self.queued_tasks.is_empty() {
+            2
+        } else if self.presence == "online" {
+            3
+        } else {
+            4
+        }
+    }
+
+    fn status_label(&self) -> String {
+        self.active_task.as_ref().map_or_else(
+            || self.activity.clone(),
+            |task| task.task.state.as_str().to_owned(),
+        )
+    }
+
+    fn status_style(&self) -> Style {
+        if self.attention_required() {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else if self.presence != "online" {
+            Style::default().fg(Color::DarkGray)
+        } else if self.active_task.as_ref().is_some_and(|task| {
+            matches!(task.task.state, TaskState::Working | TaskState::Dispatching)
+        }) {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default().fg(Color::Cyan)
+        }
+    }
+}
+
+/// Aggregate projection consumed by the terminal-only Harness Network dashboard.
+#[derive(Debug, Clone, Default)]
+pub struct PopupDashboard {
+    workers: Vec<PopupWorkerView>,
+    generated_at: Option<String>,
+    supervisor_attention: u32,
+    supervisor_id: Option<String>,
+    supervisor_presence: Option<String>,
+    supervisor_activity: Option<String>,
+}
+
+impl PopupDashboard {
+    /// Combines the currently available durable projections without inspecting terminal output.
+    #[must_use]
+    pub fn from_projections(
+        status: &[HarnessStatusView],
+        tasks: &[TaskView],
+        graph: &[TaskGraphView],
+        holds: &[HoldView],
+    ) -> Self {
+        let mut workers = status
+            .iter()
+            .filter(|harness| harness.tier == HarnessTier::Worker)
+            .map(|harness| {
+                let active_task = harness
+                    .active_task_id
+                    .and_then(|task_id| tasks.iter().find(|task| task.id == task_id).cloned());
+                let queued_tasks = graph
+                    .iter()
+                    .filter(|entry| {
+                        entry.task.worker_id == harness.id && entry.task.state == TaskState::Queued
+                    })
+                    .cloned()
+                    .map(|graph| PopupTaskView {
+                        title: graph.task.id.to_string(),
+                        graph,
+                    })
+                    .collect::<Vec<_>>();
+                let blockers = active_task.as_ref().map_or_else(Vec::new, |task| {
+                    graph
+                        .iter()
+                        .find(|entry| entry.task.id == task.id)
+                        .map_or_else(Vec::new, |entry| {
+                            let mut blockers = Vec::new();
+                            if entry.waiting_for_worker {
+                                blockers.push("waiting Worker".to_owned());
+                            }
+                            if entry.waiting_for_session {
+                                blockers.push("waiting Session".to_owned());
+                            }
+                            if entry.waiting_for_repository {
+                                blockers.push("waiting repository".to_owned());
+                            }
+                            blockers
+                        })
+                });
+                let worker_task_ids = graph
+                    .iter()
+                    .filter(|entry| entry.task.worker_id == harness.id)
+                    .map(|entry| entry.task.id)
+                    .collect::<Vec<_>>();
+                let worker_holds = holds
+                    .iter()
+                    .filter(|hold| worker_task_ids.contains(&hold.task_id))
+                    .cloned()
+                    .collect();
+                PopupWorkerView {
+                    id: harness.id.clone(),
+                    kind: "unknown".to_owned(),
+                    model: None,
+                    launch_profile: None,
+                    presence: harness.presence.clone(),
+                    activity: harness.activity.clone(),
+                    native_health: None,
+                    context_percent: active_task
+                        .as_ref()
+                        .and_then(|task| task.context_percent.clone()),
+                    context_observed_at: None,
+                    last_activity: None,
+                    session_id: None,
+                    terminal_id: None,
+                    unread_messages: harness.unread_messages,
+                    active_task: active_task.map(|task| PopupTaskView {
+                        title: task.id.to_string(),
+                        graph: TaskGraphView {
+                            task,
+                            scheduling_state: crate::core::TaskSchedulingState::Ready,
+                            dependencies: Vec::new(),
+                            dependents: Vec::new(),
+                            worker_queue_position: None,
+                            waiting_for_worker: false,
+                            waiting_for_session: false,
+                            waiting_for_repository: false,
+                        },
+                    }),
+                    queued_tasks,
+                    blockers,
+                    holds: worker_holds,
+                    attention_events: 0,
+                }
+            })
+            .collect::<Vec<_>>();
+        workers.sort_by(|left, right| {
+            left.priority()
+                .cmp(&right.priority())
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Self {
+            workers,
+            generated_at: None,
+            supervisor_attention: 0,
+            supervisor_id: None,
+            supervisor_presence: None,
+            supervisor_activity: None,
+        }
+    }
+
+    /// Adapts the single coherent Coordinator dashboard query for terminal rendering.
+    #[must_use]
+    pub fn from_dashboard(view: DashboardView) -> Self {
+        let mut workers = view
+            .workers
+            .into_iter()
+            .map(|worker| {
+                let session = worker.session;
+                let blockers = worker.active_task.as_ref().map_or_else(Vec::new, |task| {
+                    let mut blockers = Vec::new();
+                    if task.waiting_for_worker {
+                        blockers.push("waiting Worker".to_owned());
+                    }
+                    if task.waiting_for_session {
+                        blockers.push("waiting Session".to_owned());
+                    }
+                    if task.waiting_for_repository {
+                        blockers.push("waiting repository".to_owned());
+                    }
+                    blockers
+                });
+                PopupWorkerView {
+                    id: worker.id,
+                    kind: format!("{:?}", worker.kind),
+                    model: worker.model,
+                    launch_profile: worker.launch_profile,
+                    presence: session.as_ref().map_or_else(
+                        || "offline".to_owned(),
+                        |session| session.presence.to_string(),
+                    ),
+                    activity: session.as_ref().map_or_else(
+                        || "offline".to_owned(),
+                        |session| session.activity.to_string(),
+                    ),
+                    native_health: session
+                        .as_ref()
+                        .map(|session| format!("{:?}", session.native_health)),
+                    context_percent: session
+                        .as_ref()
+                        .and_then(|session| session.context_percent.clone()),
+                    context_observed_at: session
+                        .as_ref()
+                        .and_then(|session| session.context_observed_at.clone()),
+                    last_activity: session.as_ref().and_then(|session| {
+                        session.last_activity.as_ref().map(|activity| {
+                            (activity.summary.clone(), activity.observed_at.clone())
+                        })
+                    }),
+                    session_id: session.as_ref().map(|session| session.id),
+                    terminal_id: session.and_then(|session| session.terminal_id),
+                    unread_messages: worker.unread_messages,
+                    active_task: worker.active_task.map(|task| PopupTaskView {
+                        title: task.title,
+                        graph: TaskGraphView {
+                            task: task.task,
+                            scheduling_state: task.scheduling_state,
+                            dependencies: task.dependencies,
+                            dependents: task.dependents,
+                            worker_queue_position: task.worker_queue_position,
+                            waiting_for_worker: task.waiting_for_worker,
+                            waiting_for_session: task.waiting_for_session,
+                            waiting_for_repository: task.waiting_for_repository,
+                        },
+                    }),
+                    queued_tasks: worker
+                        .queued_tasks
+                        .into_iter()
+                        .map(|task| PopupTaskView {
+                            title: task.title,
+                            graph: TaskGraphView {
+                                task: task.task,
+                                scheduling_state: task.scheduling_state,
+                                dependencies: task.dependencies,
+                                dependents: task.dependents,
+                                worker_queue_position: task.worker_queue_position,
+                                waiting_for_worker: task.waiting_for_worker,
+                                waiting_for_session: task.waiting_for_session,
+                                waiting_for_repository: task.waiting_for_repository,
+                            },
+                        })
+                        .collect(),
+                    blockers,
+                    holds: worker.holds,
+                    attention_events: worker.attention_events.len(),
+                }
+            })
+            .collect::<Vec<_>>();
+        workers.sort_by(|left, right| {
+            left.priority()
+                .cmp(&right.priority())
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Self {
+            workers,
+            generated_at: Some(view.generated_at),
+            supervisor_attention: view.supervisor.attention_count,
+            supervisor_id: Some(view.supervisor.id.to_string()),
+            supervisor_presence: Some(view.supervisor.presence.to_string()),
+            supervisor_activity: Some(view.supervisor.activity.to_string()),
+        }
+    }
+
+    /// Returns Worker ids in their visible priority order.
+    pub fn worker_ids(&self) -> impl Iterator<Item = &str> {
+        self.workers.iter().map(|worker| worker.id.as_str())
+    }
+
+    fn selected(&self, selection: &PopupSelection) -> Option<&PopupWorkerView> {
+        selection
+            .selected_worker
+            .as_ref()
+            .and_then(|id| self.workers.iter().find(|worker| worker.id == *id))
+    }
+}
+
+/// Detail/list mode for a narrow popup.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PopupNarrowMode {
+    #[default]
+    List,
+    Detail,
+}
+
+/// Stable popup selection, keyed by durable Harness identity rather than display position.
+#[derive(Debug, Clone, Default)]
+pub struct PopupSelection {
+    selected_worker: Option<crate::contract::HarnessId>,
+    narrow_mode: PopupNarrowMode,
+}
+
+impl PopupSelection {
+    /// Returns the selected durable Worker identity.
+    #[must_use]
+    pub fn selected_worker_id(&self) -> Option<&crate::contract::HarnessId> {
+        self.selected_worker.as_ref()
+    }
+
+    /// Shows the selected Worker's detail on a narrow terminal.
+    pub fn show_detail(&mut self) {
+        self.narrow_mode = PopupNarrowMode::Detail;
+    }
+
+    /// Returns a narrow terminal to its Worker list.
+    pub fn show_list(&mut self) {
+        self.narrow_mode = PopupNarrowMode::List;
+    }
+
+    /// Preserves the selected Worker through a refresh, choosing the first visible Worker only
+    /// when the previous Worker is absent.
+    pub fn retain_worker(&mut self, dashboard: &PopupDashboard) {
+        if self.selected_worker.as_ref().is_some_and(|selected| {
+            dashboard
+                .workers
+                .iter()
+                .any(|worker| worker.id == *selected)
+        }) {
+            return;
+        }
+        self.selected_worker = dashboard.workers.first().map(|worker| worker.id.clone());
+    }
+
+    /// Selects the next Worker in visible priority order.
+    pub fn select_next(&mut self, dashboard: &PopupDashboard) {
+        if self.selected_worker.is_none() {
+            self.retain_worker(dashboard);
+            return;
+        }
+        self.retain_worker(dashboard);
+        let Some(selected) = self.selected_worker.as_ref() else {
+            return;
+        };
+        let Some(index) = dashboard
+            .workers
+            .iter()
+            .position(|worker| worker.id == *selected)
+        else {
+            return;
+        };
+        self.selected_worker = dashboard
+            .workers
+            .get((index + 1).min(dashboard.workers.len().saturating_sub(1)))
+            .map(|worker| worker.id.clone());
+    }
+
+    /// Selects the previous Worker in visible priority order.
+    pub fn select_previous(&mut self, dashboard: &PopupDashboard) {
+        if self.selected_worker.is_none() {
+            self.retain_worker(dashboard);
+            return;
+        }
+        self.retain_worker(dashboard);
+        let Some(selected) = self.selected_worker.as_ref() else {
+            return;
+        };
+        let Some(index) = dashboard
+            .workers
+            .iter()
+            .position(|worker| worker.id == *selected)
+        else {
+            return;
+        };
+        self.selected_worker = dashboard
+            .workers
+            .get(index.saturating_sub(1))
+            .map(|worker| worker.id.clone());
+    }
+
+    fn selected_task<'a>(&self, dashboard: &'a PopupDashboard) -> Option<&'a TaskGraphView> {
+        dashboard
+            .selected(self)
+            .and_then(|worker| worker.active_task.as_ref())
+            .map(|task| &task.graph)
+    }
+
+    /// Returns the selected Worker's active Task target for approve and cancel actions.
+    #[must_use]
+    pub fn selected_task_id(&self, dashboard: &PopupDashboard) -> Option<crate::contract::TaskId> {
+        self.selected_task(dashboard).map(|task| task.task.id)
+    }
+
+    /// Returns the selected Worker's first unresolved Hold target, including terminal Tasks.
+    #[must_use]
+    pub fn selected_hold_task_id(
+        &self,
+        dashboard: &PopupDashboard,
+    ) -> Option<crate::contract::TaskId> {
+        dashboard
+            .selected(self)
+            .and_then(|worker| worker.holds.first())
+            .map(|hold| hold.task_id)
+    }
+
+    /// Returns the selected Worker only when it currently accepts a stop request.
+    #[must_use]
+    pub fn selected_stoppable_worker_id<'a>(
+        &self,
+        dashboard: &'a PopupDashboard,
+    ) -> Option<&'a crate::contract::HarnessId> {
+        dashboard
+            .selected(self)
+            .filter(|worker| worker.presence == "online")
+            .map(|worker| &worker.id)
+    }
+}
+
+/// Draws the live Supervisor popup. Wide terminals show the Worker list and detail together;
+/// narrow terminals switch between them using Enter/Right and Left.
+pub fn draw_popup_dashboard(
+    frame: &mut Frame,
+    dashboard: &PopupDashboard,
+    selection: &PopupSelection,
+    stale_error: Option<&str>,
+    warning: Option<&str>,
+) {
+    let [body, footer] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).areas(frame.area());
+    let supervisor = dashboard
+        .supervisor_id
+        .as_ref()
+        .map_or_else(String::new, |id| {
+            let presence = dashboard
+                .supervisor_presence
+                .as_deref()
+                .unwrap_or("unknown");
+            let activity = dashboard
+                .supervisor_activity
+                .as_deref()
+                .unwrap_or("unknown");
+            format!(" · Supervisor {id} {presence}/{activity}")
+        });
+    let title = if stale_error.is_some() {
+        " Harness Network · STALE ".to_owned()
+    } else {
+        dashboard.generated_at.as_ref().map_or_else(
+            || format!(" Harness Network{supervisor} "),
+            |generated_at| format!(" Harness Network{supervisor} · updated {generated_at} "),
+        )
+    };
+    let root = Block::default().borders(Borders::ALL).title(title);
+    let inner = root.inner(body);
+    frame.render_widget(root, body);
+    if inner.width >= 88 {
+        let [list_area, detail_area] =
+            Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)])
+                .areas(inner);
+        render_worker_list(frame, list_area, dashboard, selection);
+        render_worker_detail(
+            frame,
+            detail_area,
+            dashboard.selected(selection),
+            stale_error,
+            warning,
+        );
+    } else if selection.narrow_mode == PopupNarrowMode::Detail {
+        render_worker_detail(
+            frame,
+            inner,
+            dashboard.selected(selection),
+            stale_error,
+            warning,
+        );
+    } else {
+        render_worker_list(frame, inner, dashboard, selection);
+    }
+    frame.render_widget(
+        Paragraph::new("[↑/↓] Select  [Enter/→] Detail  [←] List  [a] Approve  [c] Cancel  [h] Clear Hold\n[s] Stop Worker  [r] Refresh  [o] Open Worker  [Esc/q] Close")
+            .style(Style::default().fg(Color::Gray)),
+        footer,
+    );
+}
+
+fn render_worker_list(
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+    dashboard: &PopupDashboard,
+    selection: &PopupSelection,
+) {
+    let attention = dashboard
+        .workers
+        .iter()
+        .filter(|worker| worker.attention_required())
+        .count();
+    let items = dashboard
+        .workers
+        .iter()
+        .map(|worker| {
+            ListItem::new(Line::from(vec![
+                Span::styled("● ", worker.status_style()),
+                Span::raw(format!("{:<20}", worker.id)),
+                Span::styled(worker.status_label(), worker.status_style()),
+                Span::raw(format!("  inbox {}", worker.unread_messages)),
+            ]))
+        })
+        .collect::<Vec<_>>();
+    let selected = selection.selected_worker.as_ref().and_then(|selected| {
+        dashboard
+            .workers
+            .iter()
+            .position(|worker| worker.id == *selected)
+    });
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(format!(
+            " Workers · {} attention ",
+            attention + usize::try_from(dashboard.supervisor_attention).unwrap_or(usize::MAX)
+        )))
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("› ");
+    let mut state = ratatui::widgets::ListState::default();
+    state.select(selected);
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn render_worker_detail(
+    frame: &mut Frame,
+    area: ratatui::layout::Rect,
+    worker: Option<&PopupWorkerView>,
+    stale_error: Option<&str>,
+    warning: Option<&str>,
+) {
+    let mut lines = detail_notice_lines(stale_error, warning);
+    match worker {
+        Some(worker) => lines.extend(worker_detail_lines(worker)),
+        None => lines.push(Line::from("No top-level Worker is available.")),
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Worker detail "),
+            )
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+fn detail_notice_lines<'a>(stale_error: Option<&str>, warning: Option<&str>) -> Vec<Line<'a>> {
+    let mut lines = Vec::new();
+    if let Some(error) = stale_error {
+        lines.push(Line::styled(
+            format!("Refresh error: {error}"),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    if let Some(warning) = warning {
+        lines.push(Line::styled(
+            format!("Action warning: {warning}"),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    lines
+}
+
+fn worker_detail_lines(worker: &PopupWorkerView) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(vec![
+            Span::raw("Worker  "),
+            Span::styled(
+                worker.id.to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(format!(
+            "Harness  {}{}{}",
+            worker.kind,
+            worker
+                .model
+                .as_deref()
+                .map_or_else(String::new, |model| format!(" · {model}")),
+            worker
+                .launch_profile
+                .as_deref()
+                .map_or_else(String::new, |profile| format!(" · {profile}")),
+        )),
+        Line::from(vec![
+            Span::raw("Status  "),
+            Span::styled(worker.status_label(), worker.status_style()),
+            Span::raw(format!(" · {}", worker.presence)),
+        ]),
+        Line::from(format!("Unread  {}", worker.unread_messages)),
+        Line::from(format!("Queued  {}", worker.queued_tasks.len())),
+    ];
+    if let Some(native_health) = &worker.native_health {
+        lines.push(Line::from(format!("Health  {native_health}")));
+    }
+    if let Some((summary, observed_at)) = &worker.last_activity {
+        lines.push(Line::from(format!(
+            "Activity  {summary} · observed {observed_at}"
+        )));
+    }
+    if let Some(context_percent) = &worker.context_percent {
+        let observed_at = worker
+            .context_observed_at
+            .as_deref()
+            .unwrap_or("observation time unavailable");
+        lines.push(Line::from(format!(
+            "Context  {context_percent}% · observed {observed_at}"
+        )));
+    }
+    lines.extend(worker_task_lines(worker));
+    lines
+}
+
+fn worker_task_lines(worker: &PopupWorkerView) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if let Some(task) = &worker.active_task {
+        lines.extend([
+            Line::from(""),
+            Line::styled("Active Task", Style::default().add_modifier(Modifier::BOLD)),
+            Line::from(format!(
+                "{} · {} · revision {}",
+                task.title,
+                task.task.state.as_str(),
+                task.task.result_revision
+            )),
+        ]);
+    }
+    if !worker.blockers.is_empty() {
+        lines.extend([
+            Line::from(""),
+            Line::from(format!("Blockers  {}", worker.blockers.join(" · "))),
+        ]);
+    }
+    if !worker.queued_tasks.is_empty() {
+        lines.extend([
+            Line::from(""),
+            Line::styled(
+                "Queued Tasks",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ]);
+        for task in &worker.queued_tasks {
+            let queue = task
+                .worker_queue_position
+                .map_or_else(|| "-".to_owned(), |position| position.to_string());
+            lines.push(Line::from(format!(
+                "{} · queue {queue} · {:?}",
+                task.title, task.scheduling_state
+            )));
+            let blockers = task_blockers(task);
+            if !blockers.is_empty() {
+                lines.push(Line::from(format!("  {}", blockers.join(" · "))));
+            }
+        }
+    }
+    for hold in &worker.holds {
+        lines.push(Line::styled(
+            format!("Worktree Hold  {} · {}", hold.task_id, hold.reason),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    lines
+}
+
+fn task_blockers(task: &TaskGraphView) -> Vec<String> {
+    let mut blockers = Vec::new();
+    if task.waiting_for_worker {
+        blockers.push("waiting Worker".to_owned());
+    }
+    if task.waiting_for_session {
+        blockers.push("waiting Session".to_owned());
+    }
+    if task.waiting_for_repository {
+        blockers.push("waiting repository".to_owned());
+    }
+    blockers.extend(
+        task.dependencies
+            .iter()
+            .filter(|dependency| dependency.satisfied_by_result_revision.is_none())
+            .map(|dependency| {
+                format!(
+                    "dependency {} {:?}",
+                    dependency.task_id, dependency.condition
+                )
+            }),
+    );
+    blockers
+}
+
+/// Renders one durable text snapshot for non-interactive callers.
 ///
 /// # Errors
 ///
 /// Returns an error when authentication, broker queries, or response decoding fails.
-#[expect(
-    clippy::too_many_lines,
-    reason = "popup rendering keeps the compact Supervisor projection together"
-)]
 pub async fn render_popup(socket: &Path, bearer: String) -> Result<String> {
     let capability = SessionCapability::from_bearer(bearer)?;
-    let status = broker_query(socket, capability.clone(), CoordinatorQuery::HarnessStatus).await?;
-    let tasks = broker_query(socket, capability.clone(), CoordinatorQuery::ListTasks).await?;
-    let graph = broker_query(socket, capability.clone(), CoordinatorQuery::TaskGraph).await?;
-    let inbox = broker_query(socket, capability.clone(), CoordinatorQuery::Inbox).await?;
-    let supervisor_events = broker_query(
+    let dashboard = query_popup_dashboard(socket, &capability).await?;
+    let mut output = String::from("Harness Network\n\nWorkers\n");
+    if let Some(supervisor_id) = &dashboard.supervisor_id {
+        let _ = writeln!(output, "Supervisor {supervisor_id}");
+    }
+    for worker in dashboard.workers {
+        let _ = writeln!(
+            output,
+            "{} · {} · {} · inbox {}",
+            worker.id,
+            worker.presence,
+            worker.status_label(),
+            worker.unread_messages
+        );
+    }
+    output.push_str("\nTasks\nScheduling\n");
+    Ok(output)
+}
+
+async fn query_popup_dashboard(
+    socket: &Path,
+    capability: &SessionCapability,
+) -> Result<PopupDashboard> {
+    let dashboard = broker_query(socket, capability.clone(), CoordinatorQuery::Dashboard).await?;
+    let QueryResult::Dashboard(dashboard) = dashboard else {
+        bail!("invalid dashboard response")
+    };
+    Ok(PopupDashboard::from_dashboard(dashboard))
+}
+
+async fn focus_popup_worker(
+    socket: &Path,
+    capability: &SessionCapability,
+    worker: &PopupWorkerView,
+) -> Result<()> {
+    let session_id = worker
+        .session_id
+        .context("selected Worker has no live Coordinator Session")?;
+    let terminal_id = worker
+        .terminal_id
+        .as_deref()
+        .context("selected Worker has no durable terminal identity")?;
+    let socket_path = std::env::var_os("HERDR_SOCKET_PATH")
+        .map(PathBuf::from)
+        .context("HERDR_SOCKET_PATH is unavailable for Worker focus")?;
+    let client = HerdrSocketClient::new(socket_path);
+    let snapshot = client
+        .snapshot()
+        .await
+        .context("reading Herdr pane snapshot")?;
+    let location = snapshot
+        .resolve_terminal(terminal_id)
+        .context("resolving selected Worker terminal")?;
+    broker_execute(
         socket,
         capability.clone(),
-        CoordinatorQuery::SupervisorEvents,
+        CoordinatorCommand::RecordPaneLocation {
+            session_id,
+            terminal_id: location.terminal_id.clone(),
+            pane_id: location.pane_id.clone(),
+        },
     )
-    .await?;
-    let holds = broker_query(socket, capability, CoordinatorQuery::ActiveHolds).await?;
-    let QueryResult::HarnessStatus(status) = status else {
-        bail!("invalid Harness status response")
-    };
-    let QueryResult::Tasks(tasks) = tasks else {
-        bail!("invalid Task list response")
-    };
-    let QueryResult::TaskGraph(graph) = graph else {
-        bail!("invalid Task graph response")
-    };
-    let QueryResult::Inbox(inbox) = inbox else {
-        bail!("invalid inbox response")
-    };
-    let QueryResult::Holds(holds) = holds else {
-        bail!("invalid Hold list response")
-    };
-    let QueryResult::SupervisorEvents(supervisor_events) = supervisor_events else {
-        bail!("invalid Supervisor event response")
-    };
-    let mut output = String::from("Harness Network\n\n");
-    for harness in status {
-        let _ = writeln!(
-            output,
-            "{} {} · {:?} · {} · inbox {}",
-            if harness.presence == "online" {
-                "●"
-            } else {
-                "○"
-            },
-            harness.id,
-            harness.tier,
-            harness.activity,
-            harness.unread_messages
-        );
-    }
-    output.push_str("\nTasks\n");
-    for task in tasks {
-        let _ = writeln!(
-            output,
-            "{} · {} · {:?} · revision {} · {:?}/{:?}",
-            task.id,
-            task.worker_id,
-            task.state,
-            task.result_revision,
-            task.task_role,
-            task.requested_session_policy,
-        );
-        if let Some(session_id) = task.harness_session_id {
-            let _ = writeln!(
-                output,
-                "  Session {} · {} · {}{}",
-                session_id,
-                if task.session_reused == Some(true) {
-                    "Reused"
-                } else {
-                    "Fresh"
-                },
-                task.session_decision_reason
-                    .as_deref()
-                    .unwrap_or("decision unavailable"),
-                task.context_percent
-                    .map_or_else(String::new, |percent| format!(" · context {percent}%")),
-            );
-        }
-    }
-    output.push_str("\nScheduling\n");
-    for entry in graph {
-        let execution = if entry.task.state == TaskState::Queued {
-            "Not started".to_owned()
-        } else {
-            format!("{:?}", entry.task.state)
-        };
-        let _ = writeln!(
-            output,
-            "{} · {:?} · {} · queue {}{}{}",
-            entry.task.id,
-            entry.scheduling_state,
-            execution,
-            entry
-                .worker_queue_position
-                .map_or_else(|| "-".to_owned(), |position| position.to_string()),
-            if entry.waiting_for_worker {
-                " · waiting Worker"
-            } else {
-                ""
-            },
-            if entry.waiting_for_repository {
-                " · waiting repository"
-            } else {
-                ""
-            },
-        );
-        if entry.waiting_for_session {
-            output.push_str("  waiting Session selection or rotation\n");
-        }
-        for dependency in entry.dependencies {
-            let status = dependency.satisfied_by_result_revision.map_or_else(
-                || "awaiting".to_owned(),
-                |revision| format!("Result revision {revision}"),
-            );
-            let _ = writeln!(
-                output,
-                "  {} · {:?} · {}",
-                dependency.task_id, dependency.condition, status
-            );
-        }
-        if !entry.dependents.is_empty() {
-            let _ = writeln!(
-                output,
-                "  dependents · {}",
-                entry
-                    .dependents
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
-    }
-    output.push_str("\nInbox\n");
-    for message in inbox {
-        let _ = writeln!(
-            output,
-            "{} · {} · {} · {}",
-            message.id,
-            message.sender_id,
-            message.kind,
-            message.delivery_state.as_deref().unwrap_or("pending")
-        );
-    }
-    output.push_str("\nSupervisor events\n");
-    for event in supervisor_events {
-        let _ = writeln!(
-            output,
-            "{} · {:?} · {:?} · {}",
-            event.id, event.kind, event.state, event.summary
-        );
-    }
-    if !holds.is_empty() {
-        output.push_str("\nWorktree Holds\n");
-        for hold in holds {
-            let _ = writeln!(
-                output,
-                "{} · {} · {}",
-                hold.task_id, hold.repository_key, hold.reason
-            );
-        }
-    }
-    Ok(output)
+    .await
+    .context("refreshing selected Worker pane location")?;
+    client
+        .focus(&location.pane_id)
+        .await
+        .context("focusing selected Worker pane")?;
+    client
+        .close_popup()
+        .await
+        .context("closing Harness Network popup")?;
+    Ok(())
+}
+
+async fn close_popup() -> Result<()> {
+    let socket_path = std::env::var_os("HERDR_SOCKET_PATH")
+        .map(PathBuf::from)
+        .context("HERDR_SOCKET_PATH is unavailable for popup close")?;
+    HerdrSocketClient::new(socket_path)
+        .close_popup()
+        .await
+        .context("closing Harness Network popup")
 }
 
 /// Runs the interactive Supervisor popup until Escape or `q` is pressed.
 ///
-/// The selected Task follows FIFO display order. Arrow keys change selection; `a` approves a
-/// reviewing Task after a fresh trusted Observation, `c` cancels it, `h` clears its Hold after a
-/// fresh reconciliation Observation, and `s` stops the first online Worker.
+/// The selection follows a durable Worker identity across refreshes. Arrow keys select Workers;
+/// `a` and `c` apply to the selected active Task, `h` applies to its first unresolved Hold,
+/// and `s` stops that selected Worker.
 ///
 /// # Errors
 ///
@@ -580,45 +1250,44 @@ pub async fn render_popup(socket: &Path, bearer: String) -> Result<String> {
 pub async fn run_popup(socket: &Path, bearer: String) -> Result<()> {
     let capability = SessionCapability::from_bearer(bearer.clone())?;
     let mut terminal = ratatui::init();
-    let result = run_popup_loop(&mut terminal, socket, &bearer, &capability).await;
+    let result = run_popup_loop(&mut terminal, socket, &capability).await;
     ratatui::restore();
     result
 }
 
 #[expect(
     clippy::too_many_lines,
-    reason = "the compact popup event loop keeps selection and authorized controls together"
+    reason = "the popup loop keeps refresh, stable Worker selection, and authorized controls together"
 )]
 async fn run_popup_loop(
     terminal: &mut ratatui::DefaultTerminal,
     socket: &Path,
-    bearer: &str,
     capability: &SessionCapability,
 ) -> Result<()> {
-    let mut selected = 0_usize;
+    let mut selection = PopupSelection::default();
+    let mut dashboard = None;
+    let mut stale_error;
+    let mut popup_warning = None;
     loop {
-        let tasks = broker_query(socket, capability.clone(), CoordinatorQuery::ListTasks).await?;
-        let QueryResult::Tasks(tasks) = tasks else {
-            bail!("invalid Task list response")
-        };
-        selected = selected.min(tasks.len().saturating_sub(1));
-        let mut content = render_popup(socket, bearer.to_owned()).await?;
-        let _ = writeln!(
-            content,
-            "\nSelected: {}\n[↑/↓] Select  [a] Approve  [c] Cancel  [h] Clear Hold  [s] Stop Worker  [Esc/q] Close",
-            tasks
-                .get(selected)
-                .map_or_else(|| "none".to_owned(), |task| task.id.to_string())
-        );
+        match query_popup_dashboard(socket, capability).await {
+            Ok(next) => {
+                selection.retain_worker(&next);
+                dashboard = Some(next);
+                stale_error = None;
+            }
+            Err(error) => stale_error = Some(format!("{error:#}")),
+        }
         terminal.draw(|frame| {
-            frame.render_widget(
-                Paragraph::new(content)
-                    .block(Block::default().borders(Borders::ALL).title(" Herdr "))
-                    .wrap(Wrap { trim: false }),
-                frame.area(),
+            let fallback = PopupDashboard::default();
+            draw_popup_dashboard(
+                frame,
+                dashboard.as_ref().unwrap_or(&fallback),
+                &selection,
+                stale_error.as_deref(),
+                popup_warning.as_deref(),
             );
         })?;
-        if !event::poll(Duration::from_millis(500))? {
+        if !event::poll(Duration::from_secs(1))? {
             continue;
         }
         let Event::Key(key) = event::read()? else {
@@ -628,26 +1297,62 @@ async fn run_popup_loop(
             continue;
         }
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
-            KeyCode::Up => selected = selected.saturating_sub(1),
-            KeyCode::Down => selected = (selected + 1).min(tasks.len().saturating_sub(1)),
+            KeyCode::Esc | KeyCode::Char('q') => {
+                close_popup().await?;
+                return Ok(());
+            }
+            KeyCode::Up => {
+                if let Some(dashboard) = &dashboard {
+                    selection.select_previous(dashboard);
+                }
+            }
+            KeyCode::Down => {
+                if let Some(dashboard) = &dashboard {
+                    selection.select_next(dashboard);
+                }
+            }
+            KeyCode::Enter | KeyCode::Right => selection.narrow_mode = PopupNarrowMode::Detail,
+            KeyCode::Left => selection.narrow_mode = PopupNarrowMode::List,
+            KeyCode::Char('r') => popup_warning = None,
+            KeyCode::Char('o') => {
+                let Some(worker) = dashboard
+                    .as_ref()
+                    .and_then(|dashboard| dashboard.selected(&selection))
+                else {
+                    continue;
+                };
+                match focus_popup_worker(socket, capability, worker).await {
+                    Ok(()) => return Ok(()),
+                    Err(error) => {
+                        popup_warning = Some(format!("Unable to focus Worker: {error:#}"));
+                    }
+                }
+            }
             KeyCode::Char('c') => {
-                if let Some(task) = tasks.get(selected) {
+                if let Some(task) = dashboard
+                    .as_ref()
+                    .and_then(|dashboard| selection.selected_task(dashboard))
+                {
                     broker_execute(
                         socket,
                         capability.clone(),
-                        CoordinatorCommand::CancelTask { task_id: task.id },
+                        CoordinatorCommand::CancelTask {
+                            task_id: task.task.id,
+                        },
                     )
                     .await?;
                 }
             }
             KeyCode::Char('a') => {
-                if let Some(task) = tasks.get(selected) {
+                if let Some(task) = dashboard
+                    .as_ref()
+                    .and_then(|dashboard| selection.selected_task(dashboard))
+                {
                     let captured = broker_execute(
                         socket,
                         capability.clone(),
                         CoordinatorCommand::CaptureRepositoryObservation {
-                            task_id: task.id,
+                            task_id: task.task.id,
                             checkpoint: crate::contract::ObservationCheckpoint::Approval,
                         },
                     )
@@ -659,8 +1364,8 @@ async fn run_popup_loop(
                         socket,
                         capability.clone(),
                         CoordinatorCommand::ApproveTask {
-                            task_id: task.id,
-                            result_revision: task.result_revision,
+                            task_id: task.task.id,
+                            result_revision: task.task.result_revision,
                             observation_digest: digest,
                         },
                     )
@@ -668,12 +1373,15 @@ async fn run_popup_loop(
                 }
             }
             KeyCode::Char('h') => {
-                if let Some(task) = tasks.get(selected) {
+                if let Some(task_id) = dashboard
+                    .as_ref()
+                    .and_then(|dashboard| selection.selected_hold_task_id(dashboard))
+                {
                     let captured = broker_execute(
                         socket,
                         capability.clone(),
                         CoordinatorCommand::CaptureRepositoryObservation {
-                            task_id: task.id,
+                            task_id,
                             checkpoint: crate::contract::ObservationCheckpoint::HoldClear,
                         },
                     )
@@ -685,7 +1393,7 @@ async fn run_popup_loop(
                         socket,
                         capability.clone(),
                         CoordinatorCommand::ClearWorktreeHold {
-                            task_id: task.id,
+                            task_id,
                             observation_digest: digest,
                             audit_note: "Supervisor reconciled the repository from the popup."
                                 .to_owned(),
@@ -695,22 +1403,13 @@ async fn run_popup_loop(
                 }
             }
             KeyCode::Char('s') => {
-                let status =
-                    broker_query(socket, capability.clone(), CoordinatorQuery::HarnessStatus)
-                        .await?;
-                let QueryResult::HarnessStatus(status) = status else {
-                    bail!("invalid Harness status response")
-                };
-                if let Some(worker) = status.into_iter().find(|harness| {
-                    harness.tier == crate::contract::HarnessTier::Worker
-                        && harness.presence == "online"
+                if let Some(worker_id) = dashboard.as_ref().and_then(|dashboard| {
+                    selection.selected_stoppable_worker_id(dashboard).cloned()
                 }) {
                     broker_execute(
                         socket,
                         capability.clone(),
-                        CoordinatorCommand::StopWorker {
-                            worker_id: worker.id,
-                        },
+                        CoordinatorCommand::StopWorker { worker_id },
                     )
                     .await?;
                 }
@@ -852,7 +1551,7 @@ where
     let response = call_with_connect_retry(
         socket,
         &BrokerRequest {
-            schema_version: SCHEMA_VERSION,
+            schema_version: BROKER_SCHEMA_V2,
             request_id: uuid::Uuid::now_v7().to_string(),
             operation: BrokerOperation::Query {
                 actor: capability.into(),
@@ -876,7 +1575,7 @@ where
     let response = call_with_connect_retry(
         socket,
         &BrokerRequest {
-            schema_version: SCHEMA_VERSION,
+            schema_version: BROKER_SCHEMA_V2,
             request_id: uuid::Uuid::now_v7().to_string(),
             operation: BrokerOperation::Execute {
                 actor: capability.into(),

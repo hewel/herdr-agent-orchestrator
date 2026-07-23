@@ -287,9 +287,17 @@ Explicit Task Attachments and dependency Result snapshots are resolved separatel
 
 `harness_task_graph` is a Supervisor-only read query. For each Task it reports scheduling and execution state, dependency conditions and failure policies, satisfied Result revisions, direct dependents, Worker queue position, and whether Worker capacity or repository admission is the current wait. It does not expose database mutation or permit dependency editing.
 
+## Dashboard and pane locations
+
+`Dashboard` is a Supervisor-only transactional read query. One result contains the live Supervisor summary and every top-level Worker with its Harness Kind and model, latest live Session health and context observation, latest normalized Host activity, active and queued Task graph rows, unread count, unresolved Holds, relevant Supervisor Events, and durable terminal and pane identities. It never exposes provider-native child agents or derives state from terminal text.
+
+The local broker envelope preserves operation set v1 unchanged. `Dashboard` and `RecordPaneLocation` require broker `schema_version = 2`; a v1 request for either returns `unsupported_version`, while all original v1 operations and response shapes remain available. Dashboard read-model objects carry their own closed `schema_version = 1`, independent from the broker envelope and the public Task/message/Result schemas. Task titles live only in the Dashboard Task projection, so the existing v1 `TaskView` is unchanged.
+
+`RecordPaneLocation` binds a live Coordinator Session to the terminal and pane identities returned or resolved by Herdr. A Worker Host may update only its own Session. The Supervisor may update any Coordinator-managed live Session. Empty identities, duplicate live terminal bindings, ended Sessions, and Worker attempts to update another Session are rejected. Repeating an identical assignment is a convergent no-op, including its `last_seen_at` evidence. Pane-location recording is presentation evidence and does not change Task delivery, repository authority, or native acceptance state.
+
 ## Command idempotency
 
-Every mutating command may carry `request_key`. The Coordinator persists:
+Every caller-intent mutation that can create a second durable effect may carry `request_key`. Host evidence commands instead use generation fencing, monotonic sequences, or convergent assignments. For request-keyed commands, the Coordinator persists:
 
 ```text
 actor Harness ID + command kind + request key

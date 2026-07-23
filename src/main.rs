@@ -506,10 +506,20 @@ async fn activate_workspace(
             std::env::current_exe()?.to_string_lossy().into_owned(),
         );
         pane.env.extend(supervisor_environment);
-        HerdrSocketClient::new(identity.session_socket().to_path_buf())
+        let opened = HerdrSocketClient::new(identity.session_socket().to_path_buf())
             .open_worker(pane)
             .await
             .context("opening managed Supervisor pane")?;
+        if let Err(error) = record_supervisor_pane_location(
+            &coordinator,
+            &capability,
+            &opened.pane.terminal_id,
+            &opened.pane.pane_id,
+        )
+        .await
+        {
+            tracing::warn!(%error, "managed Supervisor opened but pane location was not recorded");
+        }
         wait_for_path(&supervisor_pid, Duration::from_secs(10)).await?;
     }
     let server = McpServer::for_workspace(socket, capability.clone(), view.state_dir.clone())
@@ -979,11 +989,56 @@ async fn reopen_disconnected_supervisor(
         std::env::current_exe()?.to_string_lossy().into_owned(),
     );
     pane.env.extend(runtime.environment);
-    HerdrSocketClient::new(runtime.session_socket)
+    let opened = HerdrSocketClient::new(runtime.session_socket)
         .open_worker(pane)
         .await
         .context("reopening managed Supervisor pane after presence expiry")?;
+    if let Err(error) = coordinator
+        .execute(
+            ActorContext::Session { capability },
+            CoordinatorCommand::RecordPaneLocation {
+                session_id: session.session_id,
+                terminal_id: opened.pane.terminal_id,
+                pane_id: opened.pane.pane_id,
+            },
+        )
+        .await
+    {
+        tracing::warn!(%error, "managed Supervisor reopened but pane location was not recorded");
+    }
     Ok(true)
+}
+
+async fn record_supervisor_pane_location(
+    coordinator: &Coordinator,
+    capability: &SessionCapability,
+    terminal_id: &str,
+    pane_id: &str,
+) -> Result<()> {
+    let QueryResult::Session(session) = coordinator
+        .query(
+            ActorContext::Session {
+                capability: capability.clone(),
+            },
+            CoordinatorQuery::SessionSelf,
+        )
+        .await?
+    else {
+        bail!("Coordinator returned the wrong Supervisor Session projection")
+    };
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: capability.clone(),
+            },
+            CoordinatorCommand::RecordPaneLocation {
+                session_id: session.session_id,
+                terminal_id: terminal_id.to_owned(),
+                pane_id: pane_id.to_owned(),
+            },
+        )
+        .await?;
+    Ok(())
 }
 
 async fn run_call(socket: PathBuf) -> Result<()> {

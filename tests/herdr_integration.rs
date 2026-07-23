@@ -5,7 +5,10 @@ use herdr_harness_coordinator::herdr::{
     PluginPaneOpenParams, SessionSnapshot,
 };
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, duplex, split};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, duplex, split},
+    net::UnixListener,
+};
 
 #[test]
 fn resolves_a_current_pane_location_by_stable_terminal_identity() {
@@ -150,6 +153,178 @@ async fn socket_client_sends_jsonl_requests_without_touching_the_live_session() 
 
     let snapshot = HerdrSocketClient::snapshot_over(client).await.unwrap();
     assert_eq!(snapshot.protocol, HERDR_PROTOCOL);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn focus_terminal_resolves_the_current_pane_before_focusing() {
+    let state = tempfile::tempdir().unwrap();
+    let socket = state.path().join("herdr.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(async move {
+        for request_number in 0..2 {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = split(stream);
+            let mut line = String::new();
+            BufReader::new(reader).read_line(&mut line).await.unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            let id = request["id"].as_str().unwrap();
+            let result = if request_number == 0 {
+                assert_eq!(request["method"], "session.snapshot");
+                json!({
+                    "type": "session_snapshot",
+                    "snapshot": {
+                        "version": HERDR_VERSION,
+                        "protocol": HERDR_PROTOCOL,
+                        "panes": [pane("9-4", "terminal-worker", "2", "2:3")]
+                    }
+                })
+            } else {
+                assert_eq!(request["method"], "plugin.pane.focus");
+                assert_eq!(request["params"]["pane_id"], "9-4");
+                json!({
+                    "type": "plugin_pane_focused",
+                    "plugin_pane": {
+                        "plugin_id": "herdr-harness-coordinator",
+                        "entrypoint": "worker",
+                        "pane": pane("9-4", "terminal-worker", "2", "2:3")
+                    }
+                })
+            };
+            writer
+                .write_all(format!("{}\n", json!({"id": id, "result": result})).as_bytes())
+                .await
+                .unwrap();
+        }
+    });
+
+    let focused = HerdrSocketClient::new(socket)
+        .focus_terminal("terminal-worker")
+        .await
+        .unwrap();
+
+    assert_eq!(focused.pane.pane_id, "9-4");
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn worker_open_restores_a_previously_focused_managed_supervisor() {
+    let state = tempfile::tempdir().unwrap();
+    let socket = state.path().join("herdr.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(async move {
+        for request_number in 0..4 {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = split(stream);
+            let mut line = String::new();
+            BufReader::new(reader).read_line(&mut line).await.unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            let id = request["id"].as_str().unwrap();
+            let result = match request_number {
+                0 => {
+                    assert_eq!(request["method"], "session.snapshot");
+                    let mut supervisor = pane("1-1", "terminal-supervisor", "1", "1:1");
+                    supervisor.focused = true;
+                    json!({"type":"session_snapshot","snapshot":{"version":HERDR_VERSION,"protocol":HERDR_PROTOCOL,"panes":[supervisor]}})
+                }
+                1 => {
+                    assert_eq!(request["method"], "plugin.pane.open");
+                    assert_eq!(request["params"]["focus"], false);
+                    json!({"type":"plugin_pane_opened","plugin_pane":{"plugin_id":"herdr-harness-coordinator","entrypoint":"worker","pane":pane("2-1", "terminal-worker", "1", "1:2")}})
+                }
+                2 => {
+                    assert_eq!(request["method"], "session.snapshot");
+                    let supervisor = pane("1-9", "terminal-supervisor", "1", "1:1");
+                    let mut worker = pane("2-1", "terminal-worker", "1", "1:2");
+                    worker.focused = true;
+                    json!({"type":"session_snapshot","snapshot":{"version":HERDR_VERSION,"protocol":HERDR_PROTOCOL,"panes":[supervisor,worker]}})
+                }
+                _ => {
+                    assert_eq!(request["method"], "plugin.pane.focus");
+                    assert_eq!(request["params"]["pane_id"], "1-9");
+                    let mut supervisor = pane("1-9", "terminal-supervisor", "1", "1:1");
+                    supervisor.focused = true;
+                    json!({"type":"plugin_pane_focused","plugin_pane":{"plugin_id":"herdr-harness-coordinator","entrypoint":"supervisor","pane":supervisor}})
+                }
+            };
+            writer
+                .write_all(format!("{}\n", json!({"id": id, "result": result})).as_bytes())
+                .await
+                .unwrap();
+        }
+    });
+    let params = PluginPaneOpenParams::worker(
+        "session-capability-1",
+        &PathBuf::from("/repo"),
+        Some("1".to_owned()),
+    );
+
+    let opened = HerdrSocketClient::new(socket)
+        .open_worker_preserving_focus(params, Some("terminal-supervisor"))
+        .await
+        .unwrap();
+
+    assert!(opened.focus_restored);
+    assert!(opened.warnings.is_empty());
+    assert_eq!(opened.plugin_pane.pane.terminal_id, "terminal-worker");
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn focus_restoration_failure_does_not_fail_an_already_opened_worker() {
+    let state = tempfile::tempdir().unwrap();
+    let socket = state.path().join("herdr.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(async move {
+        for request_number in 0..4 {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = split(stream);
+            let mut line = String::new();
+            BufReader::new(reader).read_line(&mut line).await.unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            let id = request["id"].as_str().unwrap();
+            let response = match request_number {
+                0 => {
+                    let mut supervisor = pane("1-1", "terminal-supervisor", "1", "1:1");
+                    supervisor.focused = true;
+                    json!({"id":id,"result":{"type":"session_snapshot","snapshot":{"version":HERDR_VERSION,"protocol":HERDR_PROTOCOL,"panes":[supervisor]}}})
+                }
+                1 => {
+                    json!({"id":id,"result":{"type":"plugin_pane_opened","plugin_pane":{"plugin_id":"herdr-harness-coordinator","entrypoint":"worker","pane":pane("2-1", "terminal-worker", "1", "1:2")}}})
+                }
+                2 => {
+                    let supervisor = pane("1-9", "terminal-supervisor", "1", "1:1");
+                    let mut worker = pane("2-1", "terminal-worker", "1", "1:2");
+                    worker.focused = true;
+                    json!({"id":id,"result":{"type":"session_snapshot","snapshot":{"version":HERDR_VERSION,"protocol":HERDR_PROTOCOL,"panes":[supervisor,worker]}}})
+                }
+                _ => json!({"id":id,"error":{"code":"focus_failed","message":"focus unavailable"}}),
+            };
+            writer
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+    });
+    let params = PluginPaneOpenParams::worker(
+        "session-capability-1",
+        &PathBuf::from("/repo"),
+        Some("1".to_owned()),
+    );
+
+    let opened = HerdrSocketClient::new(socket)
+        .open_worker_preserving_focus(params, Some("terminal-supervisor"))
+        .await
+        .expect("focus failure must not hide the opened Worker");
+
+    assert_eq!(
+        (
+            opened.plugin_pane.pane.terminal_id.as_str(),
+            opened.focus_restored,
+            opened.warnings.len(),
+        ),
+        ("terminal-worker", false, 1)
+    );
     server.await.unwrap();
 }
 

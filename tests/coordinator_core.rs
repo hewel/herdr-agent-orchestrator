@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use herdr_harness_coordinator::{
-    adapter::{AdapterCapabilities, AdapterLifecycle, AdapterSnapshot},
+    adapter::{AdapterCapabilities, AdapterEvent, AdapterLifecycle, AdapterSnapshot},
     contract::{
         AttachmentId, DeliveryIntent, DependencyCondition, DependencyFailurePolicy,
         HarnessDefinitionV1, HarnessId, HarnessKind, HarnessTier, MessageKind, MessageSubmissionV1,
@@ -12,8 +12,9 @@ use herdr_harness_coordinator::{
     },
     core::{
         ActorContext, CommandOutcome, Coordinator, CoordinatorCommand, CoordinatorQuery,
-        DeliveryUnknownResolution, ErrorCategory, HarnessCompatibilityEvidenceV1, QueryResult,
-        SessionCapability, TaskSchedulingState, TaskState,
+        DASHBOARD_SCHEMA_VERSION, DeliveryUnknownResolution, ErrorCategory,
+        HarnessCompatibilityEvidenceV1, QueryResult, SessionCapability, TaskSchedulingState,
+        TaskState,
     },
 };
 use sha2::{Digest, Sha256};
@@ -114,6 +115,405 @@ async fn supervisor_registration_makes_the_harness_queryable() {
             .expect("Supervisor disconnection must persist"),
         CommandOutcome::SupervisorDisconnected
     ));
+}
+
+#[tokio::test]
+async fn dashboard_projects_the_queued_task_title_for_each_worker() {
+    let (_state, coordinator, supervisor, _worker, _task_id) = seeded_task().await;
+
+    let QueryResult::Dashboard(dashboard) = coordinator
+        .query(
+            ActorContext::Session {
+                capability: supervisor,
+            },
+            CoordinatorQuery::Dashboard,
+        )
+        .await
+        .expect("Supervisor must inspect the aggregate dashboard")
+    else {
+        panic!("dashboard query returned the wrong projection")
+    };
+    let worker = dashboard
+        .workers
+        .iter()
+        .find(|worker| worker.id.as_str() == "omp-worker")
+        .expect("Worker must appear in the dashboard");
+
+    assert_eq!(
+        (
+            dashboard.schema_version,
+            worker.schema_version,
+            worker.queued_tasks[0].schema_version,
+            worker.queued_tasks[0].title.as_str(),
+        ),
+        (
+            DASHBOARD_SCHEMA_VERSION,
+            DASHBOARD_SCHEMA_VERSION,
+            DASHBOARD_SCHEMA_VERSION,
+            "Lifecycle proof",
+        )
+    );
+
+    let mut serialized = serde_json::to_value(&dashboard).expect("Dashboard must serialize");
+    serialized
+        .as_object_mut()
+        .expect("Dashboard must serialize as an object")
+        .insert("future_field".to_owned(), serde_json::json!(true));
+    assert!(
+        serde_json::from_value::<herdr_harness_coordinator::core::DashboardView>(serialized)
+            .is_err(),
+        "Dashboard v1 must reject unknown fields"
+    );
+}
+
+#[tokio::test]
+async fn worker_records_its_own_durable_pane_location() {
+    let (_state, coordinator, supervisor, worker, _task_id) = seeded_task().await;
+    let QueryResult::Session(worker_session) = coordinator
+        .query(
+            ActorContext::Session {
+                capability: worker.clone(),
+            },
+            CoordinatorQuery::SessionSelf,
+        )
+        .await
+        .expect("Worker must inspect its own Session")
+    else {
+        panic!("Session query returned the wrong projection")
+    };
+    let CommandOutcome::HostConnectionBound {
+        capability: host, ..
+    } = coordinator
+        .execute(
+            ActorContext::Session { capability: worker },
+            CoordinatorCommand::BindHostConnection {
+                instance_id: "pane-location-test".to_owned(),
+                lease_seconds: 15,
+            },
+        )
+        .await
+        .expect("Worker Host connection must bind")
+    else {
+        panic!("Host bind returned the wrong outcome")
+    };
+
+    let assignment = CoordinatorCommand::RecordPaneLocation {
+        session_id: worker_session.session_id,
+        terminal_id: "terminal-worker".to_owned(),
+        pane_id: "2-3".to_owned(),
+    };
+    coordinator
+        .execute(
+            ActorContext::Host {
+                capability: host.clone(),
+            },
+            assignment.clone(),
+        )
+        .await
+        .expect("initial pane assignment must persist");
+    let QueryResult::Dashboard(first_dashboard) = coordinator
+        .query(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorQuery::Dashboard,
+        )
+        .await
+        .expect("Supervisor must inspect the initial pane assignment")
+    else {
+        panic!("dashboard query returned the wrong projection")
+    };
+    let first_seen = first_dashboard.workers[0]
+        .session
+        .as_ref()
+        .expect("Worker Session")
+        .last_seen_at
+        .clone();
+    coordinator
+        .execute(ActorContext::Host { capability: host }, assignment)
+        .await
+        .expect("repeating the same pane assignment must be idempotent");
+    let QueryResult::Dashboard(dashboard) = coordinator
+        .query(
+            ActorContext::Session {
+                capability: supervisor,
+            },
+            CoordinatorQuery::Dashboard,
+        )
+        .await
+        .expect("Supervisor must inspect the aggregate dashboard")
+    else {
+        panic!("dashboard query returned the wrong projection")
+    };
+
+    assert_eq!(
+        dashboard.workers[0]
+            .session
+            .as_ref()
+            .map(|session| (session.terminal_id.as_deref(), session.pane_id.as_deref())),
+        Some((Some("terminal-worker"), Some("2-3")))
+    );
+    assert_eq!(
+        dashboard.workers[0]
+            .session
+            .as_ref()
+            .expect("Worker Session")
+            .last_seen_at,
+        first_seen,
+        "an identical assignment must not mutate presence evidence"
+    );
+}
+
+#[tokio::test]
+async fn worker_host_cannot_record_another_sessions_pane_location() {
+    let (_state, coordinator, supervisor, worker, _task_id) = seeded_task().await;
+    let QueryResult::Dashboard(dashboard) = coordinator
+        .query(
+            ActorContext::Session {
+                capability: supervisor,
+            },
+            CoordinatorQuery::Dashboard,
+        )
+        .await
+        .expect("Supervisor must inspect the aggregate dashboard")
+    else {
+        panic!("dashboard query returned the wrong projection")
+    };
+    let CommandOutcome::HostConnectionBound {
+        capability: host, ..
+    } = coordinator
+        .execute(
+            ActorContext::Session { capability: worker },
+            CoordinatorCommand::BindHostConnection {
+                instance_id: "pane-location-forbidden-test".to_owned(),
+                lease_seconds: 15,
+            },
+        )
+        .await
+        .expect("Worker Host connection must bind")
+    else {
+        panic!("Host bind returned the wrong outcome")
+    };
+
+    let error = coordinator
+        .execute(
+            ActorContext::Host { capability: host },
+            CoordinatorCommand::RecordPaneLocation {
+                session_id: dashboard.supervisor.session_id,
+                terminal_id: "terminal-supervisor".to_owned(),
+                pane_id: "1-1".to_owned(),
+            },
+        )
+        .await
+        .expect_err("Worker Host must not record another Session location");
+
+    assert_eq!(error.category, ErrorCategory::Forbidden);
+}
+
+#[tokio::test]
+async fn dashboard_projects_worker_model_context_health_and_latest_activity() {
+    let (_state, coordinator, supervisor, worker, _task_id) =
+        seeded_task_with_host_model(Some("provider-model-alias")).await;
+    coordinator
+        .execute(
+            ActorContext::Session {
+                capability: worker.clone(),
+            },
+            CoordinatorCommand::RecordAdapterSnapshot {
+                snapshot: AdapterSnapshot {
+                    lifecycle: AdapterLifecycle::Idle,
+                    session_id: Some("native-omp".to_owned()),
+                    thread_id: None,
+                    active_turn_id: None,
+                    steerable: false,
+                    queued_input_count: Some(0),
+                    model: Some("provider-model-alias".to_owned()),
+                    native_health: NativeSessionHealth::Compacted,
+                    context_tokens: Some(64_000),
+                    context_window: Some(128_000),
+                    context_percent: Some(50.0),
+                    compaction_count: Some(1),
+                },
+            },
+        )
+        .await
+        .expect("Adapter snapshot must persist");
+    coordinator
+        .execute(
+            ActorContext::Session { capability: worker },
+            CoordinatorCommand::RecordHostEvent {
+                sequence: 1,
+                event: serde_json::to_value(AdapterEvent::Activity {
+                    summary: "running focused verification".to_owned(),
+                })
+                .expect("Adapter event must serialize"),
+            },
+        )
+        .await
+        .expect("normalized activity must persist");
+
+    let QueryResult::Dashboard(dashboard) = coordinator
+        .query(
+            ActorContext::Session {
+                capability: supervisor,
+            },
+            CoordinatorQuery::Dashboard,
+        )
+        .await
+        .expect("Supervisor must inspect the aggregate dashboard")
+    else {
+        panic!("dashboard query returned the wrong projection")
+    };
+    let worker = &dashboard.workers[0];
+    let session = worker
+        .session
+        .as_ref()
+        .expect("Worker Session must be live");
+
+    assert_eq!(
+        (
+            worker.model.as_deref(),
+            session.native_health,
+            session.context_tokens,
+            session.context_window,
+            session.context_percent.as_deref(),
+            session.compaction_count,
+            session
+                .last_activity
+                .as_ref()
+                .map(|activity| activity.summary.as_str()),
+            session.context_observed_at.is_some(),
+        ),
+        (
+            Some("provider-model-alias"),
+            NativeSessionHealth::Compacted,
+            Some(64_000),
+            Some(128_000),
+            Some("50"),
+            Some(1),
+            Some("running focused verification"),
+            true,
+        )
+    );
+}
+
+#[tokio::test]
+async fn malformed_activity_is_rejected_without_breaking_the_dashboard() {
+    let (_state, coordinator, supervisor, worker, _task_id) = seeded_task().await;
+
+    let error = coordinator
+        .execute(
+            ActorContext::Session { capability: worker },
+            CoordinatorCommand::RecordHostEvent {
+                sequence: 1,
+                event: serde_json::json!({
+                    "kind": "activity",
+                    "value": { "summary": 7 }
+                }),
+            },
+        )
+        .await
+        .expect_err("non-text activity summaries must be rejected at admission");
+    assert_eq!(error.category, ErrorCategory::InvalidInput);
+
+    let QueryResult::Dashboard(dashboard) = coordinator
+        .query(
+            ActorContext::Session {
+                capability: supervisor,
+            },
+            CoordinatorQuery::Dashboard,
+        )
+        .await
+        .expect("a rejected activity event must not poison the Dashboard query")
+    else {
+        panic!("dashboard query returned the wrong projection")
+    };
+    assert!(
+        dashboard.workers[0]
+            .session
+            .as_ref()
+            .expect("Worker Session must remain live")
+            .last_activity
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn dashboard_groups_active_and_capacity_blocked_queued_tasks_by_worker() {
+    let (state, coordinator, supervisor, worker, active_task_id) = seeded_task().await;
+    assert!(matches!(
+        coordinator
+            .execute(
+                ActorContext::Session { capability: worker },
+                CoordinatorCommand::ClaimNextTask,
+            )
+            .await
+            .expect("Worker must claim the FIFO head"),
+        CommandOutcome::TaskDispatching { task_id, .. } if task_id == active_task_id
+    ));
+    let CommandOutcome::TaskCreated {
+        task_id: queued_task_id,
+        ..
+    } = coordinator
+        .execute(
+            ActorContext::Session {
+                capability: supervisor.clone(),
+            },
+            CoordinatorCommand::CreateTask {
+                submission: TaskSubmissionV1 {
+                    schema_version: SCHEMA_VERSION,
+                    request_key: None,
+                    worker_id: "omp-worker".parse().expect("Worker ID must be valid"),
+                    related_task_id: None,
+                    depends_on: Vec::new(),
+                    task_role: TaskRole::Investigation,
+                    session_reuse: SessionReusePolicy::Fresh,
+                    preferred_session_id: None,
+                    title: "Queued investigation".to_owned(),
+                    instructions: "Wait for Worker capacity.".to_owned(),
+                    attachments: Vec::new(),
+                    repository: TaskRepositoryAuthorityV1 {
+                        root: state.path().join("project"),
+                        access: RepositoryAccess::ReadOnly,
+                        write_scopes: Vec::new(),
+                    },
+                },
+            },
+        )
+        .await
+        .expect("second Task must queue")
+    else {
+        panic!("Task creation returned the wrong outcome")
+    };
+
+    let QueryResult::Dashboard(dashboard) = coordinator
+        .query(
+            ActorContext::Session {
+                capability: supervisor,
+            },
+            CoordinatorQuery::Dashboard,
+        )
+        .await
+        .expect("Supervisor must inspect the aggregate dashboard")
+    else {
+        panic!("dashboard query returned the wrong projection")
+    };
+    let worker = &dashboard.workers[0];
+
+    assert_eq!(
+        (
+            worker.active_task.as_ref().map(|entry| entry.task.id),
+            worker.queued_tasks[0].task.id,
+            worker.queued_tasks[0].title.as_str(),
+            worker.queued_tasks[0].waiting_for_worker,
+        ),
+        (
+            Some(active_task_id),
+            queued_task_id,
+            "Queued investigation",
+            true,
+        )
+    );
 }
 
 #[tokio::test]
@@ -761,7 +1161,7 @@ async fn worker_host_failure_records_repository_evidence_and_a_hold() {
     let QueryResult::Holds(holds) = coordinator
         .query(
             ActorContext::Session {
-                capability: supervisor,
+                capability: supervisor.clone(),
             },
             CoordinatorQuery::ActiveHolds,
         )
@@ -772,6 +1172,28 @@ async fn worker_host_failure_records_repository_evidence_and_a_hold() {
     };
     assert_eq!(holds.len(), 1);
     assert_eq!(holds[0].task_id, task_id);
+    let QueryResult::Dashboard(dashboard) = coordinator
+        .query(
+            ActorContext::Session {
+                capability: supervisor,
+            },
+            CoordinatorQuery::Dashboard,
+        )
+        .await
+        .expect("Dashboard query must expose the failed Worker's attention state")
+    else {
+        panic!("Dashboard query returned the wrong projection")
+    };
+    assert_eq!(
+        (
+            dashboard.workers[0].holds[0].task_id,
+            dashboard.workers[0]
+                .attention_events
+                .iter()
+                .any(|event| event.kind == SupervisorEventKind::WorktreeHoldCreated),
+        ),
+        (task_id, true)
+    );
 }
 
 #[tokio::test]
@@ -2067,7 +2489,10 @@ async fn fresh_related_task_uses_the_new_live_session_when_the_related_session_e
 #[tokio::test]
 async fn host_events_replay_idempotently_and_supervisor_can_stop_an_idle_worker() {
     let (_state, coordinator, supervisor, worker, _task_id) = seeded_task().await;
-    let event = serde_json::json!({"kind":"activity","summary":"started"});
+    let event = serde_json::to_value(AdapterEvent::Activity {
+        summary: "started".to_owned(),
+    })
+    .expect("Adapter event must serialize");
     coordinator
         .execute(
             ActorContext::Session {

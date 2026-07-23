@@ -1,7 +1,10 @@
 use std::{path::PathBuf, sync::Arc};
 
 use herdr_harness_coordinator::{
-    broker::{BrokerOperation, BrokerRequest, BrokerServer, call, call_with_connect_retry},
+    broker::{
+        BROKER_SCHEMA_V1, BROKER_SCHEMA_V2, BrokerOperation, BrokerRequest, BrokerServer, call,
+        call_with_connect_retry,
+    },
     contract::{HarnessDefinitionV1, HarnessId, HarnessKind, HarnessTier, SCHEMA_VERSION},
     core::{
         ActorContext, CommandOutcome, Coordinator, CoordinatorCommand, CoordinatorQuery,
@@ -14,7 +17,7 @@ async fn broker_retries_only_prewrite_connect_failures_during_handoff() {
     let state = tempfile::tempdir().expect("state directory");
     let socket = state.path().join("delayed.sock");
     let request = BrokerRequest {
-        schema_version: SCHEMA_VERSION,
+        schema_version: BROKER_SCHEMA_V1,
         request_id: "handoff-connect".to_owned(),
         operation: BrokerOperation::Query {
             actor: ActorContext::Bootstrap,
@@ -50,6 +53,10 @@ async fn broker_retries_only_prewrite_connect_failures_during_handoff() {
 }
 
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one socket lifetime proves old operations, v1 rejection, and v2 execution together"
+)]
 async fn unix_jsonl_broker_round_trips_capability_authenticated_core_calls() {
     let state = tempfile::tempdir().expect("state directory must exist");
     let coordinator = Arc::new(
@@ -66,7 +73,7 @@ async fn unix_jsonl_broker_round_trips_capability_authenticated_core_calls() {
     let registration = call(
         &socket,
         &BrokerRequest {
-            schema_version: SCHEMA_VERSION,
+            schema_version: BROKER_SCHEMA_V1,
             request_id: "register-1".to_owned(),
             operation: BrokerOperation::Execute {
                 actor: ActorContext::Bootstrap,
@@ -89,17 +96,23 @@ async fn unix_jsonl_broker_round_trips_capability_authenticated_core_calls() {
     assert!(registration.error.is_none());
     let outcome: CommandOutcome = serde_json::from_value(registration.result.expect("result"))
         .expect("command result must retain its type");
-    let CommandOutcome::SupervisorRegistered { capability, .. } = outcome else {
+    let CommandOutcome::SupervisorRegistered {
+        session_id,
+        capability,
+    } = outcome
+    else {
         panic!("registration must return a capability")
     };
 
     let listing = call(
         &socket,
         &BrokerRequest {
-            schema_version: SCHEMA_VERSION,
+            schema_version: BROKER_SCHEMA_V1,
             request_id: "query-1".to_owned(),
             operation: BrokerOperation::Query {
-                actor: ActorContext::Session { capability },
+                actor: ActorContext::Session {
+                    capability: capability.clone(),
+                },
                 query: CoordinatorQuery::ListHarnesses,
             },
         },
@@ -112,6 +125,98 @@ async fn unix_jsonl_broker_round_trips_capability_authenticated_core_calls() {
         result,
         QueryResult::Harnesses(vec!["supervisor".parse().expect("valid ID")])
     );
+
+    let dashboard_v1 = call(
+        &socket,
+        &BrokerRequest {
+            schema_version: BROKER_SCHEMA_V1,
+            request_id: "dashboard-v1".to_owned(),
+            operation: BrokerOperation::Query {
+                actor: ActorContext::Session {
+                    capability: capability.clone(),
+                },
+                query: CoordinatorQuery::Dashboard,
+            },
+        },
+    )
+    .await
+    .expect("v1 rejection must round trip");
+    assert_eq!(
+        dashboard_v1.error.expect("version error").category,
+        herdr_harness_coordinator::core::ErrorCategory::UnsupportedVersion
+    );
+
+    let dashboard_v2 = call(
+        &socket,
+        &BrokerRequest {
+            schema_version: BROKER_SCHEMA_V2,
+            request_id: "dashboard-v2".to_owned(),
+            operation: BrokerOperation::Query {
+                actor: ActorContext::Session {
+                    capability: capability.clone(),
+                },
+                query: CoordinatorQuery::Dashboard,
+            },
+        },
+    )
+    .await
+    .expect("v2 Dashboard query must round trip");
+    assert_eq!(dashboard_v2.schema_version, BROKER_SCHEMA_V2);
+    assert!(matches!(
+        serde_json::from_value::<QueryResult>(dashboard_v2.result.expect("Dashboard result"))
+            .expect("Dashboard result must retain its type"),
+        QueryResult::Dashboard(_)
+    ));
+
+    let pane_location_v1 = call(
+        &socket,
+        &BrokerRequest {
+            schema_version: BROKER_SCHEMA_V1,
+            request_id: "pane-location-v1".to_owned(),
+            operation: BrokerOperation::Execute {
+                actor: ActorContext::Session {
+                    capability: capability.clone(),
+                },
+                command: CoordinatorCommand::RecordPaneLocation {
+                    session_id,
+                    terminal_id: "supervisor-terminal".to_owned(),
+                    pane_id: "1-1".to_owned(),
+                },
+            },
+        },
+    )
+    .await
+    .expect("v1 rejection must round trip");
+    assert_eq!(
+        pane_location_v1.error.expect("version error").category,
+        herdr_harness_coordinator::core::ErrorCategory::UnsupportedVersion
+    );
+
+    let pane_location_v2 = call(
+        &socket,
+        &BrokerRequest {
+            schema_version: BROKER_SCHEMA_V2,
+            request_id: "pane-location-v2".to_owned(),
+            operation: BrokerOperation::Execute {
+                actor: ActorContext::Session { capability },
+                command: CoordinatorCommand::RecordPaneLocation {
+                    session_id,
+                    terminal_id: "supervisor-terminal".to_owned(),
+                    pane_id: "1-1".to_owned(),
+                },
+            },
+        },
+    )
+    .await
+    .expect("v2 pane-location command must round trip");
+    assert_eq!(pane_location_v2.schema_version, BROKER_SCHEMA_V2);
+    assert!(matches!(
+        serde_json::from_value::<CommandOutcome>(
+            pane_location_v2.result.expect("pane-location outcome")
+        )
+        .expect("pane-location outcome must retain its type"),
+        CommandOutcome::PaneLocationRecorded { .. }
+    ));
 
     server_task.abort();
 }
@@ -133,7 +238,7 @@ async fn broker_rejects_an_unversioned_request_without_closing_the_daemon() {
     let response = call(
         &socket,
         &BrokerRequest {
-            schema_version: 2,
+            schema_version: 3,
             request_id: "future".to_owned(),
             operation: BrokerOperation::Query {
                 actor: ActorContext::Bootstrap,
